@@ -1,49 +1,31 @@
-using Microsoft.AspNetCore.Mvc;
-using System.Text.Json;
-using soroban_bot.Services;
+using Octokit.Webhooks;
+using Octokit.Webhooks.Events;
+using Octokit.Webhooks.Events.PullRequest;
 
-namespace soroban_bot.Controllers;
+namespace soroban_bot.Services;
 
-[ApiController]
-[Route("api/webhook")]
-public class WebhookController : ControllerBase
+public class GitHubWebhookProcessor : WebhookEventProcessor
 {
     private readonly GitHubService _github;
 
-    public WebhookController(GitHubService github)
+    public GitHubWebhookProcessor(GitHubService github)
     {
         _github = github;
     }
 
-    [HttpPost]
-    public async Task<IActionResult> HandleWebhook()
+    protected override async ValueTask ProcessPullRequestWebhookAsync(
+        WebhookHeaders headers,
+        PullRequestEvent pullRequestEvent,
+        PullRequestAction action,
+        CancellationToken cancellationToken = default)
     {
-        var eventType = Request.Headers["X-GitHub-Event"].ToString();
-        using var reader = new StreamReader(Request.Body);
-        var payload = await reader.ReadToEndAsync();
+        var prNumber = (int)pullRequestEvent.PullRequest.Number;
+        var owner = pullRequestEvent.Repository.Owner.Login;
+        var repo = pullRequestEvent.Repository.Name;
+        var headSha = pullRequestEvent.PullRequest.Head.Sha;
 
-        // TODO: Now we only handle Pull Requests
-        if (eventType == "pull_request")
-        {
-            await HandlePullRequestEvent(payload);
-        }
-
-        return Ok();
-    }
-
-    private async Task HandlePullRequestEvent(string payload)
-    {
-        var json = JsonDocument.Parse(payload);
-        var root = json.RootElement;
-
-        var action = root.GetProperty("action").GetString();
-        var prNumber = root.GetProperty("pull_request").GetProperty("number").GetInt32();
-        var owner = root.GetProperty("repository").GetProperty("owner").GetProperty("login").GetString()!;
-        var repo = root.GetProperty("repository").GetProperty("name").GetString()!;
-        var headSha = root.GetProperty("pull_request").GetProperty("head").GetProperty("sha").GetString()!;
-        
         // Handle PR when opened or synchronized (new commit)
-        if (action is "opened" or "synchronize")
+        if (action == PullRequestAction.Opened || action == PullRequestAction.Synchronize)
         {
             // Get user email from PR commits (via base repo API, works for both public and private forks)
             string? userEmail = null;
@@ -62,7 +44,7 @@ public class WebhookController : ControllerBase
             await AnalyzeFilesAndLabelPR(owner, repo, prNumber, headSha);
         }
         // When PR is closed, remove/cleanup labels
-        else if (action == "closed")
+        else if (action == PullRequestAction.Closed)
         {
             await _github.RemoveLabelAsync(owner, repo, prNumber, "needs-review");
         }
@@ -121,14 +103,14 @@ public class WebhookController : ControllerBase
                         labelsToAdd.Add("BuildSystem: autotools");
                     else if (content.Contains("BuildSystem:    cmake", StringComparison.OrdinalIgnoreCase))
                         labelsToAdd.Add("BuildSystem: cmake");
-                    else if (content.Contains("BuildSystem:    golang", StringComparison.OrdinalIgnoreCase))
-                        labelsToAdd.Add("BuildSystem: golang");
                     else if (content.Contains("BuildSystem:    golangmodule", StringComparison.OrdinalIgnoreCase))
                         labelsToAdd.Add("BuildSystem: golangmodule");
-                    else if (content.Contains("BuildSystem:    rust", StringComparison.OrdinalIgnoreCase))
-                        labelsToAdd.Add("BuildSystem: rust");
+                    else if (content.Contains("BuildSystem:    golang", StringComparison.OrdinalIgnoreCase))
+                        labelsToAdd.Add("BuildSystem: golang");
                     else if (content.Contains("BuildSystem:    rustcrate", StringComparison.OrdinalIgnoreCase))
                         labelsToAdd.Add("BuildSystem: rustcrate");
+                    else if (content.Contains("BuildSystem:    rust", StringComparison.OrdinalIgnoreCase))
+                        labelsToAdd.Add("BuildSystem: rust");
                     else if (content.Contains("BuildSystem:    meson", StringComparison.OrdinalIgnoreCase))
                         labelsToAdd.Add("BuildSystem: meson");
                     else if (content.Contains("BuildSystem:    pyproject", StringComparison.OrdinalIgnoreCase))
