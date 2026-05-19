@@ -13,6 +13,7 @@ if (config.GetValue<int>("GitHubApp:AppId") == 0)      missingFields.Add("GitHub
 if (string.IsNullOrWhiteSpace(config["GitHubApp:PrivateKey"])) missingFields.Add("GitHubApp:PrivateKey");
 if (config.GetValue<long>("GitHubApp:InstallationId") == 0)    missingFields.Add("GitHubApp:InstallationId");
 if (string.IsNullOrWhiteSpace(config["GitHubApp:WebhookSecret"])) missingFields.Add("GitHubApp:WebhookSecret");
+if (string.IsNullOrWhiteSpace(config["GitHubApp:TeamName"]))      missingFields.Add("GitHubApp:TeamName");
 
 if (missingFields.Count > 0)
 {

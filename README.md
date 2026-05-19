@@ -17,6 +17,8 @@ Then edit `appsettings.json` and fill in your actual values:
 | `GitHubApp.AppId` | Your GitHub App's numeric ID |
 | `GitHubApp.InstallationId` | The installation ID for the target org/repo |
 | `GitHubApp.PrivateKey` | The RSA private key generated for your GitHub App (PEM format, newlines as `\n`) |
+| `GitHubApp.WebhookSecret` | Shared secret for validating `X-Hub-Signature-256`. Must exactly match your GitHub webhook secret. |
+| `GitHubApp.TeamName` | Team slug used for review workflow (for example: `captains`). Review labels are updated only when review is submitted by a member of this team. |
 | `Kestrel.Endpoints.Http.Url` | The address and port the server listens on (default: `http://0.0.0.0:3456`) |
 
 ### 2. Run
@@ -93,6 +95,8 @@ environment:
   - GitHubApp__AppId=123456
   - GitHubApp__InstallationId=78901234
   - GitHubApp__PrivateKey=-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----
+  - GitHubApp__WebhookSecret=webhook_secret
+  - GitHubApp__TeamName=captains
 ```
 
 > Note: Use double underscores (`__`) to represent nested configuration keys.

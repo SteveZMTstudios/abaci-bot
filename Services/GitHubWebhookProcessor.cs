@@ -1,16 +1,19 @@
 using Octokit.Webhooks;
 using Octokit.Webhooks.Events;
 using Octokit.Webhooks.Events.PullRequest;
+using Octokit.Webhooks.Events.PullRequestReview;
 
 namespace abaci_bot.Services;
 
 public class GitHubWebhookProcessor : WebhookEventProcessor
 {
     private readonly GitHubService _github;
+    private readonly IConfiguration _config;
 
-    public GitHubWebhookProcessor(GitHubService github)
+    public GitHubWebhookProcessor(GitHubService github, IConfiguration config)
     {
         _github = github;
+        _config = config;
     }
 
     protected override async ValueTask ProcessPullRequestWebhookAsync(
@@ -23,9 +26,14 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         var owner = pullRequestEvent.Repository.Owner.Login;
         var repo = pullRequestEvent.Repository.Name;
         var headSha = pullRequestEvent.PullRequest.Head.Sha;
+        var isDraft = pullRequestEvent.PullRequest.Draft;
 
         // Handle PR when opened or synchronized (new commit)
-        if (action == PullRequestAction.Opened || action == PullRequestAction.Synchronize)
+        if (action == PullRequestAction.Opened || 
+            action == PullRequestAction.Synchronize || 
+            action == PullRequestAction.Reopened ||
+            action == PullRequestAction.ConvertedToDraft || 
+            action == PullRequestAction.ReadyForReview)
         {
             // Get user email from PR commits (via base repo API, works for both public and private forks)
             string? userEmail = null;
@@ -42,11 +50,56 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
             await AnalyzeUserAndLabelPR(owner, repo, prNumber, userEmail);
             // Then, let's analyze the content of the PR and add labels accordingly.
             await AnalyzeFilesAndLabelPR(owner, repo, prNumber, headSha);
+
+            if (isDraft)
+            {
+                // For draft PR, add "Workflow: In Dev" label to indicate it's still in development,
+                // and remove "Workflow: Ready For Review" label if exists.
+                await _github.AddLabelsAsync(owner, repo, prNumber, "Workflow: In Dev");
+                await _github.RemoveLabelAsync(owner, repo, prNumber, "Workflow: Ready For Review");
+            }
+            else
+            {
+                // For non-draft PR, add "Workflow: Ready For Review" label and remove "Workflow: In Dev" label if exists.
+                await _github.RemoveLabelAsync(owner, repo, prNumber, "Workflow: In Dev");
+                await _github.AddLabelsAsync(owner, repo, prNumber, "Workflow: Ready For Review");
+                
+            }
         }
         // When PR is closed, remove/cleanup labels
         else if (action == PullRequestAction.Closed)
         {
-            await _github.RemoveLabelAsync(owner, repo, prNumber, "needs-review");
+            if (pullRequestEvent.PullRequest.Merged == true)
+            {
+                // For merged PR, add "Workflow: Complete" label.
+                await _github.AddLabelsAsync(owner, repo, prNumber, "Workflow: Complete");
+            }
+            await _github.RemoveLabelAsync(owner, repo, prNumber, "Workflow: In Dev");
+            await _github.RemoveLabelAsync(owner, repo, prNumber, "Workflow: Ready For Review");
+            await _github.RemoveLabelAsync(owner, repo, prNumber, "Workflow: In Review");
+        }
+    }
+
+    protected override async ValueTask ProcessPullRequestReviewWebhookAsync(
+    WebhookHeaders headers,
+    PullRequestReviewEvent pullRequestReviewEvent,
+    PullRequestReviewAction action,
+    CancellationToken cancellationToken = default)
+    {
+        if (action == PullRequestReviewAction.Submitted)
+        {
+            var prNumber = (int)pullRequestReviewEvent.PullRequest.Number;
+            var owner = pullRequestReviewEvent.Repository.Owner.Login;
+            var repo = pullRequestReviewEvent.Repository.Name;
+            var captains = await _github.GetTeamMembersAsync(owner, _config["GitHubApp:TeamName"]!);
+            string sender = pullRequestReviewEvent.Sender.Login.ToLowerInvariant();
+
+            // If the review is submitted by a captain, add "Workflow: In Review" label.
+            if (captains.Contains(sender))
+            {
+                await _github.RemoveLabelAsync(owner, repo, prNumber, "Workflow: Ready For Review");
+                await _github.AddLabelsAsync(owner, repo, prNumber, "Workflow: In Review");
+            }
         }
     }
 

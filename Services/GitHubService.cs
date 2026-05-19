@@ -57,7 +57,7 @@ public class GitHubService
         var payload = Base64UrlEncode(JsonSerializer.Serialize(new
         {
             iat = now.AddSeconds(-60).ToUnixTimeSeconds(),
-            exp = now.AddMinutes(10).ToUnixTimeSeconds(),
+            exp = now.AddMinutes(9).ToUnixTimeSeconds(),
             iss = _appId
         }));
 
@@ -104,7 +104,6 @@ public class GitHubService
         }
         return null;
     }
-    
 
     public async Task<string> GetFileContentAsync(
         string owner, string repo, string path, string sha)
@@ -130,5 +129,14 @@ public class GitHubService
             await _client.Issue.Labels.RemoveFromIssue(owner, repo, issueNumber, label);
         }
         catch (NotFoundException) { }
+    }
+
+    public async Task<HashSet<string>> GetTeamMembersAsync(
+        string owner, string teamName)
+    {
+        await EnsureAuthenticatedAsync();
+        var teamSlug = await _client.Organization.Team.GetByName(owner, teamName.ToLowerInvariant());
+        var members = await _client.Organization.Team.GetAllMembers(teamSlug.Id);
+        return members.Select(m => m.Login.ToLowerInvariant()).ToHashSet();
     }
 }
