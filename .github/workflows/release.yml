@@ -38,8 +38,8 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: soroban-bot-linux-amd64
-          path: ./publish/soroban-bot
+          name: abaci-bot-linux-amd64
+          path: ./publish/abaci-bot
 
   release:
     name: Create GitHub Release
@@ -53,15 +53,15 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: soroban-bot-linux-amd64
+          name: abaci-bot-linux-amd64
           path: ./dist
 
       - name: Make binary executable
-        run: chmod +x ./dist/soroban-bot
+        run: chmod +x ./dist/abaci-bot
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ./dist/soroban-bot
+          files: ./dist/abaci-bot
           generate_release_notes: true
 

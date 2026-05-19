@@ -3,7 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
-namespace soroban_bot.Services;
+namespace abaci_bot.Services;
 
 public class GitHubService
 {
@@ -18,7 +18,7 @@ public class GitHubService
         _appId = appId;
         _privateKey = privateKey;
         _installationId = installationId;
-        _client = new GitHubClient(new ProductHeaderValue("soroban-bot"));
+        _client = new GitHubClient(new ProductHeaderValue("abaci-bot"));
     }
 
     public void SetInstallationId(long installationId)

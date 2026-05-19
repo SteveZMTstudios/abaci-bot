@@ -2,7 +2,7 @@ using Octokit.Webhooks;
 using Octokit.Webhooks.Events;
 using Octokit.Webhooks.Events.PullRequest;
 
-namespace soroban_bot.Services;
+namespace abaci_bot.Services;
 
 public class GitHubWebhookProcessor : WebhookEventProcessor
 {

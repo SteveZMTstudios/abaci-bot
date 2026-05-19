@@ -1,9 +1,9 @@
 services:
-  soroban-bot:
-    image: ghcr.io/openruyi/soroban-bot:latest
+  abaci-bot:
+    image: ghcr.io/openruyi/abaci-bot:latest
     # Or build locally:
     # build: .
-    container_name: soroban-bot
+    container_name: abaci-bot
     restart: unless-stopped
     ports:
       - "3456:3456"

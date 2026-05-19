@@ -32,5 +32,5 @@ EXPOSE 3456
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3456/health || exit 1
 
-ENTRYPOINT ["dotnet", "soroban-bot.dll"]
+ENTRYPOINT ["dotnet", "abaci-bot.dll"]
 

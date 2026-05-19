@@ -1,6 +1,6 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "soroban-bot", "soroban-bot.csproj", "{DB9EB766-0713-4D0A-A2C2-A91C9558FD57}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "abaci-bot", "abaci-bot.csproj", "{DB9EB766-0713-4D0A-A2C2-A91C9558FD57}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

@@ -1,4 +1,4 @@
-# soroban-bot
+# abaci-bot
 
 ## Getting Started
 
@@ -30,7 +30,7 @@ dotnet run
 Or run the published binary directly:
 
 ```bash
-./soroban-bot
+./abaci-bot
 ```
 
 #### Option B: Run with Docker Compose (Recommended)
@@ -60,14 +60,14 @@ Or run the published binary directly:
 
 ```bash
 # Pull the image
-docker pull ghcr.io/openruyi/soroban-bot:latest
+docker pull ghcr.io/openruyi/abaci-bot:latest
 
 # Run with mounted config
 docker run -d \
-  --name soroban-bot \
+  --name abaci-bot \
   -p 3456:3456 \
   -v $(pwd)/appsettings.json:/app/appsettings.json:ro \
-  ghcr.io/openruyi/soroban-bot:latest
+  ghcr.io/openruyi/abaci-bot:latest
 ```
 
 ### 3. Build Docker Image Locally (Optional)
@@ -75,7 +75,7 @@ docker run -d \
 If you want to build the image yourself:
 
 ```bash
-docker build -t soroban-bot .
+docker build -t abaci-bot .
 ```
 
 Or with docker compose:
