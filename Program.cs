@@ -65,7 +65,10 @@ builder.Services.AddSingleton<IGitHubService>(sp => new GitHubService(
 
 builder.Services.Configure<TargetClassificationOptions>(config.GetSection("TargetClassification"));
 builder.Services.Configure<ChangeTypeClassificationOptions>(config.GetSection("ChangeTypeClassification"));
-builder.Services.Configure<StaleLifecycleOptions>(config.GetSection("StaleLifecycle"));
+builder.Services.AddOptions<StaleLifecycleOptions>()
+    .Bind(config.GetSection("StaleLifecycle"))
+    .ValidateOnStart();
+builder.Services.AddSingleton<Microsoft.Extensions.Options.IValidateOptions<StaleLifecycleOptions>, StaleLifecycleOptionsValidator>();
 builder.Services.Configure<BotDetectionOptions>(config.GetSection("BotDetection"));
 
 // Register pipeline infrastructure and mutual-exclusion engine

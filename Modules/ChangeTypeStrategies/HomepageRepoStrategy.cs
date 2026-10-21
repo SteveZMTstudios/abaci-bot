@@ -8,7 +8,7 @@ namespace abaci_bot.Modules.ChangeTypeStrategies;
 
 /// <summary>
 /// Change type classification strategy for the community portal and documentation homepage repository.
-/// Categorizes PRs into Type: Frontend, Type: Submodule Update, and Type: Documentation.
+/// Categorizes PRs into Type: Frontend and Type: Documentation.
 /// </summary>
 public class HomepageRepoStrategy : IChangeTypeStrategy
 {
@@ -32,7 +32,6 @@ public class HomepageRepoStrategy : IChangeTypeStrategy
             return Task.CompletedTask;
 
         bool hasFrontendChanges = false;
-        bool hasSubmoduleChanges = false;
         bool allDocs = true;
 
         foreach (var file in files)
@@ -49,14 +48,6 @@ public class HomepageRepoStrategy : IChangeTypeStrategy
             {
                 hasFrontendChanges = true;
             }
-
-            // Git submodule detection: status "submodule", .gitmodules file, or submodule commit pointer
-            if (path.Equals(".gitmodules", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(file.Status, "submodule", StringComparison.OrdinalIgnoreCase) ||
-                (file.Patch == null && file.Changes == 1 && (file.Additions + file.Deletions == 1) && !path.Contains('.')))
-            {
-                hasSubmoduleChanges = true;
-            }
         }
 
         if (hasFrontendChanges)
@@ -64,13 +55,8 @@ public class HomepageRepoStrategy : IChangeTypeStrategy
             context.LabelsToAdd.Add(GitHubLabels.TypeFrontend);
         }
 
-        if (hasSubmoduleChanges)
-        {
-            context.LabelsToAdd.Add(GitHubLabels.TypeSubmoduleUpdate);
-        }
-
-        // Pure documentation changes (exclusively docs, mutually exclusive with frontend/submodule changes)
-        if (allDocs && !hasFrontendChanges && !hasSubmoduleChanges)
+        // Pure documentation changes (exclusively docs, mutually exclusive with frontend changes)
+        if (allDocs && !hasFrontendChanges)
         {
             context.LabelsToAdd.Add(GitHubLabels.TypeDocumentation);
         }

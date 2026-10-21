@@ -133,18 +133,19 @@ public class ChangeTypeClassificationModuleTests
     }
 
     [Fact]
-    public async Task HomepageRepo_WhenSubmoduleModified_AddsSubmoduleUpdateLabel()
+    public async Task HomepageRepo_WhenRootFilesModified_DoesNotAddSubmoduleUpdateLabel()
     {
         var module = new ChangeTypeClassificationModule();
         var files = new[]
         {
-            CreateFile(".gitmodules")
+            CreateFile("CODEOWNERS"),
+            CreateFile("LICENSE")
         };
         var context = CreateContextWithFiles("homepage", files);
 
         await module.ProcessAsync(context, CancellationToken.None);
 
-        Assert.Contains(GitHubLabels.TypeSubmoduleUpdate, context.LabelsToAdd);
+        Assert.DoesNotContain(GitHubLabels.TypeSubmoduleUpdate, context.LabelsToAdd);
     }
 
     [Fact]

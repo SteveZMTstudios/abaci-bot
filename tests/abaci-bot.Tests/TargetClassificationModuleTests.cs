@@ -124,7 +124,7 @@ public class TargetClassificationModuleTests
     [Theory]
     [InlineData(null)]
     [InlineData("UnrecognizedCustomValue")]
-    public async Task ProcessAsync_UnknownBranchWithUnrecognizedOrNullDefault_FallsBackToRolling(string? defaultTarget)
+    public async Task ProcessAsync_UnknownBranchWithUnrecognizedOrNullDefault_KeepsSilentWithoutTargetLabel(string? defaultTarget)
     {
         var options = Microsoft.Extensions.Options.Options.Create(new TargetClassificationOptions
         {
@@ -135,7 +135,8 @@ public class TargetClassificationModuleTests
 
         await module.ProcessAsync(context, CancellationToken.None);
 
-        Assert.Contains(GitHubLabels.TargetRolling, context.LabelsToAdd);
+        Assert.DoesNotContain(GitHubLabels.TargetRolling, context.LabelsToAdd);
+        Assert.DoesNotContain(GitHubLabels.TargetLts, context.LabelsToAdd);
     }
 
     [Fact]
@@ -152,5 +153,82 @@ public class TargetClassificationModuleTests
 
         Assert.Contains(GitHubLabels.TargetLts, diff.LabelsToAdd);
         Assert.Contains(GitHubLabels.TargetRolling, diff.LabelsToRemove);
+    }
+
+    [Fact]
+    public void ShouldProcess_PullRequestEdited_ReturnsTrue()
+    {
+        var module = new TargetClassificationModule();
+        var context = CreateContext("openRuyi", "lts/24.03", action: PullRequestAction.Edited);
+
+        Assert.True(module.ShouldProcess(context));
+    }
+
+    [Fact]
+    public async Task ProcessAsync_RetargetFromMainToLtsSlashBranch_ReconcilesLabelsDirectly()
+    {
+        var module = new TargetClassificationModule();
+        // Retargeting to "lts/24.03" with pre-existing "Target: Rolling" label and Edited action (no new commits)
+        var context = CreateContext("openRuyi", "lts/24.03", action: PullRequestAction.Edited, existingLabels: new[] { GitHubLabels.TargetRolling });
+
+        Assert.True(module.ShouldProcess(context));
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Contains(GitHubLabels.TargetLts, context.LabelsToAdd);
+        Assert.Contains(GitHubLabels.TargetRolling, context.LabelsToRemove);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_RetargetFromLtsToMain_ReconcilesLabelsDirectly()
+    {
+        var module = new TargetClassificationModule();
+        // Retargeting back to "main" with pre-existing "Target: LTS" label and Edited action
+        var context = CreateContext("openRuyi", "main", action: PullRequestAction.Edited, existingLabels: new[] { GitHubLabels.TargetLts });
+
+        Assert.True(module.ShouldProcess(context));
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Contains(GitHubLabels.TargetRolling, context.LabelsToAdd);
+        Assert.Contains(GitHubLabels.TargetLts, context.LabelsToRemove);
+    }
+
+    [Theory]
+    [InlineData("lts/24.03")]
+    [InlineData("lts/milestone-1")]
+    [InlineData("lts-24.03")]
+    public async Task ProcessAsync_DefaultLtsPrefixes_MatchesBothSlashAndHyphen(string branchName)
+    {
+        var module = new TargetClassificationModule();
+        var context = CreateContext("openRuyi", branchName);
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Contains(GitHubLabels.TargetLts, context.LabelsToAdd);
+        Assert.DoesNotContain(GitHubLabels.TargetRolling, context.LabelsToAdd);
+    }
+
+    [Fact]
+    public void ManagedTargetLabels_IsReadOnlyAndContainsExpectedLabels()
+    {
+        Assert.NotNull(TargetClassificationModule.ManagedTargetLabels);
+        Assert.Equal(2, TargetClassificationModule.ManagedTargetLabels.Count);
+        Assert.Contains(GitHubLabels.TargetRolling, TargetClassificationModule.ManagedTargetLabels);
+        Assert.Contains(GitHubLabels.TargetLts, TargetClassificationModule.ManagedTargetLabels);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_LtsBranchPrefix_MatchesBeforeLtsRepositories()
+    {
+        var options = new TargetClassificationOptions
+        {
+            LtsRepositories = new List<string> { "special-repo" },
+            LtsBranchPrefixes = new List<string> { "lts/" }
+        };
+        var module = new TargetClassificationModule(Microsoft.Extensions.Options.Options.Create(options));
+        var context = CreateContext("special-repo", "lts/24.03");
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Contains(GitHubLabels.TargetLts, context.LabelsToAdd);
     }
 }

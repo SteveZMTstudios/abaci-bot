@@ -118,6 +118,18 @@ public interface IGitHubService
         string owner, string repo, int number, string comment, CancellationToken ct = default);
 
     /// <summary>
+    /// Retrieves the authoritative Issue model for an issue or pull request.
+    /// Returns null if the item is not found.
+    /// </summary>
+    /// <param name="owner">Repository owner or organization name.</param>
+    /// <param name="repo">Repository name.</param>
+    /// <param name="number">Issue or pull request number.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The <see cref="Issue"/> model, or <c>null</c> if not found.</returns>
+    Task<Issue?> GetIssueAsync(
+        string owner, string repo, int number, CancellationToken ct = default);
+
+    /// <summary>
     /// Retrieves the remaining GitHub API core rate limit for the current authenticated app installation.
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
@@ -126,5 +138,15 @@ public interface IGitHubService
     /// or returns the last known remaining quota if a network/transient error occurs.
     /// </returns>
     Task<int?> GetRemainingRateLimitAsync(
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Retrieves the remaining GitHub Search API rate limit for the current authenticated app installation.
+    /// </summary>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>
+    /// The remaining search quota count; returns <c>null</c> if authentication fails or an error occurs.
+    /// </returns>
+    Task<int?> GetRemainingSearchRateLimitAsync(
         CancellationToken ct = default);
 }

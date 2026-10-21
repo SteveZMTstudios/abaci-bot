@@ -19,6 +19,7 @@ public class StaleLifecycleService : BackgroundService
     private readonly IConfiguration _config;
     private readonly PullRequestLockManager _lockManager;
     private readonly ILogger<StaleLifecycleService> _logger;
+    private const int MinSearchWatermarkPerSweep = 4;
 
     public StaleLifecycleService(
         IGitHubService gitHub,
@@ -110,26 +111,36 @@ public class StaleLifecycleService : BackgroundService
 
         while (true)
         {
-            var remainingQuota = await _gitHub.GetRemainingRateLimitAsync(cancellationToken);
-            if (remainingQuota is null)
+            var remainingCore = await _gitHub.GetRemainingRateLimitAsync(cancellationToken);
+            var remainingSearch = await _gitHub.GetRemainingSearchRateLimitAsync(cancellationToken);
+
+            if (remainingCore is null)
             {
                 _logger.LogError("Authentication or network error while querying GitHub rate limits. Aborting stale sweep for {Owner}/{Repo}.", owner, repo);
                 return;
             }
 
-            if (remainingQuota.Value >= options.MinRateLimitRemaining)
+            // Watermark requirement: Minimum 4 search calls per repository sweep
+            // (2 for stale candidate discovery: issues + PRs; 2 for close candidate discovery: issues + PRs).
+            // Note on fail-open: If remainingSearch is null (rate limit probe failed due to transient network glitch),
+            // we fail-open and proceed with the sweep so a temporary probe failure does not halt governance,
+            // relying on downstream per-call rate limit exception handling.
+            var isCoreHealthy = remainingCore.Value >= options.MinRateLimitRemaining;
+            var isSearchHealthy = remainingSearch == null || remainingSearch.Value >= MinSearchWatermarkPerSweep;
+
+            if (isCoreHealthy && isSearchHealthy)
                 break;
 
             retryCount++;
             if (retryCount > maxRateLimitRetries)
             {
-                _logger.LogError("GitHub API remaining quota ({Remaining}) is persistently below watermark ({Min}) after {Retries} retries. Skipping sweep for {Owner}/{Repo}.",
-                    remainingQuota.Value, options.MinRateLimitRemaining, maxRateLimitRetries, owner, repo);
+                _logger.LogError("GitHub API quota (Core: {Core}, Search: {Search}) is persistently below watermark after {Retries} retries. Skipping sweep for {Owner}/{Repo}.",
+                    remainingCore.Value, remainingSearch, maxRateLimitRetries, owner, repo);
                 return;
             }
 
-            _logger.LogWarning("GitHub API remaining quota ({Remaining}) is below watermark ({Min}). Pausing before retry {Attempt}/{Max}.",
-                remainingQuota.Value, options.MinRateLimitRemaining, retryCount, maxRateLimitRetries);
+            _logger.LogWarning("GitHub API quota (Core: {Core}, Search: {Search}) is below watermark. Pausing before retry {Attempt}/{Max}.",
+                remainingCore.Value, remainingSearch, retryCount, maxRateLimitRetries);
 
             try
             {
@@ -150,10 +161,31 @@ public class StaleLifecycleService : BackgroundService
 
         // 2. Fetch candidates to mark as Stale:
         // Open, not draft, without Status: Stale, not updated within StaleDays
-        var staleIssues = await _gitHub.SearchStaleCandidatesAsync(
-            owner, repo, staleThreshold, isPr: false, labelFilter: $"-label:\"{GitHubLabels.StatusStale}\"", ct: cancellationToken);
-        var stalePrs = await _gitHub.SearchStaleCandidatesAsync(
-            owner, repo, staleThreshold, isPr: true, labelFilter: $"-label:\"{GitHubLabels.StatusStale}\"", ct: cancellationToken);
+        IReadOnlyList<Octokit.Issue> staleIssues;
+        IReadOnlyList<Octokit.Issue> stalePrs;
+        try
+        {
+            staleIssues = await _gitHub.SearchStaleCandidatesAsync(
+                owner, repo, staleThreshold, isPr: false, labelFilter: $"-label:\"{GitHubLabels.StatusStale}\"", ct: cancellationToken);
+            stalePrs = await _gitHub.SearchStaleCandidatesAsync(
+                owner, repo, staleThreshold, isPr: true, labelFilter: $"-label:\"{GitHubLabels.StatusStale}\"", ct: cancellationToken);
+        }
+        catch (Octokit.RateLimitExceededException ex)
+        {
+            DateTimeOffset? resetTime = null;
+            try
+            {
+                resetTime = ex.Reset;
+            }
+            catch (NullReferenceException)
+            {
+                // Octokit's Reset property can throw NullReferenceException if HttpResponse is missing (e.g. in mocks)
+            }
+
+            _logger.LogWarning(ex, "Search API quota exceeded during candidate search for {Owner}/{Repo}. Reset: {Reset}. Skipping repository sweep.",
+                owner, repo, resetTime);
+            return;
+        }
 
         var newStaleCandidates = staleIssues.Concat(stalePrs)
             .GroupBy(i => i.Number)
@@ -171,6 +203,11 @@ public class StaleLifecycleService : BackgroundService
             {
                 using (await _lockManager.AcquireLockAsync(owner, repo, item.Number, cancellationToken))
                 {
+                    // Lock-time TOCTOU verification: verify latest authoritative state on GitHub
+                    var latest = await TryVerifyEligibilityAsync(owner, repo, item.Number, requireStaleLabel: false, staleThreshold, options, cancellationToken);
+                    if (latest == null)
+                        continue;
+
                     if (options.DryRun)
                     {
                         _logger.LogInformation("[DryRun] Would mark {Owner}/{Repo}#{Number} as Status: Stale", owner, repo, item.Number);
@@ -187,6 +224,14 @@ public class StaleLifecycleService : BackgroundService
                     await _gitHub.AddLabelsAsync(owner, repo, item.Number, new[] { GitHubLabels.StatusStale }, cancellationToken);
                 }
             }
+            catch (Octokit.RateLimitExceededException ex)
+            {
+                DateTimeOffset? resetTime = null;
+                try { resetTime = ex.Reset; } catch (NullReferenceException) { }
+                _logger.LogWarning(ex, "GitHub Core API rate limit exceeded while processing {Owner}/{Repo}#{Number}. Reset: {Reset}. Aborting sweep for this repository.",
+                    owner, repo, item.Number, resetTime);
+                break;
+            }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogWarning(ex, "Failed to mark {Owner}/{Repo}#{Number} as stale. Skipping item.", owner, repo, item.Number);
@@ -200,10 +245,31 @@ public class StaleLifecycleService : BackgroundService
 
         // 3. Fetch candidates to auto-close:
         // Open, not draft, with Status: Stale, and not updated within CloseDays (i.e. grace period expired)
-        var closeIssues = await _gitHub.SearchStaleCandidatesAsync(
-            owner, repo, closeThreshold, isPr: false, labelFilter: $"label:\"{GitHubLabels.StatusStale}\"", ct: cancellationToken);
-        var closePrs = await _gitHub.SearchStaleCandidatesAsync(
-            owner, repo, closeThreshold, isPr: true, labelFilter: $"label:\"{GitHubLabels.StatusStale}\"", ct: cancellationToken);
+        IReadOnlyList<Octokit.Issue> closeIssues;
+        IReadOnlyList<Octokit.Issue> closePrs;
+        try
+        {
+            closeIssues = await _gitHub.SearchStaleCandidatesAsync(
+                owner, repo, closeThreshold, isPr: false, labelFilter: $"label:\"{GitHubLabels.StatusStale}\"", ct: cancellationToken);
+            closePrs = await _gitHub.SearchStaleCandidatesAsync(
+                owner, repo, closeThreshold, isPr: true, labelFilter: $"label:\"{GitHubLabels.StatusStale}\"", ct: cancellationToken);
+        }
+        catch (Octokit.RateLimitExceededException ex)
+        {
+            DateTimeOffset? resetTime = null;
+            try
+            {
+                resetTime = ex.Reset;
+            }
+            catch (NullReferenceException)
+            {
+                // Octokit's Reset property can throw NullReferenceException if HttpResponse is missing (e.g. in mocks)
+            }
+
+            _logger.LogWarning(ex, "Search API quota exceeded during close candidate search for {Owner}/{Repo}. Reset: {Reset}. Skipping repository sweep.",
+                owner, repo, resetTime);
+            return;
+        }
 
         var closeCandidates = closeIssues.Concat(closePrs)
             .GroupBy(i => i.Number)
@@ -221,6 +287,11 @@ public class StaleLifecycleService : BackgroundService
             {
                 using (await _lockManager.AcquireLockAsync(owner, repo, item.Number, cancellationToken))
                 {
+                    // Lock-time TOCTOU verification: verify latest authoritative state on GitHub
+                    var latest = await TryVerifyEligibilityAsync(owner, repo, item.Number, requireStaleLabel: true, closeThreshold, options, cancellationToken);
+                    if (latest == null)
+                        continue;
+
                     if (options.DryRun)
                     {
                         _logger.LogInformation("[DryRun] Would auto-close expired stale object {Owner}/{Repo}#{Number}", owner, repo, item.Number);
@@ -236,6 +307,14 @@ public class StaleLifecycleService : BackgroundService
                     await _gitHub.CreateCommentAsync(owner, repo, item.Number, closeComment, cancellationToken);
                 }
             }
+            catch (Octokit.RateLimitExceededException ex)
+            {
+                DateTimeOffset? resetTime = null;
+                try { resetTime = ex.Reset; } catch (NullReferenceException) { }
+                _logger.LogWarning(ex, "GitHub Core API rate limit exceeded while auto-closing {Owner}/{Repo}#{Number}. Reset: {Reset}. Aborting sweep for this repository.",
+                    owner, repo, item.Number, resetTime);
+                break;
+            }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogWarning(ex, "Failed to auto-close stale object {Owner}/{Repo}#{Number}. Skipping item.", owner, repo, item.Number);
@@ -246,6 +325,32 @@ public class StaleLifecycleService : BackgroundService
                 await Task.Delay(options.RequestThrottleMilliseconds, cancellationToken);
             }
         }
+    }
+
+    private async Task<Octokit.Issue?> TryVerifyEligibilityAsync(
+        string owner,
+        string repo,
+        int number,
+        bool requireStaleLabel,
+        DateTimeOffset threshold,
+        StaleLifecycleOptions options,
+        CancellationToken cancellationToken)
+    {
+        var latest = await _gitHub.GetIssueAsync(owner, repo, number, cancellationToken);
+        if (latest == null || latest.State.Value != Octokit.ItemState.Open)
+            return null;
+
+        var hasStale = latest.Labels.Any(l => string.Equals(l.Name, GitHubLabels.StatusStale, StringComparison.OrdinalIgnoreCase));
+        if (hasStale != requireStaleLabel)
+            return null;
+
+        if (IsExempt(latest, options))
+            return null;
+
+        if (latest.UpdatedAt > threshold)
+            return null;
+
+        return latest;
     }
 
     private static bool IsExempt(Octokit.Issue item, StaleLifecycleOptions options)
