@@ -1205,6 +1205,46 @@ public class GitHubWebhookProcessorTests
         Assert.Empty(github.LabelOperations);
     }
 
+    [Fact]
+    public async Task ProcessPullRequestReviewComment_WhenHumanReviewerComments_RemovesNewAndStatusStaleLabels()
+    {
+        var github = new FakeGitHubService();
+        var processor = CreateFullProcessor(github);
+
+        var repo = Create<WebhookRepository>(
+            (nameof(WebhookRepository.Name), "openRuyi"),
+            (nameof(WebhookRepository.Owner), User("openRuyi-Project")));
+
+        var head = Create<Octokit.Webhooks.Models.SimplePullRequestHead>((nameof(Octokit.Webhooks.Models.SimplePullRequestHead.Sha), "sha123"));
+        var @base = Create<Octokit.Webhooks.Models.SimplePullRequestBase>((nameof(Octokit.Webhooks.Models.SimplePullRequestBase.Ref), "main"));
+
+        var pr = Create<WebhookSimplePullRequest>(
+            (nameof(WebhookSimplePullRequest.Number), 150L),
+            (nameof(WebhookSimplePullRequest.Title), "Feature PR"),
+            (nameof(WebhookSimplePullRequest.User), User("contributor-alice")),
+            (nameof(WebhookSimplePullRequest.Head), head),
+            (nameof(WebhookSimplePullRequest.Base), @base),
+            (nameof(WebhookSimplePullRequest.Draft), false),
+            (nameof(WebhookSimplePullRequest.Labels), Labels(new[] { GitHubLabels.New, GitHubLabels.StatusStale })));
+
+        var comment = Create<Octokit.Webhooks.Models.PullRequestReviewComment>(
+            (nameof(Octokit.Webhooks.Models.PullRequestReviewComment.Body), "Please check this diff line"),
+            (nameof(Octokit.Webhooks.Models.PullRequestReviewComment.User), User("reviewer-bob")));
+
+        var reviewCommentEvent = Create<Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentCreatedEvent>(
+            (nameof(Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentCreatedEvent.Repository), repo),
+            (nameof(Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentCreatedEvent.PullRequest), pr),
+            (nameof(Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentCreatedEvent.Comment), comment),
+            (nameof(Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentCreatedEvent.Sender), User("reviewer-bob")));
+
+        await processor.ProcessPullRequestReviewCommentAsync(
+            reviewCommentEvent,
+            Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentAction.Created);
+
+        Assert.Contains($"remove:{GitHubLabels.New}", github.LabelOperations);
+        Assert.Contains($"remove:{GitHubLabels.StatusStale}", github.LabelOperations);
+    }
+
     #endregion
 
     private static PullRequestLabeledEvent LabeledEvent(string labelName, IReadOnlyList<string>? labels = null)
@@ -1405,6 +1445,15 @@ public class GitHubWebhookProcessorTests
             }
             return ProcessPullRequestReviewWebhookAsync(null!, payload, action);
         }
+
+        public ValueTask ProcessPullRequestReviewCommentAsync(Octokit.Webhooks.Events.PullRequestReviewCommentEvent payload, Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentAction action)
+        {
+            if (_testGithub is FakeGitHubService fake)
+            {
+                fake.SyncFromReviewComment(payload);
+            }
+            return ProcessPullRequestReviewCommentWebhookAsync(null!, payload, action);
+        }
     }
 
     private sealed class FakeGitHubService : IGitHubService
@@ -1495,6 +1544,25 @@ public class GitHubWebhookProcessorTests
             }
         }
 
+        public void SyncFromReviewComment(Octokit.Webhooks.Events.PullRequestReviewCommentEvent payload)
+        {
+            if (payload.PullRequest != null)
+            {
+                var pr = (OctokitPullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(OctokitPullRequest));
+                typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Title))?.SetValue(pr, payload.PullRequest.Title);
+                typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Draft))?.SetValue(pr, PullRequest.Draft);
+                PullRequest = pr;
+
+                if (payload.PullRequest.Labels != null && RemoteLabels.Count == 0)
+                {
+                    foreach (var l in payload.PullRequest.Labels)
+                    {
+                        if (!string.IsNullOrWhiteSpace(l.Name)) RemoteLabels.Add(l.Name);
+                    }
+                }
+            }
+        }
+
         public Task<IReadOnlyList<OctokitPullRequestFile>> GetPullRequestFilesAsync(
             string owner, string repo, int prNumber, CancellationToken cancellationToken = default)
         {
@@ -1566,7 +1634,20 @@ public class GitHubWebhookProcessorTests
         public List<int> ClosedIssues { get; } = new();
         public List<(int IssueNumber, string Comment)> CreatedComments { get; } = new();
         public List<Octokit.Issue> StaleCandidates { get; set; } = new();
+        public Dictionary<int, Octokit.Issue> RemoteIssues { get; } = new();
         public int? RemainingRateLimit { get; set; } = 5000;
+        public int? RemainingSearchRateLimit { get; set; } = 30;
+
+        public Task<Octokit.Issue?> GetIssueAsync(string owner, string repo, int number, CancellationToken ct = default)
+        {
+            if (RemoteIssues.TryGetValue(number, out var issue))
+            {
+                return Task.FromResult<Octokit.Issue?>(issue);
+            }
+
+            var candidate = StaleCandidates.FirstOrDefault(c => c.Number == number);
+            return Task.FromResult<Octokit.Issue?>(candidate);
+        }
 
         public Task<IReadOnlyList<Octokit.Issue>> SearchStaleCandidatesAsync(
             string owner, string repo, DateTimeOffset updatedBefore, bool isPr, string? labelFilter = null, CancellationToken ct = default)
@@ -1589,6 +1670,11 @@ public class GitHubWebhookProcessorTests
         public Task<int?> GetRemainingRateLimitAsync(CancellationToken ct = default)
         {
             return Task.FromResult(RemainingRateLimit);
+        }
+
+        public Task<int?> GetRemainingSearchRateLimitAsync(CancellationToken ct = default)
+        {
+            return Task.FromResult(RemainingSearchRateLimit);
         }
     }
 

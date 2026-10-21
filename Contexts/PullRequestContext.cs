@@ -6,10 +6,12 @@ using Octokit.Webhooks.Events;
 using Octokit.Webhooks.Events.IssueComment;
 using Octokit.Webhooks.Events.PullRequest;
 using Octokit.Webhooks.Events.PullRequestReview;
+using Octokit.Webhooks.Events.PullRequestReviewComment;
 using PullRequest = Octokit.PullRequest;
 using PullRequestAction = Octokit.Webhooks.Events.PullRequest.PullRequestAction;
 using PullRequestFile = Octokit.PullRequestFile;
 using PullRequestReviewAction = Octokit.Webhooks.Events.PullRequestReview.PullRequestReviewAction;
+using PullRequestReviewCommentAction = Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentAction;
 using WebhookPullRequestReviewEvent = Octokit.Webhooks.Events.PullRequestReviewEvent;
 
 namespace abaci_bot.Contexts;
@@ -18,7 +20,8 @@ public enum PullRequestEventType
 {
     PullRequest,
     Review,
-    IssueComment
+    IssueComment,
+    ReviewComment
 }
 
 /// <summary>
@@ -132,6 +135,11 @@ public class PullRequestContext
     public IssueCommentAction? IssueCommentAction { get; }
 
     /// <summary>
+    /// The action sub-type if this context originated from a pull request review comment event.
+    /// </summary>
+    public PullRequestReviewCommentAction? PullRequestReviewCommentAction { get; }
+
+    /// <summary>
     /// Original pull request webhook event payload, if applicable.
     /// </summary>
     public PullRequestEvent? PullRequestEvent { get; }
@@ -145,6 +153,11 @@ public class PullRequestContext
     /// Original comment webhook event payload, if applicable.
     /// </summary>
     public IssueCommentEvent? IssueCommentEvent { get; }
+
+    /// <summary>
+    /// Original review comment webhook event payload, if applicable.
+    /// </summary>
+    public PullRequestReviewCommentEvent? PullRequestReviewCommentEvent { get; }
 
     /// <summary>
     /// Lazily fetches the list of files modified by this pull request.
@@ -207,7 +220,8 @@ public class PullRequestContext
            PullRequestAction == Octokit.Webhooks.Events.PullRequest.PullRequestAction.Closed ||
            string.Equals(RemoteState, "closed", StringComparison.OrdinalIgnoreCase) ||
            string.Equals(PullRequestEvent?.PullRequest?.State?.StringValue, "closed", StringComparison.OrdinalIgnoreCase) ||
-           string.Equals(PullRequestReviewEvent?.PullRequest?.State?.StringValue, "closed", StringComparison.OrdinalIgnoreCase));
+           string.Equals(PullRequestReviewEvent?.PullRequest?.State?.StringValue, "closed", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(PullRequestReviewCommentEvent?.PullRequest?.State?.StringValue, "closed", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Indicates whether the pull request has reached a terminal lifecycle state (closed, merged, or tagged as Complete).
@@ -262,6 +276,8 @@ public class PullRequestContext
         string? senderType = null,
         WebhookPullRequestReviewEvent? reviewEvent = null,
         IssueCommentEvent? commentEvent = null,
+        PullRequestReviewCommentAction? reviewCommentAction = null,
+        PullRequestReviewCommentEvent? reviewCommentEvent = null,
         CancellationToken cancellationToken = default)
     {
         _gitHubService = gitHubService;
@@ -284,10 +300,14 @@ public class PullRequestContext
         PullRequestAction = prAction;
         PullRequestReviewAction = reviewAction;
         IssueCommentAction = commentAction;
+        PullRequestReviewCommentAction = reviewCommentAction;
         PullRequestEvent = prEvent;
         PullRequestReviewEvent = reviewEvent;
         IssueCommentEvent = commentEvent;
-        RemoteState = prEvent?.PullRequest?.State?.StringValue ?? reviewEvent?.PullRequest?.State?.StringValue;
+        PullRequestReviewCommentEvent = reviewCommentEvent;
+        RemoteState = prEvent?.PullRequest?.State?.StringValue
+            ?? reviewEvent?.PullRequest?.State?.StringValue
+            ?? reviewCommentEvent?.PullRequest?.State?.StringValue;
 
         ExistingLabels = new HashSet<string>(existingLabels, StringComparer.OrdinalIgnoreCase);
 
@@ -450,6 +470,45 @@ public class PullRequestContext
             cancellationToken: cancellationToken);
     }
 
+    /// <summary>
+    /// Creates a PullRequestContext from a native GitHub pull request inline review comment event.
+    /// </summary>
+    public static PullRequestContext FromReviewCommentEvent(
+        IGitHubService gitHub,
+        string teamName,
+        WebhookHeaders? headers,
+        PullRequestReviewCommentEvent reviewCommentEvent,
+        PullRequestReviewCommentAction action,
+        CancellationToken cancellationToken = default)
+    {
+        var owner = reviewCommentEvent.Repository?.Owner?.Login ?? string.Empty;
+        var repo = reviewCommentEvent.Repository?.Name ?? string.Empty;
+        var prNumber = (int)reviewCommentEvent.PullRequest.Number;
+        var labels = GitHubWebhookProcessor.GetLabelNames(reviewCommentEvent.PullRequest.Labels);
+
+        return new PullRequestContext(
+            gitHubService: gitHub,
+            teamName: teamName,
+            headers: headers,
+            eventType: PullRequestEventType.ReviewComment,
+            owner: owner,
+            repo: repo,
+            prNumber: prNumber,
+            headSha: reviewCommentEvent.PullRequest.Head?.Sha ?? string.Empty,
+            baseBranch: reviewCommentEvent.PullRequest.Base?.Ref,
+            isDraft: reviewCommentEvent.PullRequest.Draft,
+            isMerged: null,
+            title: reviewCommentEvent.PullRequest.Title ?? string.Empty,
+            body: reviewCommentEvent.Comment?.Body,
+            senderLogin: reviewCommentEvent.Sender?.Login,
+            authorLogin: reviewCommentEvent.PullRequest.User?.Login,
+            action: action.ToString(),
+            existingLabels: labels,
+            reviewCommentAction: action,
+            reviewCommentEvent: reviewCommentEvent,
+            senderType: reviewCommentEvent.Sender?.Type?.ToString(),
+            cancellationToken: cancellationToken);
+    }
 
     /// <summary>
     /// Asynchronous overload for backward compatibility with existing callers.
@@ -575,6 +634,7 @@ public class PullRequestContext
     {
         ReconcileLabels(managedLabels, label => string.Equals(label, desiredLabel, StringComparison.OrdinalIgnoreCase));
     }
+    /// <summary>
     /// Evaluates whether the sender who triggered this webhook event is either the pull request author,
     /// a declared bot account, or matches known bot patterns/whitelists.
     /// Pulls complexity downward by preventing individual modules from duplicating bot detection logic.

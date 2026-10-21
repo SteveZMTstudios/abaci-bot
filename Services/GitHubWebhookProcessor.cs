@@ -9,6 +9,7 @@ using Octokit.Webhooks.Events;
 using Octokit.Webhooks.Events.IssueComment;
 using Octokit.Webhooks.Events.PullRequest;
 using Octokit.Webhooks.Events.PullRequestReview;
+using Octokit.Webhooks.Events.PullRequestReviewComment;
 
 namespace abaci_bot.Services;
 
@@ -108,6 +109,31 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
 
         var teamName = _config["GitHubApp:TeamName"] ?? string.Empty;
         var context = PullRequestContext.FromReviewEvent(_github, teamName, headers, pullRequestReviewEvent, action, cancellationToken);
+
+        using (await _lockManager.AcquireLockAsync(owner, repo, context.PrNumber, cancellationToken))
+        {
+            await _pipeline.ExecuteAsync(context, cancellationToken);
+        }
+    }
+
+    protected override async ValueTask ProcessPullRequestReviewCommentWebhookAsync(
+        WebhookHeaders headers,
+        PullRequestReviewCommentEvent pullRequestReviewCommentEvent,
+        PullRequestReviewCommentAction action,
+        CancellationToken cancellationToken = default)
+    {
+        // Only react to newly created inline review comments; ignore edits and deletions
+        if (action != PullRequestReviewCommentAction.Created)
+            return;
+
+        if (!TryGetRepositoryContext(pullRequestReviewCommentEvent.Repository, out var owner, out var repo))
+            return;
+
+        if (!HasSender(pullRequestReviewCommentEvent.Sender))
+            return;
+
+        var teamName = _config["GitHubApp:TeamName"] ?? string.Empty;
+        var context = PullRequestContext.FromReviewCommentEvent(_github, teamName, headers, pullRequestReviewCommentEvent, action, cancellationToken);
 
         using (await _lockManager.AcquireLockAsync(owner, repo, context.PrNumber, cancellationToken))
         {

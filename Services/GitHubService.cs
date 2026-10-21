@@ -257,9 +257,30 @@ public class GitHubService : IGitHubService, IDisposable
             }
 
             page++;
+            if (page <= maxPages)
+            {
+                // Throttle between pagination requests to prevent search API bursts
+                await Task.Delay(500, ct);
+            }
         }
 
         return allItems;
+    }
+
+    public async Task<Issue?> GetIssueAsync(string owner, string repo, int number, CancellationToken ct = default)
+    {
+        using var _ = SetAmbientToken(ct);
+        ct.ThrowIfCancellationRequested();
+        await EnsureAuthenticatedAsync(ct);
+        ct.ThrowIfCancellationRequested();
+        try
+        {
+            return await _client.Issue.Get(owner, repo, number);
+        }
+        catch (NotFoundException)
+        {
+            return null;
+        }
     }
 
     public async Task CloseIssueAsync(string owner, string repo, int number, CancellationToken ct = default)
@@ -299,6 +320,31 @@ public class GitHubService : IGitHubService, IDisposable
         {
             _logger?.LogWarning(ex, "Failed to query GitHub rate limits due to network or API error.");
             return _client.GetLastApiInfo()?.RateLimit?.Remaining;
+        }
+    }
+
+    public async Task<int?> GetRemainingSearchRateLimitAsync(CancellationToken ct = default)
+    {
+        using var _ = SetAmbientToken(ct);
+        try
+        {
+            await EnsureAuthenticatedAsync(ct);
+            var rateLimits = await _client.RateLimit.GetRateLimits();
+            return rateLimits?.Resources?.Search?.Remaining;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (AuthorizationException authEx)
+        {
+            _logger?.LogError(authEx, "Authentication failure while requesting GitHub search rate limit quota.");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "Failed to query GitHub search rate limits due to network or API error.");
+            return null;
         }
     }
 

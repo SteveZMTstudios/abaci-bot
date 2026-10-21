@@ -6,6 +6,7 @@ using Microsoft.Extensions.Options;
 using Octokit.Webhooks.Events.IssueComment;
 using Octokit.Webhooks.Events.PullRequest;
 using Octokit.Webhooks.Events.PullRequestReview;
+using Octokit.Webhooks.Events.PullRequestReviewComment;
 
 namespace abaci_bot.Modules;
 
@@ -40,6 +41,9 @@ public class ShinyNewPrModule : IPullRequestModule
 
             PullRequestEventType.IssueComment =>
                 context.IssueCommentAction == IssueCommentAction.Created,
+
+            PullRequestEventType.ReviewComment =>
+                context.PullRequestReviewCommentAction == PullRequestReviewCommentAction.Created,
 
             _ => false
         };

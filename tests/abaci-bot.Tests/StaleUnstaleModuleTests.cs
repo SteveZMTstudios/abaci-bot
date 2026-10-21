@@ -27,6 +27,7 @@ public class StaleUnstaleModuleTests
         PullRequestAction? prAction = null,
         PullRequestReviewAction? reviewAction = null,
         IssueCommentAction? commentAction = null,
+        Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentAction? reviewCommentAction = null,
         IEnumerable<string>? existingLabels = null)
     {
         return new PullRequestContext(
@@ -45,11 +46,12 @@ public class StaleUnstaleModuleTests
             body: "PR Body",
             senderLogin: senderLogin,
             authorLogin: authorLogin,
-            action: prAction?.ToString() ?? reviewAction?.ToString() ?? commentAction?.ToString() ?? string.Empty,
+            action: prAction?.ToString() ?? reviewAction?.ToString() ?? commentAction?.ToString() ?? reviewCommentAction?.ToString() ?? string.Empty,
             existingLabels: existingLabels ?? Array.Empty<string>(),
             prAction: prAction,
             reviewAction: reviewAction,
             commentAction: commentAction,
+            reviewCommentAction: reviewCommentAction,
             senderType: senderType);
     }
 
@@ -184,5 +186,39 @@ public class StaleUnstaleModuleTests
             existingLabels: new[] { GitHubLabels.StatusStale });
 
         Assert.False(module.ShouldProcess(context));
+    }
+
+    [Fact]
+    public async Task ProcessAsync_WhenInlineReviewCommentByHumanReviewer_RemovesStatusStale()
+    {
+        var module = new StaleUnstaleModule(_botOptions);
+        var context = CreateContext(
+            PullRequestEventType.ReviewComment,
+            senderLogin: "reviewer-bob",
+            authorLogin: "author-alice",
+            reviewCommentAction: Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentAction.Created,
+            existingLabels: new[] { GitHubLabels.StatusStale });
+
+        Assert.True(module.ShouldProcess(context));
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Contains(GitHubLabels.StatusStale, context.LabelsToRemove);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_WhenInlineReviewCommentByBot_PreservesStatusStale()
+    {
+        var module = new StaleUnstaleModule(_botOptions);
+        var context = CreateContext(
+            PullRequestEventType.ReviewComment,
+            senderLogin: "ci-bot",
+            authorLogin: "author-alice",
+            reviewCommentAction: Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentAction.Created,
+            existingLabels: new[] { GitHubLabels.StatusStale });
+
+        Assert.True(module.ShouldProcess(context));
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.DoesNotContain(GitHubLabels.StatusStale, context.LabelsToRemove);
     }
 }

@@ -9,8 +9,14 @@ namespace abaci_bot.Modules;
 
 /// <summary>
 /// Multi-repository change type classification module (Priority: 35).
-/// Evaluates modified file paths using strategy pattern (IChangeTypeStrategy) to label PRs
+/// Evaluates modified file paths using strategy pattern (<see cref="IChangeTypeStrategy"/>) to label PRs
 /// with Type: Packaging, Type: Documentation, Type: Infrastructure, Type: Frontend, etc.
+/// <para>
+/// Architecture note on label consumers: These labels currently serve as human triage and search
+/// discovery indexing for maintainers, allowing dashboard filtering and domain-specific code reviews.
+/// They also serve as an architectural extension point for future automated actions (e.g. automated reviewer
+/// assignment by change type or conditional CI triggering).
+/// </para>
 /// </summary>
 public class ChangeTypeClassificationModule : IPullRequestModule
 {

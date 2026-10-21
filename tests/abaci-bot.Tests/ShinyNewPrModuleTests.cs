@@ -27,6 +27,7 @@ public class ShinyNewPrModuleTests
         PullRequestAction? prAction = null,
         PullRequestReviewAction? reviewAction = null,
         IssueCommentAction? commentAction = null,
+        Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentAction? reviewCommentAction = null,
         IEnumerable<string>? existingLabels = null)
     {
         return new PullRequestContext(
@@ -45,11 +46,12 @@ public class ShinyNewPrModuleTests
             body: "description",
             senderLogin: senderLogin,
             authorLogin: authorLogin,
-            action: prAction?.ToString() ?? reviewAction?.ToString() ?? commentAction?.ToString() ?? string.Empty,
+            action: prAction?.ToString() ?? reviewAction?.ToString() ?? commentAction?.ToString() ?? reviewCommentAction?.ToString() ?? string.Empty,
             existingLabels: existingLabels ?? Array.Empty<string>(),
             prAction: prAction,
             reviewAction: reviewAction,
             commentAction: commentAction,
+            reviewCommentAction: reviewCommentAction,
             senderType: senderType);
     }
 
@@ -229,5 +231,56 @@ public class ShinyNewPrModuleTests
         var context = CreateContext((PullRequestEventType)999, senderLogin: "user");
 
         Assert.False(module.ShouldProcess(context));
+    }
+
+    [Fact]
+    public async Task ProcessAsync_WhenInlineReviewCommentByHumanReviewer_RemovesNewLabel()
+    {
+        var module = new ShinyNewPrModule(_botOptions);
+        var context = CreateContext(
+            PullRequestEventType.ReviewComment,
+            senderLogin: "reviewer-bob",
+            authorLogin: "author-alice",
+            reviewCommentAction: Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentAction.Created,
+            existingLabels: new[] { GitHubLabels.New });
+
+        Assert.True(module.ShouldProcess(context));
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Contains(GitHubLabels.New, context.LabelsToRemove);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_WhenInlineReviewCommentByAuthor_PreservesNewLabel()
+    {
+        var module = new ShinyNewPrModule(_botOptions);
+        var context = CreateContext(
+            PullRequestEventType.ReviewComment,
+            senderLogin: "author-alice",
+            authorLogin: "author-alice",
+            reviewCommentAction: Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentAction.Created,
+            existingLabels: new[] { GitHubLabels.New });
+
+        Assert.True(module.ShouldProcess(context));
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.DoesNotContain(GitHubLabels.New, context.LabelsToRemove);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_WhenInlineReviewCommentByBot_PreservesNewLabel()
+    {
+        var module = new ShinyNewPrModule(_botOptions);
+        var context = CreateContext(
+            PullRequestEventType.ReviewComment,
+            senderLogin: "ci-bot",
+            authorLogin: "author-alice",
+            reviewCommentAction: Octokit.Webhooks.Events.PullRequestReviewComment.PullRequestReviewCommentAction.Created,
+            existingLabels: new[] { GitHubLabels.New });
+
+        Assert.True(module.ShouldProcess(context));
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.DoesNotContain(GitHubLabels.New, context.LabelsToRemove);
     }
 }

@@ -6,16 +6,17 @@ namespace abaci_bot.Options;
 public class TargetClassificationOptions
 {
     /// <summary>
-    /// Repositories dedicated exclusively to LTS releases (e.g. "openRuyi-LTS").
-    /// PRs targeted to these repositories are always tagged with Target: LTS.
+    /// Optional repositories dedicated exclusively to LTS releases (if any).
+    /// Standard OpenRuyi workflow tracks LTS releases via branch naming conventions (e.g. "lts/*")
+    /// within the primary repositories rather than separate dedicated repositories.
     /// </summary>
     public List<string> LtsRepositories { get; set; } = new();
 
     /// <summary>
-    /// Base branch name prefixes that indicate LTS tracking (e.g. "lts-", "lts/").
-    /// Default matches branches like "lts-24.03".
+    /// Base branch name prefixes that indicate LTS tracking (e.g. "lts/", "lts-").
+    /// Default matches branches like "lts/24.03" and "lts-24.03".
     /// </summary>
-    public List<string> LtsBranchPrefixes { get; set; } = new() { "lts-" };
+    public List<string> LtsBranchPrefixes { get; set; } = new() { "lts/", "lts-" };
 
     /// <summary>
     /// Base branch names that represent the standard Rolling track.
