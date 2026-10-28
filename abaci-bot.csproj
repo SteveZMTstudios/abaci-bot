@@ -11,8 +11,8 @@
 
     <ItemGroup>
       <PackageReference Include="Octokit" Version="14.0.0" />
-      <PackageReference Include="Octokit.Webhooks" Version="4.2.0" />
-      <PackageReference Include="Octokit.Webhooks.AspNetCore" Version="4.2.0" />
+      <PackageReference Include="Octokit.Webhooks" Version="4.2.3" />
+      <PackageReference Include="Octokit.Webhooks.AspNetCore" Version="4.2.3" />
     </ItemGroup>
 
     <ItemGroup>
