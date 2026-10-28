@@ -133,7 +133,7 @@ public class ChangeTypeClassificationModuleTests
     }
 
     [Fact]
-    public async Task HomepageRepo_WhenRootFilesModified_DoesNotAddSubmoduleUpdateLabel()
+    public async Task HomepageRepo_WhenRootFilesModified_DoesNotClassifyOrAddLabels()
     {
         var module = new ChangeTypeClassificationModule();
         var files = new[]
@@ -145,7 +145,7 @@ public class ChangeTypeClassificationModuleTests
 
         await module.ProcessAsync(context, CancellationToken.None);
 
-        Assert.DoesNotContain(GitHubLabels.TypeSubmoduleUpdate, context.LabelsToAdd);
+        Assert.Empty(context.LabelsToAdd);
     }
 
     [Fact]

@@ -28,7 +28,7 @@ Then edit `appsettings.json` and fill in your actual values:
 - **Instant Indicator (`new`)**: Automatically tags newly opened pull requests with `new`. Removes it as soon as a non-author human leaves a review or comment.
 - **Target Release Classification**: Tags PRs targeting rolling branches (e.g. `main`, `master`) with `Target: Rolling`, and LTS branches (e.g. `lts-24.03`) with `Target: LTS`.
 - **Build System & CI Analysis**: Inspects PR files to assign build system tags (`BuildSystem: autotools`, `cmake`, `meson`, etc.) and `CI`.
-- **Multi-Repo Change Type Classification**: Analyzes modified file paths to assign change categories (`Type: Packaging`, `Type: Documentation`, `Type: Frontend`, `Type: Submodule Update`, `Type: Infrastructure`).
+- **Multi-Repo Change Type Classification**: Analyzes modified file paths to assign change categories (`Type: Packaging`, `Type: Documentation`, `Type: Frontend`, `Type: Infrastructure`).
 - **Automated Stale Lifecycle & Auto-Close**: Periodically monitors inactive issues/PRs, marks them with `Status: Stale` after 30 days of inactivity, and auto-closes after a 7-day grace period. Human activity (push, comment, review) immediately removes `Status: Stale`.
 - **Bot Detection & Protection**: Filters bot actions (`[bot]`, whitelist, account type) so automated activity does not disrupt governance states.
 

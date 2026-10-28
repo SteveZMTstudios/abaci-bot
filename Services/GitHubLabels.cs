@@ -48,7 +48,6 @@ public static class GitHubLabels
     public const string TypePackaging = "Type: Packaging";
     public const string TypeInfrastructure = "Type: Infrastructure";
     public const string TypeFrontend = "Type: Frontend";
-    public const string TypeSubmoduleUpdate = "Type: Submodule Update";
     public const string TypeBuildFailure = "Type: Build Failure";
 
     // 8. Forward-looking: Security vulnerability severity mapping

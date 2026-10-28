@@ -346,7 +346,7 @@ public class GitHubServiceTests
     }
 
     [Fact]
-    public async Task GetRemainingRateLimitAsync_ReturnsRemainingQuota()
+    public async Task GetRateLimitSnapshotAsync_ReturnsCoreAndSearchQuotasAndResets()
     {
         var (pem, _) = GenerateRsaKeyPair();
         var (service, client) = CreateTestService(pem);
@@ -354,19 +354,31 @@ public class GitHubServiceTests
         var rateLimitClient = Substitute.For<IRateLimitClient>();
         client.RateLimit.Returns(rateLimitClient);
 
-        var rateLimit = new RateLimit(1000, 750, 123456789);
+        var coreResetTime = DateTimeOffset.UtcNow.AddMinutes(50);
+        var searchResetTime = DateTimeOffset.UtcNow.AddMinutes(1);
+        var coreRateLimit = new RateLimit(5000, 4800, coreResetTime.ToUnixTimeSeconds());
+        var searchRateLimit = new RateLimit(30, 25, searchResetTime.ToUnixTimeSeconds());
+
+        var resources = (ResourceRateLimit)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(ResourceRateLimit));
+        typeof(ResourceRateLimit).GetProperty(nameof(ResourceRateLimit.Core))?.SetValue(resources, coreRateLimit);
+        typeof(ResourceRateLimit).GetProperty(nameof(ResourceRateLimit.Search))?.SetValue(resources, searchRateLimit);
+
         var miscRateLimit = (MiscellaneousRateLimit)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(MiscellaneousRateLimit));
-        typeof(MiscellaneousRateLimit).GetProperty(nameof(MiscellaneousRateLimit.Rate))?.SetValue(miscRateLimit, rateLimit);
+        typeof(MiscellaneousRateLimit).GetProperty(nameof(MiscellaneousRateLimit.Rate))?.SetValue(miscRateLimit, coreRateLimit);
+        typeof(MiscellaneousRateLimit).GetProperty(nameof(MiscellaneousRateLimit.Resources))?.SetValue(miscRateLimit, resources);
 
         rateLimitClient.GetRateLimits().Returns(Task.FromResult(miscRateLimit));
 
-        var remaining = await service.GetRemainingRateLimitAsync();
+        var snapshot = await service.GetRateLimitSnapshotAsync();
 
-        Assert.Equal(750, remaining);
+        Assert.Equal(4800, snapshot.CoreRemaining);
+        Assert.Equal(coreResetTime.ToUnixTimeSeconds(), snapshot.CoreReset?.ToUnixTimeSeconds());
+        Assert.Equal(25, snapshot.SearchRemaining);
+        Assert.Equal(searchResetTime.ToUnixTimeSeconds(), snapshot.SearchReset?.ToUnixTimeSeconds());
     }
 
     [Fact]
-    public async Task GetRemainingRateLimitAsync_WhenApiThrows_FallsBackToLastApiInfo()
+    public async Task GetRateLimitSnapshotAsync_WhenApiThrows_FallsBackToLastApiInfo()
     {
         var (pem, _) = GenerateRsaKeyPair();
         var (service, client) = CreateTestService(pem);
@@ -379,9 +391,29 @@ public class GitHubServiceTests
         typeof(ApiInfo).GetProperty(nameof(ApiInfo.RateLimit))?.SetValue(lastApiInfo, new RateLimit(5000, 4200, 123456789));
         client.GetLastApiInfo().Returns(lastApiInfo);
 
-        var remaining = await service.GetRemainingRateLimitAsync();
+        var snapshot = await service.GetRateLimitSnapshotAsync();
 
-        Assert.Equal(4200, remaining);
+        Assert.Equal(4200, snapshot.CoreRemaining);
+        Assert.Equal(123456789, snapshot.CoreReset?.ToUnixTimeSeconds());
+        Assert.Null(snapshot.SearchRemaining);
+        Assert.Null(snapshot.SearchReset);
+    }
+
+    [Fact]
+    public async Task GetPullRequestAsync_WhenNotFound_ReturnsNull()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var prClient = Substitute.For<IPullRequestsClient>();
+        client.PullRequest.Returns(prClient);
+
+        var notFoundEx = (NotFoundException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(NotFoundException));
+        prClient.Get("owner", "repo", 999).Returns(Task.FromException<PullRequest>(notFoundEx));
+
+        var result = await service.GetPullRequestAsync("owner", "repo", 999);
+
+        Assert.Null(result);
     }
 
     [Fact]
@@ -441,7 +473,7 @@ public class GitHubServiceTests
     }
 
     [Fact]
-    public async Task GetRemainingRateLimitAsync_WhenApiAndLastApiInfoThrow_ReturnsNull()
+    public async Task GetRateLimitSnapshotAsync_WhenApiAndLastApiInfoThrow_ReturnsNullCoreRemaining()
     {
         var (pem, _) = GenerateRsaKeyPair();
         var (service, client) = CreateTestService(pem);
@@ -451,13 +483,14 @@ public class GitHubServiceTests
         rateLimitClient.GetRateLimits().Returns(Task.FromException<MiscellaneousRateLimit>(new Exception("Auth failed 401")));
         client.GetLastApiInfo().Returns((ApiInfo?)null);
 
-        var remaining = await service.GetRemainingRateLimitAsync();
+        var snapshot = await service.GetRateLimitSnapshotAsync();
 
-        Assert.Null(remaining);
+        Assert.Null(snapshot.CoreRemaining);
+        Assert.Null(snapshot.SearchRemaining);
     }
 
     [Fact]
-    public async Task GetRemainingRateLimitAsync_WhenAuthorizationException_ReturnsNull()
+    public async Task GetRateLimitSnapshotAsync_WhenAuthorizationException_ReturnsNullSnapshot()
     {
         var (pem, _) = GenerateRsaKeyPair();
         var (service, client) = CreateTestService(pem);
@@ -466,13 +499,14 @@ public class GitHubServiceTests
         client.RateLimit.Returns(rateLimitClient);
         rateLimitClient.GetRateLimits().Returns(Task.FromException<MiscellaneousRateLimit>(new AuthorizationException()));
 
-        var remaining = await service.GetRemainingRateLimitAsync();
+        var snapshot = await service.GetRateLimitSnapshotAsync();
 
-        Assert.Null(remaining);
+        Assert.Null(snapshot.CoreRemaining);
+        Assert.Null(snapshot.SearchRemaining);
     }
 
     [Fact]
-    public async Task GetRemainingRateLimitAsync_WhenApiThrowsNonAuthAndLastApiInfoHasValue_ReturnsLastRemaining()
+    public async Task GetRateLimitSnapshotAsync_WhenApiThrowsNonAuthAndLastApiInfoHasValue_ReturnsLastRemaining()
     {
         var (pem, _) = GenerateRsaKeyPair();
         var (service, client) = CreateTestService(pem);
@@ -482,13 +516,14 @@ public class GitHubServiceTests
         rateLimitClient.GetRateLimits().Returns(Task.FromException<MiscellaneousRateLimit>(new WebException("Temporary network glitch")));
         client.GetLastApiInfo().Returns(CreateMockApiInfo(42));
 
-        var remaining = await service.GetRemainingRateLimitAsync();
+        var snapshot = await service.GetRateLimitSnapshotAsync();
 
-        Assert.Equal(42, remaining);
+        Assert.Equal(42, snapshot.CoreRemaining);
+        Assert.Null(snapshot.SearchRemaining);
     }
 
     [Fact]
-    public async Task GetRemainingRateLimitAsync_WhenOperationCanceled_ThrowsOperationCanceledException()
+    public async Task GetRateLimitSnapshotAsync_WhenOperationCanceled_ThrowsOperationCanceledException()
     {
         var (pem, _) = GenerateRsaKeyPair();
         var (service, client) = CreateTestService(pem);
@@ -500,7 +535,47 @@ public class GitHubServiceTests
 
         rateLimitClient.GetRateLimits().Returns(Task.FromException<MiscellaneousRateLimit>(new OperationCanceledException(cts.Token)));
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => service.GetRemainingRateLimitAsync(cts.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => service.GetRateLimitSnapshotAsync(cts.Token));
+    }
+
+    [Fact]
+    public async Task SearchStaleCandidatesAsync_WhenRateLimitExceededDuringPagination_LogsDebugAndRethrows()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var logger = Substitute.For<ILogger<GitHubService>>();
+        var (service, client) = CreateTestService(pem, logger: logger);
+
+        var searchClient = Substitute.For<ISearchClient>();
+        client.Search.Returns(searchClient);
+
+        var page1Items = Enumerable.Range(1, 100).Select(i =>
+        {
+            var issue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+            typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issue, i);
+            return issue;
+        }).ToList();
+
+        var res1 = (SearchIssuesResult)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SearchIssuesResult));
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.Items))?.SetValue(res1, page1Items);
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.TotalCount))?.SetValue(res1, 200);
+
+        searchClient.SearchIssues(Arg.Is<SearchIssuesRequest>(r => r.Page == 1)).Returns(Task.FromResult(res1));
+
+        var rateLimitEx = (RateLimitExceededException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(RateLimitExceededException));
+        searchClient.SearchIssues(Arg.Is<SearchIssuesRequest>(r => r.Page == 2)).Returns(Task.FromException<SearchIssuesResult>(rateLimitEx));
+
+        var ex = await Assert.ThrowsAsync<RateLimitExceededException>(() =>
+            service.SearchStaleCandidatesAsync("owner", "repo", DateTimeOffset.UtcNow, isPr: false));
+
+        Assert.Same(rateLimitEx, ex);
+
+        // Verify diagnostic log includes page number and count of discarded items
+        logger.ReceivedWithAnyArgs().Log(
+            LogLevel.Debug,
+            Arg.Any<EventId>(),
+            Arg.Is<object>(o => o.ToString()!.Contains("page 2") && o.ToString()!.Contains("100")),
+            rateLimitEx,
+            Arg.Any<Func<object, Exception?, string>>());
     }
 
     [Fact]

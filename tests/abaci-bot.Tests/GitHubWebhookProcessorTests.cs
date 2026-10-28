@@ -1610,7 +1610,7 @@ public class GitHubWebhookProcessorTests
             return Task.FromResult(TeamMembers);
         }
 
-        public Task<OctokitPullRequest> GetPullRequestAsync(
+        public Task<OctokitPullRequest?> GetPullRequestAsync(
             string owner, string repo, int prNumber, CancellationToken cancellationToken = default)
         {
             var pr = (OctokitPullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(OctokitPullRequest));
@@ -1628,7 +1628,7 @@ public class GitHubWebhookProcessorTests
             }
             typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.State))?.SetValue(pr, PullRequest.State);
             typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Title))?.SetValue(pr, PullRequest.Title);
-            return Task.FromResult(pr);
+            return Task.FromResult<OctokitPullRequest?>(pr);
         }
 
         public List<int> ClosedIssues { get; } = new();
@@ -1667,14 +1667,9 @@ public class GitHubWebhookProcessorTests
             return Task.CompletedTask;
         }
 
-        public Task<int?> GetRemainingRateLimitAsync(CancellationToken ct = default)
+        public Task<GitHubRateLimitSnapshot> GetRateLimitSnapshotAsync(CancellationToken ct = default)
         {
-            return Task.FromResult(RemainingRateLimit);
-        }
-
-        public Task<int?> GetRemainingSearchRateLimitAsync(CancellationToken ct = default)
-        {
-            return Task.FromResult(RemainingSearchRateLimit);
+            return Task.FromResult(new GitHubRateLimitSnapshot(RemainingRateLimit, null, RemainingSearchRateLimit, null));
         }
     }
 
