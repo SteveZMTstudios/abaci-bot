@@ -78,8 +78,8 @@ public interface IGitHubService
     /// <param name="owner">Repository owner or organization name.</param>
     /// <param name="repo">Repository name.</param>
     /// <param name="prNumber">Pull request number.</param>
-    /// <returns>The <see cref="PullRequest"/> model from the GitHub API.</returns>
-    Task<PullRequest> GetPullRequestAsync(
+    /// <returns>The <see cref="PullRequest"/> model from the GitHub API, or <c>null</c> if not found.</returns>
+    Task<PullRequest?> GetPullRequestAsync(
         string owner, string repo, int prNumber, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -130,23 +130,10 @@ public interface IGitHubService
         string owner, string repo, int number, CancellationToken ct = default);
 
     /// <summary>
-    /// Retrieves the remaining GitHub API core rate limit for the current authenticated app installation.
+    /// Retrieves a point-in-time snapshot of both Core and Search API rate limit quotas and reset timestamps.
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>
-    /// The remaining quota count; returns <c>null</c> if authentication fails (indicating caller must abort),
-    /// or returns the last known remaining quota if a network/transient error occurs.
-    /// </returns>
-    Task<int?> GetRemainingRateLimitAsync(
-        CancellationToken ct = default);
-
-    /// <summary>
-    /// Retrieves the remaining GitHub Search API rate limit for the current authenticated app installation.
-    /// </summary>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>
-    /// The remaining search quota count; returns <c>null</c> if authentication fails or an error occurs.
-    /// </returns>
-    Task<int?> GetRemainingSearchRateLimitAsync(
+    /// <returns>A <see cref="GitHubRateLimitSnapshot"/> containing Core and Search limits and reset timestamps.</returns>
+    Task<GitHubRateLimitSnapshot> GetRateLimitSnapshotAsync(
         CancellationToken ct = default);
 }

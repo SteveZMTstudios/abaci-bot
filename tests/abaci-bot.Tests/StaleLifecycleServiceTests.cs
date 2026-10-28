@@ -20,52 +20,73 @@ public class StaleLifecycleServiceTests
 
     private readonly Dictionary<int, Issue> _issuesByNumber = new();
 
+    private static void SetProperty<T, TVal>(T obj, string propertyName, TVal value)
+    {
+        var prop = typeof(T).GetProperty(propertyName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"Property '{propertyName}' not found on {typeof(T).Name}");
+        prop.SetValue(obj, value);
+    }
+
     public StaleLifecycleServiceTests()
     {
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(5000);
-        _gitHub.GetRemainingSearchRateLimitAsync(Arg.Any<CancellationToken>()).Returns(30);
+        _gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new GitHubRateLimitSnapshot(5000, null, 30, null)));
         _gitHub.GetIssueAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<CancellationToken>())
             .Returns(callInfo =>
             {
                 var num = callInfo.ArgAt<int>(2);
                 return _issuesByNumber.TryGetValue(num, out var issue) ? issue : null;
             });
-    }
-
-    private Issue CreateMockIssue(int number, string title, DateTimeOffset updatedAt, params string[] labelNames)
-    {
-        return CreateMockIssue(number, title, updatedAt, isDraft: false, labelNames);
+        _gitHub.GetPullRequestAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                var num = callInfo.ArgAt<int>(2);
+                if (_issuesByNumber.TryGetValue(num, out var issue) && issue.PullRequest != null)
+                {
+                    var pr = (PullRequest)RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+                    SetProperty(pr, nameof(PullRequest.Number), num);
+                    SetProperty(pr, nameof(PullRequest.Draft), issue.PullRequest.Draft);
+                    SetProperty(pr, nameof(PullRequest.State), new StringEnum<ItemState>(issue.State.Value));
+                    return Task.FromResult<PullRequest?>(pr);
+                }
+                return Task.FromResult<PullRequest?>(null);
+            });
     }
 
     /// <summary>
-    /// Creates a mock Issue. Note: in production, Draft PRs are filtered server-side
-    /// via the '-is:draft' query in GitHub Search API. The isDraft parameter allows testing
-    /// client-side defensive checks.
+    /// Creates a mock Issue representing an Issue as returned by the GitHub Issues API.
     /// </summary>
-    private Issue CreateMockIssue(int number, string title, DateTimeOffset updatedAt, bool isDraft, params string[] labelNames)
+    private Issue CreateMockIssue(int number, string title, DateTimeOffset updatedAt, params string[] labelNames)
     {
         var issue = (Issue)RuntimeHelpers.GetUninitializedObject(typeof(Issue));
-        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issue, number);
-        typeof(Issue).GetProperty(nameof(Issue.Title))?.SetValue(issue, title);
-        typeof(Issue).GetProperty(nameof(Issue.UpdatedAt))?.SetValue(issue, updatedAt);
-        typeof(Issue).GetProperty(nameof(Issue.State))?.SetValue(issue, new StringEnum<ItemState>(ItemState.Open));
-
-        if (isDraft)
-        {
-            var pr = (PullRequest)RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
-            typeof(PullRequest).GetProperty(nameof(PullRequest.Draft))?.SetValue(pr, true);
-            typeof(Issue).GetProperty(nameof(Issue.PullRequest))?.SetValue(issue, pr);
-        }
+        SetProperty(issue, nameof(Issue.Number), number);
+        SetProperty(issue, nameof(Issue.Title), title);
+        SetProperty(issue, nameof(Issue.UpdatedAt), updatedAt);
+        SetProperty(issue, nameof(Issue.State), new StringEnum<ItemState>(ItemState.Open));
 
         var labels = labelNames.Select(name =>
         {
             var label = (Label)RuntimeHelpers.GetUninitializedObject(typeof(Label));
-            typeof(Label).GetProperty(nameof(Label.Name))?.SetValue(label, name);
+            SetProperty(label, nameof(Label.Name), name);
             return label;
         }).ToList();
 
-        typeof(Issue).GetProperty(nameof(Issue.Labels))?.SetValue(issue, labels);
+        SetProperty(issue, nameof(Issue.Labels), labels);
         _issuesByNumber[number] = issue;
+        return issue;
+    }
+
+    /// <summary>
+    /// Creates a mock Issue representing a Pull Request as returned by the GitHub Issues API.
+    /// In the GitHub Issues API payload (/repos/{owner}/{repo}/issues/{number}), the embedded
+    /// 'pull_request' object contains URLs but omits the 'draft' field entirely.
+    /// </summary>
+    private Issue CreateMockPullRequestFromIssuesApi(int number, string title, DateTimeOffset updatedAt, params string[] labelNames)
+    {
+        var issue = CreateMockIssue(number, title, updatedAt, labelNames);
+        var embeddedPr = (PullRequest)RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        SetProperty(embeddedPr, nameof(PullRequest.Draft), false);
+        SetProperty(issue, nameof(Issue.PullRequest), embeddedPr);
         return issue;
     }
 
@@ -81,9 +102,6 @@ public class StaleLifecycleServiceTests
             RequestThrottleMilliseconds = 0,
             DryRun = false
         });
-
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns(5000);
 
         var candidate = CreateMockIssue(101, "Normal Issue", DateTimeOffset.UtcNow.AddDays(-35));
         _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
@@ -117,9 +135,6 @@ public class StaleLifecycleServiceTests
             DryRun = false
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns(5000);
-
         var candidate = CreateMockIssue(101, "Normal Issue", DateTimeOffset.UtcNow.AddDays(-35));
         _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
             .Returns(new List<Issue> { candidate });
@@ -147,8 +162,6 @@ public class StaleLifecycleServiceTests
             RequestThrottleMilliseconds = 0,
             DryRun = false
         });
-
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(5000);
 
         var candidate = CreateMockIssue(200, "Lock Test Issue", DateTimeOffset.UtcNow.AddDays(-35));
         _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
@@ -188,9 +201,6 @@ public class StaleLifecycleServiceTests
             DryRun = true
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns(5000);
-
         var staleCandidate = CreateMockIssue(101, "Normal Issue", DateTimeOffset.UtcNow.AddDays(-35));
         var expiredCandidate = CreateMockIssue(102, "Expired Issue", DateTimeOffset.UtcNow.AddDays(-45), GitHubLabels.StatusStale);
 
@@ -225,9 +235,6 @@ public class StaleLifecycleServiceTests
             DryRun = false
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns(5000);
-
         // Updated 40 days ago and already marked as Status: Stale
         var expiredCandidate = CreateMockIssue(102, "Abandoned Issue", DateTimeOffset.UtcNow.AddDays(-40), GitHubLabels.StatusStale);
         _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
@@ -257,9 +264,6 @@ public class StaleLifecycleServiceTests
             DryRun = false
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns(5000);
-
         var pinnedIssue = CreateMockIssue(103, "Important Pinned Issue", DateTimeOffset.UtcNow.AddDays(-60), "Status: Pinned");
         _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns(new List<Issue> { pinnedIssue });
@@ -274,7 +278,7 @@ public class StaleLifecycleServiceTests
     }
 
     [Fact]
-    public async Task RunLifecycleSweepAsync_WhenCandidateIsDraftPrOrWipTitle_SkipsStale()
+    public async Task RunLifecycleSweepAsync_WhenCandidateHasWipTitle_PreFiltersWithoutLock()
     {
         var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
         {
@@ -283,20 +287,18 @@ public class StaleLifecycleServiceTests
             DryRun = false
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns(5000);
-
-        var draftPr = CreateMockIssue(104, "Draft PR feature", DateTimeOffset.UtcNow.AddDays(-60), isDraft: true);
-        var wipIssue = CreateMockIssue(105, "WIP: Ongoing refactor", DateTimeOffset.UtcNow.AddDays(-60), isDraft: false);
+        var wipIssue = CreateMockIssue(105, "WIP: Ongoing refactor", DateTimeOffset.UtcNow.AddDays(-60));
 
         _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns(new List<Issue> { wipIssue });
         _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: true, Arg.Any<string?>(), Arg.Any<CancellationToken>())
-            .Returns(new List<Issue> { draftPr });
+            .Returns(new List<Issue>());
 
         var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
         await service.RunLifecycleSweepAsync();
 
+        // Pre-filtered by IsExempt without modifying GitHub or fetching item
+        await _gitHub.DidNotReceive().GetIssueAsync(Arg.Any<string>(), Arg.Any<string>(), 105, Arg.Any<CancellationToken>());
         await _gitHub.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default(string[])!, default);
         await _gitHub.DidNotReceive().CloseIssueAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<CancellationToken>());
     }
@@ -310,8 +312,8 @@ public class StaleLifecycleServiceTests
             MinRateLimitRemaining = 100
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns(50); // Below 100
+        _gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(50, null, 30, null)); // Below 100
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
         var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
@@ -330,8 +332,8 @@ public class StaleLifecycleServiceTests
             MinRateLimitRemaining = 100
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns((int?)null); // Auth/network failure indicator
+        _gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(null, null, 30, null)); // Auth/network failure indicator
 
         var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
         await service.RunLifecycleSweepAsync();
@@ -365,7 +367,6 @@ public class StaleLifecycleServiceTests
             MinRateLimitRemaining = 100
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(5000);
         _gitHub.SearchStaleCandidatesAsync("valid-org", "valid-repo", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns(new List<Issue>());
 
@@ -386,7 +387,6 @@ public class StaleLifecycleServiceTests
             MinRateLimitRemaining = 100
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(5000);
         _gitHub.SearchStaleCandidatesAsync("org", "repo2", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns(new List<Issue>());
 
@@ -411,9 +411,6 @@ public class StaleLifecycleServiceTests
             RequestThrottleMilliseconds = 1,
             DryRun = false
         });
-
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns(5000);
 
         var candidate1 = CreateMockIssue(101, "Issue 1", DateTimeOffset.UtcNow.AddDays(-35));
         var candidate2 = CreateMockIssue(102, "Issue 2", DateTimeOffset.UtcNow.AddDays(-35));
@@ -444,7 +441,7 @@ public class StaleLifecycleServiceTests
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
         await service.StartAsync(cts.Token);
 
-        await _gitHub.DidNotReceive().GetRemainingRateLimitAsync(Arg.Any<CancellationToken>());
+        await _gitHub.DidNotReceive().GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -465,7 +462,7 @@ public class StaleLifecycleServiceTests
 
         await service.CallExecuteAsync(cts.Token);
 
-        await _gitHub.DidNotReceive().GetRemainingRateLimitAsync(Arg.Any<CancellationToken>());
+        await _gitHub.DidNotReceive().GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -497,9 +494,6 @@ public class StaleLifecycleServiceTests
             MinRateLimitRemaining = 100
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns(5000);
-
         _gitHub.SearchStaleCandidatesAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns(new List<Issue>());
 
@@ -514,7 +508,7 @@ public class StaleLifecycleServiceTests
         // Wait brief moment for the initial sweep to execute
         await Task.Delay(30);
 
-        await _gitHub.Received().GetRemainingRateLimitAsync(Arg.Any<CancellationToken>());
+        await _gitHub.Received().GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -527,9 +521,6 @@ public class StaleLifecycleServiceTests
             MonitoredRepositories = new List<string> { "openRuyi-Project/openRuyi" },
             MinRateLimitRemaining = 100
         });
-
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns(5000);
 
         _gitHub.SearchStaleCandidatesAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns<IReadOnlyList<Issue>>(_ => throw new InvalidOperationException("Simulated unexpected sweep failure"));
@@ -564,7 +555,8 @@ public class StaleLifecycleServiceTests
         });
 
         // Always low quota
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(10);
+        _gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(10, null, 30, null));
 
         var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance)
         {
@@ -588,10 +580,7 @@ public class StaleLifecycleServiceTests
             DryRun = false
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>())
-            .Returns(5000);
-
-        var expiredCandidate = CreateMockIssue(103, "Stale Issue", DateTimeOffset.UtcNow.AddDays(-10), isDraft: false, GitHubLabels.StatusStale);
+        var expiredCandidate = CreateMockIssue(103, "Stale Issue", DateTimeOffset.UtcNow.AddDays(-10), GitHubLabels.StatusStale);
 
         _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
             .Returns(new List<Issue>());
@@ -619,8 +608,6 @@ public class StaleLifecycleServiceTests
             RequestThrottleMilliseconds = 0,
             DryRun = false
         });
-
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(5000);
 
         var candidate1 = CreateMockIssue(101, "Candidate 1", DateTimeOffset.UtcNow.AddDays(-35));
         var candidate2 = CreateMockIssue(102, "Candidate 2", DateTimeOffset.UtcNow.AddDays(-35));
@@ -661,10 +648,8 @@ public class StaleLifecycleServiceTests
             DryRun = false
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(5000);
-
-        var candidate1 = CreateMockIssue(201, "Stale 1", DateTimeOffset.UtcNow.AddDays(-10), isDraft: false, GitHubLabels.StatusStale);
-        var candidate2 = CreateMockIssue(202, "Stale 2", DateTimeOffset.UtcNow.AddDays(-10), isDraft: false, GitHubLabels.StatusStale);
+        var candidate1 = CreateMockIssue(201, "Stale 1", DateTimeOffset.UtcNow.AddDays(-10), GitHubLabels.StatusStale);
+        var candidate2 = CreateMockIssue(202, "Stale 2", DateTimeOffset.UtcNow.AddDays(-10), GitHubLabels.StatusStale);
 
         _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
             .Returns(new List<Issue>());
@@ -702,8 +687,6 @@ public class StaleLifecycleServiceTests
             RequestThrottleMilliseconds = 0,
             DryRun = false
         });
-
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(5000);
 
         var candidate = CreateMockIssue(101, "Candidate", DateTimeOffset.UtcNow.AddDays(-35));
 
@@ -832,8 +815,8 @@ public class StaleLifecycleServiceTests
         });
 
         // Core quota is plentiful (5000), but Search API quota is exhausted (0)
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(5000);
-        _gitHub.GetRemainingSearchRateLimitAsync(Arg.Any<CancellationToken>()).Returns(0);
+        _gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, null, 0, null));
 
         var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance)
         {
@@ -860,8 +843,8 @@ public class StaleLifecycleServiceTests
         });
 
         // Core quota is plentiful (5000), but Search API quota is strictly below MinSearchWatermarkPerSweep (4)
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(5000);
-        _gitHub.GetRemainingSearchRateLimitAsync(Arg.Any<CancellationToken>()).Returns(remainingSearch);
+        _gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, null, remainingSearch, null));
 
         var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance)
         {
@@ -883,9 +866,6 @@ public class StaleLifecycleServiceTests
             MinRateLimitRemaining = 100
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(5000);
-        _gitHub.GetRemainingSearchRateLimitAsync(Arg.Any<CancellationToken>()).Returns(30);
-
         var rateLimitEx = (RateLimitExceededException)RuntimeHelpers.GetUninitializedObject(typeof(RateLimitExceededException));
         _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromException<IReadOnlyList<Issue>>(rateLimitEx));
@@ -897,7 +877,7 @@ public class StaleLifecycleServiceTests
     }
 
     [Fact]
-    public async Task RunLifecycleSweepAsync_WhenCoreRateLimitExceededDuringCandidateProcessing_AbortsSweepGracefully()
+    public async Task RunLifecycleSweepAsync_WhenRateLimitExceededDuringStaleMarking_AbortsEntireSweepImmediately()
     {
         var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
         {
@@ -908,9 +888,6 @@ public class StaleLifecycleServiceTests
             DryRun = false
         });
 
-        _gitHub.GetRemainingRateLimitAsync(Arg.Any<CancellationToken>()).Returns(5000);
-        _gitHub.GetRemainingSearchRateLimitAsync(Arg.Any<CancellationToken>()).Returns(30);
-
         var staleIssue1 = CreateMockIssue(101, "Issue 101", DateTimeOffset.UtcNow.AddDays(-40));
         var staleIssue2 = CreateMockIssue(102, "Issue 102", DateTimeOffset.UtcNow.AddDays(-40));
 
@@ -920,15 +897,233 @@ public class StaleLifecycleServiceTests
             .Returns(new List<Issue>());
 
         var rateLimitEx = (RateLimitExceededException)RuntimeHelpers.GetUninitializedObject(typeof(RateLimitExceededException));
-        _gitHub.GetIssueAsync("openRuyi-Project", "openRuyi", 101, Arg.Any<CancellationToken>())
-            .Returns(Task.FromException<Issue?>(rateLimitEx));
+        _gitHub.CreateCommentAsync("openRuyi-Project", "openRuyi", 101, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromException<IssueComment>(rateLimitEx)); // RateLimitExceededException during stale marking
 
         var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
 
         await service.RunLifecycleSweepAsync();
 
-        // Issue 102 should NOT be processed because loop was aborted on RateLimitExceededException
+        // 1. Issue 102 should NOT be processed
         await _gitHub.DidNotReceive().GetIssueAsync("openRuyi-Project", "openRuyi", 102, Arg.Any<CancellationToken>());
+
+        // 2. Stage 3 search for close candidates must NOT be executed at all
+        await _gitHub.DidNotReceive().SearchStaleCandidatesAsync(
+            "openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Is<string?>(s => s != null && s.StartsWith("label:")), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task RunLifecycleSweepAsync_WhenSearchQuotaUnavailable_AbortsSweepSafely()
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
+        {
+            MonitoredRepositories = new List<string> { "openRuyi-Project/openRuyi" },
+            MinRateLimitRemaining = 100
+        });
+
+        // Search quota is null (e.g. rate limit response did not contain search quota or header omitted)
+        _gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, null, null, null));
+
+        var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance)
+        {
+            RetryDelay = TimeSpan.Zero
+        };
+
+        await service.RunLifecycleSweepAsync();
+
+        // Fail-safe: Should abort sweep without calling search
+        await _gitHub.DidNotReceive().SearchStaleCandidatesAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task RunLifecycleSweepAsync_WhenServerResetTimeExceedsThreshold_AbortsSweepImmediately()
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
+        {
+            MonitoredRepositories = new List<string> { "openRuyi-Project/openRuyi" },
+            MinRateLimitRemaining = 100
+        });
+
+        // Search quota below watermark, and reset is 45 minutes in the future (exceeding 30 min safety cap)
+        var futureReset = DateTimeOffset.UtcNow.AddMinutes(45);
+        _gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, null, 1, futureReset));
+
+        var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
+
+        await service.RunLifecycleSweepAsync();
+
+        // Should abort immediately without waiting or searching
+        await _gitHub.Received(1).GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>());
+        await _gitHub.DidNotReceive().SearchStaleCandidatesAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<CancellationToken>());
+    }
+
+    [Theory]
+    [InlineData(10)]    // Future reset (10ms)
+    [InlineData(-5000)] // Past reset (-5s)
+    public async Task RunLifecycleSweepAsync_WhenQuotaLowWithResetTarget_ProbesAgainInsteadOfAborting(int resetOffsetMs)
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
+        {
+            MonitoredRepositories = new List<string> { "openRuyi-Project/openRuyi" },
+            MinRateLimitRemaining = 100
+        });
+
+        var resetTime = DateTimeOffset.UtcNow.AddMilliseconds(resetOffsetMs);
+        var lowSnapshot = new GitHubRateLimitSnapshot(5000, null, 1, resetTime);
+        var healthySnapshot = new GitHubRateLimitSnapshot(5000, null, 30, null);
+
+        var callCount = 0;
+        _gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(++callCount == 1 ? lowSnapshot : healthySnapshot));
+
+        _gitHub.SearchStaleCandidatesAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+
+        var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance)
+        {
+            RetryDelay = TimeSpan.Zero
+        };
+
+        await service.RunLifecycleSweepAsync();
+
+        // Verifies it probed again and then successfully resumed candidate discovery
+        await _gitHub.Received(2).GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>());
+        await _gitHub.Received().SearchStaleCandidatesAsync(
+            "openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<CancellationToken>());
+    }
+
+    public enum PrEligibilityScenario
+    {
+        Eligible,
+        Draft,
+        NotFound,
+        Closed
+    }
+
+    [Theory]
+    [InlineData(PrEligibilityScenario.Eligible)]
+    [InlineData(PrEligibilityScenario.Draft)]
+    [InlineData(PrEligibilityScenario.NotFound)]
+    [InlineData(PrEligibilityScenario.Closed)]
+    public async Task RunLifecycleSweepAsync_PullRequestEligibilityVerification_HandlesVariousStates(PrEligibilityScenario scenario)
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
+        {
+            MonitoredRepositories = new List<string> { "openRuyi-Project/openRuyi" },
+            StaleDays = 30,
+            CloseDays = 7,
+            DryRun = false
+        });
+
+        var prIssue = CreateMockPullRequestFromIssuesApi(101, "Candidate PR", DateTimeOffset.UtcNow.AddDays(-40));
+
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: true, Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue> { prIssue });
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Is<string?>(s => s != null && s.StartsWith("label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+
+        PullRequest? prResult = null;
+        if (scenario != PrEligibilityScenario.NotFound)
+        {
+            var fullPr = (PullRequest)RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+            SetProperty(fullPr, nameof(PullRequest.Number), 101);
+            SetProperty(fullPr, nameof(PullRequest.Draft), scenario == PrEligibilityScenario.Draft);
+            SetProperty(fullPr, nameof(PullRequest.State), new StringEnum<ItemState>(scenario == PrEligibilityScenario.Closed ? ItemState.Closed : ItemState.Open));
+            prResult = fullPr;
+        }
+
+        _gitHub.GetPullRequestAsync("openRuyi-Project", "openRuyi", 101, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<PullRequest?>(prResult));
+
+        var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
+        await service.RunLifecycleSweepAsync();
+
+        if (scenario == PrEligibilityScenario.Eligible)
+        {
+            // Positive verification (P2-1): Eligible open non-draft PR is marked stale and commented on
+            await _gitHub.Received(1).AddLabelsAsync(
+                "openRuyi-Project", "openRuyi", 101, Arg.Is<string[]>(labels => labels.Contains(GitHubLabels.StatusStale)), Arg.Any<CancellationToken>());
+            await _gitHub.Received(1).CreateCommentAsync(
+                "openRuyi-Project", "openRuyi", 101, Arg.Any<string>(), Arg.Any<CancellationToken>());
+        }
+        else
+        {
+            // Defensive verification: Ineligible states must not be marked stale or commented on
+            await _gitHub.DidNotReceive().AddLabelsAsync(
+                "openRuyi-Project", "openRuyi", 101, Arg.Any<string[]>(), Arg.Any<CancellationToken>());
+            await _gitHub.DidNotReceive().CreateCommentAsync(
+                "openRuyi-Project", "openRuyi", 101, Arg.Any<string>(), Arg.Any<CancellationToken>());
+        }
+    }
+
+    [Fact]
+    public async Task RunLifecycleSweepAsync_WhenPullRequestRecentlyUpdated_RejectsBeforeFetchingRemotePullRequest()
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
+        {
+            MonitoredRepositories = new List<string> { "openRuyi-Project/openRuyi" },
+            StaleDays = 30,
+            CloseDays = 7,
+            DryRun = false
+        });
+
+        // Search returned a stale issue, but authoritative GetIssueAsync reveals it was recently updated (5 minutes ago)
+        var prIssue = CreateMockPullRequestFromIssuesApi(101, "Candidate PR", DateTimeOffset.UtcNow.AddDays(-40));
+        var recentlyUpdatedIssue = CreateMockPullRequestFromIssuesApi(101, "Candidate PR", DateTimeOffset.UtcNow.AddMinutes(-5));
+
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: true, Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue> { prIssue });
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Is<string?>(s => s != null && s.StartsWith("label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+
+        _gitHub.GetIssueAsync("openRuyi-Project", "openRuyi", 101, Arg.Any<CancellationToken>())
+            .Returns(recentlyUpdatedIssue);
+
+        var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
+        await service.RunLifecycleSweepAsync();
+
+        // Must reject via in-memory UpdatedAt check BEFORE making the network call to GetPullRequestAsync (P3-4)
+        await _gitHub.DidNotReceive().GetPullRequestAsync(
+            "openRuyi-Project", "openRuyi", 101, Arg.Any<CancellationToken>());
+        await _gitHub.DidNotReceive().AddLabelsAsync(
+            "openRuyi-Project", "openRuyi", 101, Arg.Any<string[]>(), Arg.Any<CancellationToken>());
+    }
+
+    [Theory]
+    [InlineData(true, true, 50, 20, null)]
+    [InlineData(false, false, 60, 20, 60)]
+    [InlineData(false, false, 20, 60, 60)]
+    [InlineData(false, false, null, 20, 20)]
+    [InlineData(false, false, 60, null, 60)]
+    [InlineData(false, true, 60, 20, 60)]
+    [InlineData(true, false, 60, 20, 20)]
+    public void SelectBackoffTarget_SelectsAppropriateResetWindow(
+        bool isCoreHealthy, bool isSearchHealthy, int? coreOffsetSec, int? searchOffsetSec, int? expectedOffsetSec)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var coreReset = coreOffsetSec.HasValue ? now.AddSeconds(coreOffsetSec.Value) : (DateTimeOffset?)null;
+        var searchReset = searchOffsetSec.HasValue ? now.AddSeconds(searchOffsetSec.Value) : (DateTimeOffset?)null;
+        var snapshot = new GitHubRateLimitSnapshot(100, coreReset, 10, searchReset);
+
+        var result = StaleLifecycleService.SelectBackoffTarget(isCoreHealthy, isSearchHealthy, snapshot);
+
+        if (expectedOffsetSec.HasValue)
+        {
+            Assert.NotNull(result);
+            Assert.Equal(now.AddSeconds(expectedOffsetSec.Value).ToUnixTimeSeconds(), result.Value.ToUnixTimeSeconds());
+        }
+        else
+        {
+            Assert.Null(result);
+        }
     }
 
     private class TestableStaleLifecycleService : StaleLifecycleService

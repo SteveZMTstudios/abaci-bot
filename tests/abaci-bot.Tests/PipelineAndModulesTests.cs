@@ -508,7 +508,7 @@ public class PipelineAndModulesTests
 
         var prCallCount = 0;
         gitHub.GetPullRequestAsync("owner", "repo", 100, Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(++prCallCount == 1 ? initialPr : freshPr));
+            .Returns(_ => Task.FromResult<PullRequest?>(++prCallCount == 1 ? initialPr : freshPr));
 
         // Execute pipeline: should catch the partial failure, query GetPullRequestAsync, recompute diff, and retry
         await pipeline.ExecuteAsync(context);
@@ -552,8 +552,8 @@ public class PipelineAndModulesTests
         // Call 1 is post-lock refresh; call 2 is automated recovery
         gitHub.GetPullRequestAsync("owner", "repo", 100, Arg.Any<CancellationToken>())
             .Returns(_ => ++prCallCount == 1
-                ? Task.FromResult(initialPr)
-                : Task.FromException<PullRequest>(new HttpRequestException("Remote network unreachable")));
+                ? Task.FromResult<PullRequest?>(initialPr)
+                : Task.FromException<PullRequest?>(new HttpRequestException("Remote network unreachable")));
 
         var aggEx = await Assert.ThrowsAsync<AggregateException>(() => pipeline.ExecuteAsync(context));
         Assert.Equal(2, aggEx.InnerExceptions.Count);
@@ -591,7 +591,7 @@ public class PipelineAndModulesTests
 
         // Call 1 is post-lock refresh; call 2 is automated recovery
         gitHub.GetPullRequestAsync("owner", "repo", 100, Arg.Any<CancellationToken>())
-            .Returns(_ => ++prCallCount == 1 ? Task.FromResult<PullRequest>(initialPr) : Task.FromResult<PullRequest>(null!));
+            .Returns(_ => ++prCallCount == 1 ? Task.FromResult<PullRequest?>(initialPr) : Task.FromResult<PullRequest?>(null));
 
         var aggEx = await Assert.ThrowsAsync<AggregateException>(() => pipeline.ExecuteAsync(context));
         Assert.Equal(2, aggEx.InnerExceptions.Count);
@@ -634,7 +634,7 @@ public class PipelineAndModulesTests
 
         // Call 1 is post-lock refresh; call 2 is automated recovery
         gitHub.GetPullRequestAsync("owner", "repo", 100, Arg.Any<CancellationToken>())
-            .Returns(_ => ++prCallCount == 1 ? Task.FromResult(initialPr) : Task.FromResult(freshPrWithoutLabels));
+            .Returns(_ => ++prCallCount == 1 ? Task.FromResult<PullRequest?>(initialPr) : Task.FromResult<PullRequest?>(freshPrWithoutLabels));
 
         var aggEx = await Assert.ThrowsAsync<AggregateException>(() => pipeline.ExecuteAsync(context));
         Assert.Equal(2, aggEx.InnerExceptions.Count);
@@ -679,11 +679,11 @@ public class PipelineAndModulesTests
             {
                 recoveryCallCount++;
                 if (recoveryCallCount == 1)
-                    return freshPr;
+                    return (PullRequest?)freshPr;
 
                 var ct = ci.Arg<CancellationToken>();
                 await Task.Delay(10000, ct);
-                return freshPr;
+                return (PullRequest?)freshPr;
             });
 
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
@@ -796,7 +796,7 @@ public class PipelineAndModulesTests
 
         var prCalls = 0;
         gitHub.GetPullRequestAsync("owner", "repo", 100, Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(++prCalls == 1 ? initialPr : recoveryPr));
+            .Returns(_ => Task.FromResult<PullRequest?>(++prCalls == 1 ? initialPr : recoveryPr));
 
         // Pipeline should throw OperationCanceledException directly without wrapping in AggregateException
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pipeline.ExecuteAsync(context, cts.Token));
@@ -848,7 +848,7 @@ public class PipelineAndModulesTests
 
         var getPrCalls = 0;
         gitHub.GetPullRequestAsync("owner", "repo", 100, Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(++getPrCalls == 1 ? initialPr : freshPr));
+            .Returns(_ => Task.FromResult<PullRequest?>(++getPrCalls == 1 ? initialPr : freshPr));
 
         // Step 3: Recovery retries RemoveLabelAsync and succeeds
         gitHub.RemoveLabelAsync("owner", "repo", 100, GitHubLabels.WorkflowReadyForReview, Arg.Any<CancellationToken>())
@@ -921,7 +921,7 @@ public class PipelineAndModulesTests
 
         var getPrCalls = 0;
         gitHub.GetPullRequestAsync("owner", "repo", 100, Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult(++getPrCalls == 1 ? initialPr : freshPr));
+            .Returns(_ => Task.FromResult<PullRequest?>(++getPrCalls == 1 ? initialPr : freshPr));
 
         // Recovery write: RemoveLabelAsync removes label from fake remote state
         gitHub.RemoveLabelAsync("owner", "repo", 100, GitHubLabels.WorkflowReadyForReview, Arg.Any<CancellationToken>())
@@ -990,7 +990,7 @@ public class PipelineAndModulesTests
         var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Existing: Label" });
 
         gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
-            .Returns<PullRequest>(_ => throw new HttpRequestException("Simulated API failure"));
+            .Throws(new HttpRequestException("Simulated API failure"));
 
         await pipeline.ExecuteAsync(context, CancellationToken.None);
 
@@ -1001,6 +1001,31 @@ public class PipelineAndModulesTests
             Arg.Any<Exception?>(),
             Arg.Any<Func<object, Exception?, string>>());
 
+        await gitHub.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default(string[])!, default);
+        await gitHub.DidNotReceiveWithAnyArgs().RemoveLabelAsync(default!, default!, default, default!, default);
+    }
+
+    [Fact]
+    public async Task PullRequestPipeline_PostLockRefreshReturnsNull_AbortsImmediatelyWithoutRetries()
+    {
+        var module = Substitute.For<IPullRequestModule>();
+        module.Priority.Returns(10);
+        module.ShouldProcess(Arg.Any<PullRequestContext>()).Returns(true);
+
+        var gitHub = Substitute.For<IGitHubService>();
+        var logger = Substitute.For<ILogger<PullRequestPipeline>>();
+        var mutexEngine = new LabelMutexEngine();
+        var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub, logger);
+        var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Existing: Label" });
+
+        gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<PullRequest?>(null));
+
+        await pipeline.ExecuteAsync(context, CancellationToken.None);
+
+        // Crucial distinction (P2-1): 404/null PR aborts immediately on attempt 0 without retrying 3 times
+        await gitHub.Received(1).GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>());
+        await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
         await gitHub.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default(string[])!, default);
         await gitHub.DidNotReceiveWithAnyArgs().RemoveLabelAsync(default!, default!, default, default!, default);
     }
@@ -1165,7 +1190,7 @@ public class PipelineAndModulesTests
         typeof(PullRequest).GetProperty(nameof(PullRequest.Base))?.SetValue(freshPr, baseRef);
 
         gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(freshPr));
+            .Returns(Task.FromResult<PullRequest?>(freshPr));
 
         var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Stale: Label" });
         var refreshed = await context.RefreshAsync();
@@ -1191,7 +1216,7 @@ public class PipelineAndModulesTests
         typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(freshPr, Array.Empty<Octokit.Label>());
 
         gitHub.GetPullRequestAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(freshPr));
+            .Returns(Task.FromResult<PullRequest?>(freshPr));
 
         var prEvent = (Octokit.Webhooks.Events.PullRequest.PullRequestReadyForReviewEvent)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.Webhooks.Events.PullRequest.PullRequestReadyForReviewEvent));
         var pr = (Octokit.Webhooks.Models.PullRequestEvent.PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.Webhooks.Models.PullRequestEvent.PullRequest));
@@ -1213,7 +1238,7 @@ public class PipelineAndModulesTests
         typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(freshPr, Array.Empty<Octokit.Label>());
 
         gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(freshPr));
+            .Returns(Task.FromResult<PullRequest?>(freshPr));
 
         var context = CreateMockContext(
             gitHub,
@@ -1237,7 +1262,7 @@ public class PipelineAndModulesTests
         typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(freshPr, Array.Empty<Octokit.Label>());
 
         gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(freshPr));
+            .Returns(Task.FromResult<PullRequest?>(freshPr));
 
         var context = CreateMockContext(
             gitHub,
@@ -1257,7 +1282,7 @@ public class PipelineAndModulesTests
     {
         var gitHub = Substitute.For<IGitHubService>();
         gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult<PullRequest>(null!));
+            .Returns(Task.FromResult<PullRequest?>(null));
 
         var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Original: Label" });
         var refreshed = await context.RefreshAsync();
@@ -1271,7 +1296,7 @@ public class PipelineAndModulesTests
     {
         var gitHub = Substitute.For<IGitHubService>();
         gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
-            .Returns<PullRequest>(_ => throw new InvalidOperationException("Simulated API glitch"));
+            .Throws(new InvalidOperationException("Simulated API glitch"));
 
         var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Original: Label" });
         var refreshed = await context.RefreshAsync();
@@ -1288,7 +1313,7 @@ public class PipelineAndModulesTests
         cts.Cancel();
 
         gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
-            .Returns<PullRequest>(_ => throw new OperationCanceledException(cts.Token));
+            .Throws(new OperationCanceledException(cts.Token));
 
         var context = CreateMockContext(gitHub, prNumber: 42);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => context.RefreshAsync(cts.Token));
@@ -1905,7 +1930,7 @@ public class PipelineAndModulesTests
             typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(defaultPr, labelObjs);
 
             gitHub.GetPullRequestAsync(Arg.Any<string>(), Arg.Any<string>(), prNumber, Arg.Any<CancellationToken>())
-                .Returns(Task.FromResult(defaultPr));
+                .Returns(Task.FromResult<PullRequest?>(defaultPr));
         }
 
         return new PullRequestContext(
@@ -2022,7 +2047,7 @@ public class PipelineAndModulesTests
 
         // Remote GitHub already has Workflow: Ready For Review, but refresh fails transients
         gitHub.GetPullRequestAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<CancellationToken>())
-            .Returns<PullRequest>(_ => throw new HttpRequestException("Simulated transient network failure"));
+            .Throws(new HttpRequestException("Simulated transient network failure"));
 
         await pipeline.ExecuteAsync(context);
 
@@ -2042,7 +2067,7 @@ public class PipelineAndModulesTests
         typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(freshPr, Array.Empty<Octokit.Label>());
 
         gitHub.GetPullRequestAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(freshPr));
+            .Returns(Task.FromResult<PullRequest?>(freshPr));
 
         var prEvent = (Octokit.Webhooks.Events.PullRequest.PullRequestConvertedToDraftEvent)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.Webhooks.Events.PullRequest.PullRequestConvertedToDraftEvent));
         var pr = (Octokit.Webhooks.Models.PullRequestEvent.PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.Webhooks.Models.PullRequestEvent.PullRequest));
@@ -2069,7 +2094,7 @@ public class PipelineAndModulesTests
         typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(freshPr, Array.Empty<Octokit.Label>());
 
         gitHub.GetPullRequestAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(freshPr));
+            .Returns(Task.FromResult<PullRequest?>(freshPr));
 
         var prEvent = (Octokit.Webhooks.Events.PullRequest.PullRequestClosedEvent)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.Webhooks.Events.PullRequest.PullRequestClosedEvent));
         var pr = (Octokit.Webhooks.Models.PullRequestEvent.PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.Webhooks.Models.PullRequestEvent.PullRequest));
@@ -2119,11 +2144,11 @@ public class PipelineAndModulesTests
                 var ct = ci.Arg<CancellationToken>();
                 if (++prCallCount == 1)
                 {
-                    return initialPr;
+                    return (PullRequest?)initialPr;
                 }
                 // Simulate recovery timeout by waiting on recoveryToken until canceled
                 await Task.Delay(Timeout.Infinite, ct);
-                return initialPr;
+                return (PullRequest?)initialPr;
             });
 
         // Initial write throws TaskCanceledException
@@ -2688,7 +2713,7 @@ public class PipelineAndModulesTests
         typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(freshPr, null);
 
         gitHub.GetPullRequestAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(freshPr));
+            .Returns(Task.FromResult<PullRequest?>(freshPr));
 
         var context = CreateMockContext(gitHub, prNumber: 1, existingLabels: new[] { "existing-label" });
 
@@ -2722,7 +2747,7 @@ public class PipelineAndModulesTests
                     return lbl;
                 }).ToList();
                 typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(freshPr, labelList);
-                return Task.FromResult(freshPr);
+                return Task.FromResult<PullRequest?>(freshPr);
             });
 
         gitHub.AddLabelsAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<string[]>(), Arg.Any<CancellationToken>())
@@ -2784,7 +2809,7 @@ public class PipelineAndModulesTests
                     return lbl;
                 }).ToList();
                 typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(freshPr, labelList);
-                return Task.FromResult(freshPr);
+                return Task.FromResult<PullRequest?>(freshPr);
             });
 
         gitHub.AddLabelsAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<string[]>(), Arg.Any<CancellationToken>())
@@ -2861,7 +2886,7 @@ public class PipelineAndModulesTests
                     return lbl;
                 }).ToList();
                 typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(freshPr, labelList);
-                return Task.FromResult(freshPr);
+                return Task.FromResult<PullRequest?>(freshPr);
             });
 
         gitHub.AddLabelsAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<string[]>(), Arg.Any<CancellationToken>())
@@ -2941,7 +2966,7 @@ public class PipelineAndModulesTests
                     return lbl;
                 }).ToList();
                 typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(freshPr, labelList);
-                return Task.FromResult(freshPr);
+                return Task.FromResult<PullRequest?>(freshPr);
             });
 
         gitHub.GetPullRequestFilesAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<CancellationToken>())
@@ -3017,7 +3042,7 @@ public class PipelineAndModulesTests
                     return lbl;
                 }).ToList();
                 typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(freshPr, labelList);
-                return Task.FromResult(freshPr);
+                return Task.FromResult<PullRequest?>(freshPr);
             });
 
         gitHub.GetPullRequestAuthorEmailAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<CancellationToken>())

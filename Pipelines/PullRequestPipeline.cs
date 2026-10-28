@@ -73,10 +73,12 @@ public class PullRequestPipeline
             }
 
             var lastEx = context.LastRefreshException;
-            if (lastEx != null && IsNonRetriable(lastEx))
+            // When freshPr is null (404 Not Found), RefreshAsync returns false without exception.
+            // Treat missing remote PR or non-retriable exceptions as immediate abort conditions.
+            if (lastEx == null || IsNonRetriable(lastEx))
             {
-                _logger?.LogError(lastEx,
-                    "Non-retriable error refreshing remote PR {Owner}/{Repo}#{PrNumber}; aborting refresh.",
+                _logger?.LogWarning(lastEx,
+                    "Aborting remote PR refresh for {Owner}/{Repo}#{PrNumber} due to non-retriable condition (not found or client error).",
                     context.Owner, context.Repo, context.PrNumber);
                 break;
             }
@@ -100,7 +102,7 @@ public class PullRequestPipeline
         if (!refreshed)
         {
             _logger?.LogError(
-                "Post-lock refresh failed for {Owner}/{Repo}#{PrNumber} after retries; aborting label mutation to prevent stale state writes.",
+                "Post-lock refresh failed for {Owner}/{Repo}#{PrNumber}; aborting label mutation to prevent stale state writes.",
                 context.Owner, context.Repo, context.PrNumber);
             return;
         }

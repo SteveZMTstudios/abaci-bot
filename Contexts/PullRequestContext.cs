@@ -341,8 +341,11 @@ public class PullRequestContext
             return new HashSet<string>(members, StringComparer.OrdinalIgnoreCase);
         });
 
-        PullRequest = new Lazy<Task<PullRequest>>(() =>
-            _gitHubService.GetPullRequestAsync(Owner, Repo, PrNumber, CancellationToken));
+        // Invariant assertion: PullRequestPipeline aborts before executing modules if RefreshAsync fails or returns 404.
+        // This guard guarantees downstream modules receive an authoritative non-null PullRequest instance.
+        PullRequest = new Lazy<Task<PullRequest>>(async () =>
+            await _gitHubService.GetPullRequestAsync(Owner, Repo, PrNumber, CancellationToken)
+            ?? throw new InvalidOperationException($"Pull request #{PrNumber} not found on repository {Owner}/{Repo}."));
     }
 
 
@@ -544,7 +547,7 @@ public class PullRequestContext
     /// <summary>
     /// Refreshes the pull request state and existing labels from GitHub after acquiring the concurrency lock.
     /// Ensures that modules and mutex calculation evaluate against current remote state rather than stale webhook payloads.
-    /// Returns true if remote state was refreshed successfully; false if a transient failure occurred and payload state was retained.
+    /// Returns true if remote state was refreshed successfully; false if remote pull request was not found (404) or a failure occurred (in which case <see cref="LastRefreshException"/> is populated and webhook payload state is retained).
     /// </summary>
     public async Task<bool> RefreshAsync(CancellationToken cancellationToken = default)
     {

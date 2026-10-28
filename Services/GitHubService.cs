@@ -204,13 +204,20 @@ public class GitHubService : IGitHubService, IDisposable
         return members.Select(m => m.Login).ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
 
-    public async Task<PullRequest> GetPullRequestAsync(string owner, string repo, int prNumber, CancellationToken cancellationToken = default)
+    public async Task<PullRequest?> GetPullRequestAsync(string owner, string repo, int prNumber, CancellationToken cancellationToken = default)
     {
         using var _ = SetAmbientToken(cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         await EnsureAuthenticatedAsync(cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
-        return await _client.PullRequest.Get(owner, repo, prNumber);
+        try
+        {
+            return await _client.PullRequest.Get(owner, repo, prNumber);
+        }
+        catch (NotFoundException)
+        {
+            return null;
+        }
     }
 
     public async Task<IReadOnlyList<Issue>> SearchStaleCandidatesAsync(
@@ -242,7 +249,17 @@ public class GitHubService : IGitHubService, IDisposable
                 PerPage = perPage
             };
 
-            var searchResult = await _client.Search.SearchIssues(searchRequest);
+            SearchIssuesResult searchResult;
+            try
+            {
+                searchResult = await _client.Search.SearchIssues(searchRequest);
+            }
+            catch (RateLimitExceededException ex)
+            {
+                _logger?.LogDebug(ex, "Search API rate limit exceeded during pagination (page {Page}) for {Owner}/{Repo}. Discarding {Count} partially retrieved candidates.",
+                    page, owner, repo, allItems.Count);
+                throw;
+            }
             if (searchResult.Items.Count == 0)
                 break;
 
@@ -298,14 +315,18 @@ public class GitHubService : IGitHubService, IDisposable
         await _client.Issue.Comment.Create(owner, repo, number, comment);
     }
 
-    public async Task<int?> GetRemainingRateLimitAsync(CancellationToken ct = default)
+    public async Task<GitHubRateLimitSnapshot> GetRateLimitSnapshotAsync(CancellationToken ct = default)
     {
         using var _ = SetAmbientToken(ct);
         try
         {
             await EnsureAuthenticatedAsync(ct);
             var rateLimits = await _client.RateLimit.GetRateLimits();
-            return rateLimits?.Rate?.Remaining;
+            return new GitHubRateLimitSnapshot(
+                CoreRemaining: rateLimits?.Rate?.Remaining,
+                CoreReset: rateLimits?.Rate?.Reset,
+                SearchRemaining: rateLimits?.Resources?.Search?.Remaining,
+                SearchReset: rateLimits?.Resources?.Search?.Reset);
         }
         catch (OperationCanceledException)
         {
@@ -314,37 +335,17 @@ public class GitHubService : IGitHubService, IDisposable
         catch (AuthorizationException authEx)
         {
             _logger?.LogError(authEx, "Authentication failure while requesting GitHub rate limit quota.");
-            return null;
+            return new GitHubRateLimitSnapshot(null, null, null, null);
         }
         catch (Exception ex)
         {
             _logger?.LogWarning(ex, "Failed to query GitHub rate limits due to network or API error.");
-            return _client.GetLastApiInfo()?.RateLimit?.Remaining;
-        }
-    }
-
-    public async Task<int?> GetRemainingSearchRateLimitAsync(CancellationToken ct = default)
-    {
-        using var _ = SetAmbientToken(ct);
-        try
-        {
-            await EnsureAuthenticatedAsync(ct);
-            var rateLimits = await _client.RateLimit.GetRateLimits();
-            return rateLimits?.Resources?.Search?.Remaining;
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (AuthorizationException authEx)
-        {
-            _logger?.LogError(authEx, "Authentication failure while requesting GitHub search rate limit quota.");
-            return null;
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogWarning(ex, "Failed to query GitHub search rate limits due to network or API error.");
-            return null;
+            var lastInfo = _client.GetLastApiInfo()?.RateLimit;
+            return new GitHubRateLimitSnapshot(
+                CoreRemaining: lastInfo?.Remaining,
+                CoreReset: lastInfo?.Reset,
+                SearchRemaining: null,
+                SearchReset: null);
         }
     }
 

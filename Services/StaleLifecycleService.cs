@@ -20,6 +20,8 @@ public class StaleLifecycleService : BackgroundService
     private readonly PullRequestLockManager _lockManager;
     private readonly ILogger<StaleLifecycleService> _logger;
     private const int MinSearchWatermarkPerSweep = 4;
+    private static readonly TimeSpan MaxResetWaitThreshold = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan ClockSkewBuffer = TimeSpan.FromSeconds(1);
 
     public StaleLifecycleService(
         IGitHubService gitHub,
@@ -111,8 +113,9 @@ public class StaleLifecycleService : BackgroundService
 
         while (true)
         {
-            var remainingCore = await _gitHub.GetRemainingRateLimitAsync(cancellationToken);
-            var remainingSearch = await _gitHub.GetRemainingSearchRateLimitAsync(cancellationToken);
+            var snapshot = await _gitHub.GetRateLimitSnapshotAsync(cancellationToken);
+            var remainingCore = snapshot.CoreRemaining;
+            var remainingSearch = snapshot.SearchRemaining;
 
             if (remainingCore is null)
             {
@@ -120,13 +123,16 @@ public class StaleLifecycleService : BackgroundService
                 return;
             }
 
+            if (remainingSearch is null)
+            {
+                _logger.LogError("GitHub Search rate limit quota is unavailable or unverified. Aborting stale sweep for {Owner}/{Repo}.", owner, repo);
+                return;
+            }
+
             // Watermark requirement: Minimum 4 search calls per repository sweep
             // (2 for stale candidate discovery: issues + PRs; 2 for close candidate discovery: issues + PRs).
-            // Note on fail-open: If remainingSearch is null (rate limit probe failed due to transient network glitch),
-            // we fail-open and proceed with the sweep so a temporary probe failure does not halt governance,
-            // relying on downstream per-call rate limit exception handling.
             var isCoreHealthy = remainingCore.Value >= options.MinRateLimitRemaining;
-            var isSearchHealthy = remainingSearch == null || remainingSearch.Value >= MinSearchWatermarkPerSweep;
+            var isSearchHealthy = remainingSearch.Value >= MinSearchWatermarkPerSweep;
 
             if (isCoreHealthy && isSearchHealthy)
                 break;
@@ -135,18 +141,37 @@ public class StaleLifecycleService : BackgroundService
             if (retryCount > maxRateLimitRetries)
             {
                 _logger.LogError("GitHub API quota (Core: {Core}, Search: {Search}) is persistently below watermark after {Retries} retries. Skipping sweep for {Owner}/{Repo}.",
-                    remainingCore.Value, remainingSearch, maxRateLimitRetries, owner, repo);
+                    remainingCore.Value, remainingSearch.Value, maxRateLimitRetries, owner, repo);
                 return;
             }
 
             _logger.LogWarning("GitHub API quota (Core: {Core}, Search: {Search}) is below watermark. Pausing before retry {Attempt}/{Max}.",
-                remainingCore.Value, remainingSearch, retryCount, maxRateLimitRetries);
+                remainingCore.Value, remainingSearch.Value, retryCount, maxRateLimitRetries);
 
             try
             {
+                var targetReset = SelectBackoffTarget(isCoreHealthy, isSearchHealthy, snapshot);
+                TimeSpan delay;
+                if (targetReset.HasValue)
+                {
+                    var serverDelay = targetReset.Value - DateTimeOffset.UtcNow;
+                    if (serverDelay > MaxResetWaitThreshold)
+                    {
+                        _logger.LogWarning("GitHub rate limit reset time {Reset} exceeds maximum wait threshold ({Threshold}). Aborting sweep for {Owner}/{Repo}.",
+                            targetReset.Value, MaxResetWaitThreshold, owner, repo);
+                        return;
+                    }
+
+                    delay = serverDelay > TimeSpan.Zero ? serverDelay.Add(ClockSkewBuffer) : ClockSkewBuffer;
+                }
+                else
+                {
+                    delay = RetryDelay;
+                }
+
                 if (RetryDelay > TimeSpan.Zero)
                 {
-                    await Task.Delay(RetryDelay, cancellationToken);
+                    await Task.Delay(delay, cancellationToken);
                 }
             }
             catch (OperationCanceledException)
@@ -230,7 +255,7 @@ public class StaleLifecycleService : BackgroundService
                 try { resetTime = ex.Reset; } catch (NullReferenceException) { }
                 _logger.LogWarning(ex, "GitHub Core API rate limit exceeded while processing {Owner}/{Repo}#{Number}. Reset: {Reset}. Aborting sweep for this repository.",
                     owner, repo, item.Number, resetTime);
-                break;
+                return;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -313,7 +338,7 @@ public class StaleLifecycleService : BackgroundService
                 try { resetTime = ex.Reset; } catch (NullReferenceException) { }
                 _logger.LogWarning(ex, "GitHub Core API rate limit exceeded while auto-closing {Owner}/{Repo}#{Number}. Reset: {Reset}. Aborting sweep for this repository.",
                     owner, repo, item.Number, resetTime);
-                break;
+                return;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -350,7 +375,33 @@ public class StaleLifecycleService : BackgroundService
         if (latest.UpdatedAt > threshold)
             return null;
 
+        // Authoritative Draft PR verification:
+        // GitHub Issues API does not provide complete PR state (the draft property is omitted from embedded pull_request objects).
+        // For pull request candidates, fetch the full pull request via GetPullRequestAsync and explicitly check Draft.
+        if (latest.PullRequest != null)
+        {
+            var pr = await _gitHub.GetPullRequestAsync(owner, repo, number, cancellationToken);
+            if (pr == null || pr.Draft || !string.Equals(pr.State.StringValue, "open", StringComparison.OrdinalIgnoreCase))
+                return null;
+        }
+
         return latest;
+    }
+
+    internal static DateTimeOffset? SelectBackoffTarget(bool isCoreHealthy, bool isSearchHealthy, GitHubRateLimitSnapshot snapshot)
+    {
+        if (isCoreHealthy && isSearchHealthy)
+            return null;
+
+        if (!isCoreHealthy && !isSearchHealthy)
+        {
+            if (snapshot.CoreReset.HasValue && snapshot.SearchReset.HasValue)
+                return snapshot.CoreReset.Value > snapshot.SearchReset.Value ? snapshot.CoreReset : snapshot.SearchReset;
+
+            return snapshot.CoreReset ?? snapshot.SearchReset;
+        }
+
+        return !isCoreHealthy ? snapshot.CoreReset : snapshot.SearchReset;
     }
 
     private static bool IsExempt(Octokit.Issue item, StaleLifecycleOptions options)
@@ -359,11 +410,10 @@ public class StaleLifecycleService : BackgroundService
         if (item.Labels.Any(l => options.ExemptLabels.Contains(l.Name, StringComparer.OrdinalIgnoreCase)))
             return true;
 
-        // Protection: Draft PRs and WIP titles should not be marked or closed as stale
+        // Protection: WIP titles are pre-filtered before lock acquisition and verified authoritatively under lock.
+        // Note: Draft PRs cannot be detected here because GitHub Issues API omits 'draft' from embedded pull_request objects;
+        // authoritative draft verification is performed via GetPullRequestAsync inside TryVerifyEligibilityAsync.
         if (item.Title.StartsWith("WIP", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        if (item.PullRequest?.Draft == true)
             return true;
 
         return false;
