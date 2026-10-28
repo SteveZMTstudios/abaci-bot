@@ -1,8 +1,10 @@
+using System.Net;
 using abaci_bot.Options;
 using abaci_bot.Pipelines;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Octokit;
 
 namespace abaci_bot.Services;
 
@@ -101,11 +103,16 @@ public class StaleLifecycleService : BackgroundService
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            await ProcessRepositoryAsync(owner, repo, options, cancellationToken);
+            var shouldContinue = await ProcessRepositoryAsync(owner, repo, options, cancellationToken);
+            if (!shouldContinue)
+            {
+                _logger.LogWarning("Aborting sweep across remaining repositories due to rate limit exhaustion or secondary throttling.");
+                break;
+            }
         }
     }
 
-    private async Task ProcessRepositoryAsync(string owner, string repo, StaleLifecycleOptions options, CancellationToken cancellationToken)
+    private async Task<bool> ProcessRepositoryAsync(string owner, string repo, StaleLifecycleOptions options, CancellationToken cancellationToken)
     {
         // 1. Inspect rate limit quota before beginning queries. If below watermark, retry with backoff.
         const int maxRateLimitRetries = 3;
@@ -120,13 +127,13 @@ public class StaleLifecycleService : BackgroundService
             if (remainingCore is null)
             {
                 _logger.LogError("Authentication or network error while querying GitHub rate limits. Aborting stale sweep for {Owner}/{Repo}.", owner, repo);
-                return;
+                return false;
             }
 
             if (remainingSearch is null)
             {
                 _logger.LogError("GitHub Search rate limit quota is unavailable or unverified. Aborting stale sweep for {Owner}/{Repo}.", owner, repo);
-                return;
+                return false;
             }
 
             // Watermark requirement: Minimum 4 search calls per repository sweep
@@ -142,7 +149,7 @@ public class StaleLifecycleService : BackgroundService
             {
                 _logger.LogError("GitHub API quota (Core: {Core}, Search: {Search}) is persistently below watermark after {Retries} retries. Skipping sweep for {Owner}/{Repo}.",
                     remainingCore.Value, remainingSearch.Value, maxRateLimitRetries, owner, repo);
-                return;
+                return false;
             }
 
             _logger.LogWarning("GitHub API quota (Core: {Core}, Search: {Search}) is below watermark. Pausing before retry {Attempt}/{Max}.",
@@ -159,7 +166,7 @@ public class StaleLifecycleService : BackgroundService
                     {
                         _logger.LogWarning("GitHub rate limit reset time {Reset} exceeds maximum wait threshold ({Threshold}). Aborting sweep for {Owner}/{Repo}.",
                             targetReset.Value, MaxResetWaitThreshold, owner, repo);
-                        return;
+                        return false;
                     }
 
                     delay = serverDelay > TimeSpan.Zero ? serverDelay.Add(ClockSkewBuffer) : ClockSkewBuffer;
@@ -176,7 +183,7 @@ public class StaleLifecycleService : BackgroundService
             }
             catch (OperationCanceledException)
             {
-                return;
+                return false;
             }
         }
 
@@ -195,21 +202,11 @@ public class StaleLifecycleService : BackgroundService
             stalePrs = await _gitHub.SearchStaleCandidatesAsync(
                 owner, repo, staleThreshold, isPr: true, labelFilter: $"-label:\"{GitHubLabels.StatusStale}\"", ct: cancellationToken);
         }
-        catch (Octokit.RateLimitExceededException ex)
+        catch (Exception ex) when (IsRateLimitOrAbuse(ex, out var retryAfter, out var rateLimitType))
         {
-            DateTimeOffset? resetTime = null;
-            try
-            {
-                resetTime = ex.Reset;
-            }
-            catch (NullReferenceException)
-            {
-                // Octokit's Reset property can throw NullReferenceException if HttpResponse is missing (e.g. in mocks)
-            }
-
-            _logger.LogWarning(ex, "Search API quota exceeded during candidate search for {Owner}/{Repo}. Reset: {Reset}. Skipping repository sweep.",
-                owner, repo, resetTime);
-            return;
+            _logger.LogWarning(ex, "GitHub {Type} rate limit exceeded during candidate search for {Owner}/{Repo}. Retry after: {RetryAfter}. Aborting sweep.",
+                rateLimitType, owner, repo, retryAfter);
+            return false;
         }
 
         var newStaleCandidates = staleIssues.Concat(stalePrs)
@@ -249,13 +246,11 @@ public class StaleLifecycleService : BackgroundService
                     await _gitHub.AddLabelsAsync(owner, repo, item.Number, new[] { GitHubLabels.StatusStale }, cancellationToken);
                 }
             }
-            catch (Octokit.RateLimitExceededException ex)
+            catch (Exception ex) when (IsRateLimitOrAbuse(ex, out var retryAfter, out var rateLimitType))
             {
-                DateTimeOffset? resetTime = null;
-                try { resetTime = ex.Reset; } catch (NullReferenceException) { }
-                _logger.LogWarning(ex, "GitHub Core API rate limit exceeded while processing {Owner}/{Repo}#{Number}. Reset: {Reset}. Aborting sweep for this repository.",
-                    owner, repo, item.Number, resetTime);
-                return;
+                _logger.LogWarning(ex, "GitHub {Type} rate limit exceeded while processing {Owner}/{Repo}#{Number}. Retry after: {RetryAfter}. Aborting sweep.",
+                    rateLimitType, owner, repo, item.Number, retryAfter);
+                return false;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -279,21 +274,11 @@ public class StaleLifecycleService : BackgroundService
             closePrs = await _gitHub.SearchStaleCandidatesAsync(
                 owner, repo, closeThreshold, isPr: true, labelFilter: $"label:\"{GitHubLabels.StatusStale}\"", ct: cancellationToken);
         }
-        catch (Octokit.RateLimitExceededException ex)
+        catch (Exception ex) when (IsRateLimitOrAbuse(ex, out var retryAfter, out var rateLimitType))
         {
-            DateTimeOffset? resetTime = null;
-            try
-            {
-                resetTime = ex.Reset;
-            }
-            catch (NullReferenceException)
-            {
-                // Octokit's Reset property can throw NullReferenceException if HttpResponse is missing (e.g. in mocks)
-            }
-
-            _logger.LogWarning(ex, "Search API quota exceeded during close candidate search for {Owner}/{Repo}. Reset: {Reset}. Skipping repository sweep.",
-                owner, repo, resetTime);
-            return;
+            _logger.LogWarning(ex, "GitHub {Type} rate limit exceeded during close candidate search for {Owner}/{Repo}. Retry after: {RetryAfter}. Aborting sweep.",
+                rateLimitType, owner, repo, retryAfter);
+            return false;
         }
 
         var closeCandidates = closeIssues.Concat(closePrs)
@@ -332,13 +317,11 @@ public class StaleLifecycleService : BackgroundService
                     await _gitHub.CreateCommentAsync(owner, repo, item.Number, closeComment, cancellationToken);
                 }
             }
-            catch (Octokit.RateLimitExceededException ex)
+            catch (Exception ex) when (IsRateLimitOrAbuse(ex, out var retryAfter, out var rateLimitType))
             {
-                DateTimeOffset? resetTime = null;
-                try { resetTime = ex.Reset; } catch (NullReferenceException) { }
-                _logger.LogWarning(ex, "GitHub Core API rate limit exceeded while auto-closing {Owner}/{Repo}#{Number}. Reset: {Reset}. Aborting sweep for this repository.",
-                    owner, repo, item.Number, resetTime);
-                return;
+                _logger.LogWarning(ex, "GitHub {Type} rate limit exceeded while auto-closing {Owner}/{Repo}#{Number}. Retry after: {RetryAfter}. Aborting sweep.",
+                    rateLimitType, owner, repo, item.Number, retryAfter);
+                return false;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -350,6 +333,8 @@ public class StaleLifecycleService : BackgroundService
                 await Task.Delay(options.RequestThrottleMilliseconds, cancellationToken);
             }
         }
+
+        return true;
     }
 
     private async Task<Octokit.Issue?> TryVerifyEligibilityAsync(
@@ -402,6 +387,47 @@ public class StaleLifecycleService : BackgroundService
         }
 
         return !isCoreHealthy ? snapshot.CoreReset : snapshot.SearchReset;
+    }
+
+    internal static bool IsRateLimitOrAbuse(Exception ex, out TimeSpan? retryAfter, out string rateLimitType)
+    {
+        if (ex is RateLimitExceededException rle)
+        {
+            rateLimitType = "Core";
+            DateTimeOffset? reset = null;
+            try { reset = rle.Reset; } catch (NullReferenceException) { }
+            retryAfter = reset.HasValue ? reset.Value - DateTimeOffset.UtcNow : null;
+            return true;
+        }
+
+        if (ex is AbuseException abuse)
+        {
+            rateLimitType = "Abuse";
+            int? seconds = null;
+            try { seconds = abuse.RetryAfterSeconds; } catch (NullReferenceException) { }
+            retryAfter = seconds.HasValue
+                ? TimeSpan.FromSeconds(Math.Max(60, seconds.Value))
+                : TimeSpan.FromSeconds(60);
+            return true;
+        }
+
+        if (ex is SecondaryRateLimitExceededException)
+        {
+            rateLimitType = "Secondary";
+            retryAfter = TimeSpan.FromSeconds(60);
+            return true;
+        }
+
+        if (ex is ApiException apiEx && apiEx.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            rateLimitType = "HTTP 429";
+            retryAfter = TimeSpan.FromSeconds(60);
+            return true;
+        }
+
+        rateLimitType = string.Empty;
+        retryAfter = null;
+        return false;
     }
 
     private static bool IsExempt(Octokit.Issue item, StaleLifecycleOptions options)
