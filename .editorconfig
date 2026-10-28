@@ -24,10 +24,14 @@ dotnet_sort_system_directives_first = true
 dotnet_separate_import_directive_groups = false
 
 # Analyzer rules
-dotnet_diagnostic.CA1707.severity = none # Allow abaci_bot namespace naming
-dotnet_diagnostic.CA1848.severity = none # LoggerMessage performance recommendation
-dotnet_diagnostic.CA1873.severity = none # Evaluating logging arguments
-dotnet_diagnostic.CA1859.severity = none # Change return type to concrete type
+# Allow abaci_bot namespace naming
+dotnet_diagnostic.CA1707.severity = none
+# LoggerMessage performance recommendation
+dotnet_diagnostic.CA1848.severity = none
+# Evaluating logging arguments
+dotnet_diagnostic.CA1873.severity = none
+# Change return type to concrete type
+dotnet_diagnostic.CA1859.severity = none
 
 # XML / Project files
 [*.{csproj,props,targets,xml,runsettings}]
