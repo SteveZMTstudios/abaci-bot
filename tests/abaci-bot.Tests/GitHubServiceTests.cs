@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using abaci_bot.Services;
+using Microsoft.Extensions.Logging;
 using NSubstitute;
 using NSubstitute.ExceptionExtensions;
 using Octokit;
@@ -21,7 +22,8 @@ public class GitHubServiceTests
     private static (GitHubService service, IGitHubClient client) CreateTestService(
         string privateKeyPem,
         int appId = 123456,
-        long installationId = 789012)
+        long installationId = 789012,
+        ILogger<GitHubService>? logger = null)
     {
         var client = Substitute.For<IGitHubClient>();
         var connection = Substitute.For<IConnection>();
@@ -33,8 +35,18 @@ public class GitHubServiceTests
         var tokenResponse = CreateInstallationToken("test-installation-token", DateTimeOffset.UtcNow.AddHours(1));
         appsClient.CreateInstallationToken(Arg.Any<long>()).Returns(Task.FromResult(tokenResponse));
 
-        var service = new GitHubService(appId, privateKeyPem, installationId, client);
+        var service = new GitHubService(appId, privateKeyPem, installationId, client, logger);
         return (service, client);
+    }
+
+    private static ApiInfo CreateMockApiInfo(int remaining)
+    {
+        var rateLimit = (RateLimit)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(RateLimit));
+        typeof(RateLimit).GetProperty(nameof(RateLimit.Remaining))?.SetValue(rateLimit, remaining);
+
+        var apiInfo = (ApiInfo)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(ApiInfo));
+        typeof(ApiInfo).GetProperty(nameof(ApiInfo.RateLimit))?.SetValue(apiInfo, rateLimit);
+        return apiInfo;
     }
 
     private static AccessToken CreateInstallationToken(string token, DateTimeOffset expiresAt)
@@ -75,6 +87,45 @@ public class GitHubServiceTests
         await client.GitHubApps.Received(1).CreateInstallationToken(5555);
     }
 
+    [Fact]
+    public async Task GitHubService_UsesConfiguredInstallationId_AndReusesValidToken()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem, appId: 9999, installationId: 1000);
+
+        var prClient = Substitute.For<IPullRequestsClient>();
+        client.PullRequest.Returns(prClient);
+        prClient.Files("owner", "repo", 1).Returns(Task.FromResult<IReadOnlyList<PullRequestFile>>(Array.Empty<PullRequestFile>()));
+
+        // First call with installation 1000
+        await service.GetPullRequestFilesAsync("owner", "repo", 1);
+        await client.GitHubApps.Received(1).CreateInstallationToken(1000);
+
+        // Subsequent call reuses the cached token
+        await service.GetPullRequestFilesAsync("owner", "repo", 1);
+        await client.GitHubApps.Received(1).CreateInstallationToken(1000);
+    }
+
+    [Fact]
+    public async Task EnsureAuthenticatedAsync_ConcurrentCallers_UsesDoubleCheckedLockingToPreventDuplicateTokenCreation()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem, appId: 9999, installationId: 1000);
+
+        var prClient = Substitute.For<IPullRequestsClient>();
+        client.PullRequest.Returns(prClient);
+        prClient.Files("owner", "repo", 1).Returns(Task.FromResult<IReadOnlyList<PullRequestFile>>(Array.Empty<PullRequestFile>()));
+
+        // Run 10 concurrent requests simultaneously when cache is cold
+        var tasks = Enumerable.Range(0, 10)
+            .Select(_ => service.GetPullRequestFilesAsync("owner", "repo", 1))
+            .ToArray();
+
+        await Task.WhenAll(tasks);
+
+        // Exactly 1 installation token should be generated thanks to double-checked lock
+        await client.GitHubApps.Received(1).CreateInstallationToken(1000);
+    }
 
     [Fact]
     public async Task GetPullRequestFilesAsyncReturnsFiles()
@@ -223,9 +274,9 @@ public class GitHubServiceTests
 
         var result = await service.GetTeamMembersAsync("owner", "Captains");
 
-        // Verify case-insensitive set behavior
-        Assert.Contains("captainalice", result);
+        // Verifies case-insensitive lookup
         Assert.Contains("CaptainAlice", result);
+        Assert.Contains("captainalice", result);
         Assert.Contains("captainbob", result);
         Assert.Contains("CAPTAINBOB", result);
         Assert.Equal(2, result.Count);
@@ -238,6 +289,325 @@ public class GitHubServiceTests
         var rawList = result.ToList();
         Assert.Contains("CaptainAlice", rawList);
         Assert.Contains("CAPTAINBOB", rawList);
+    }
+
+    [Fact]
+    public async Task SearchStaleCandidatesAsync_QueriesIssuesWithPagination()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var searchClient = Substitute.For<ISearchClient>();
+        client.Search.Returns(searchClient);
+
+        var issue1 = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issue1, 101);
+
+        var searchResult = (SearchIssuesResult)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SearchIssuesResult));
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.Items))?.SetValue(searchResult, new List<Issue> { issue1 });
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.TotalCount))?.SetValue(searchResult, 1);
+
+        searchClient.SearchIssues(Arg.Any<SearchIssuesRequest>()).Returns(Task.FromResult(searchResult));
+
+        var candidates = await service.SearchStaleCandidatesAsync("owner", "repo", DateTimeOffset.UtcNow, isPr: false, "-label:\"Status: Stale\"");
+
+        Assert.Single(candidates);
+        Assert.Equal(101, candidates[0].Number);
+    }
+
+    [Fact]
+    public async Task CloseIssueAsync_UpdatesStateToClosed()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var issueClient = Substitute.For<IIssuesClient>();
+        client.Issue.Returns(issueClient);
+
+        await service.CloseIssueAsync("owner", "repo", 202);
+
+        await issueClient.Received(1).Update("owner", "repo", 202, Arg.Is<IssueUpdate>(u => u.State == ItemState.Closed));
+    }
+
+    [Fact]
+    public async Task CreateCommentAsync_PostsComment()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var issueClient = Substitute.For<IIssuesClient>();
+        var commentsClient = Substitute.For<IIssueCommentsClient>();
+        client.Issue.Returns(issueClient);
+        issueClient.Comment.Returns(commentsClient);
+
+        await service.CreateCommentAsync("owner", "repo", 303, "Test Comment");
+
+        await commentsClient.Received(1).Create("owner", "repo", 303, "Test Comment");
+    }
+
+    [Fact]
+    public async Task GetRateLimitSnapshotAsync_ReturnsCoreAndSearchQuotasAndResets()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var rateLimitClient = Substitute.For<IRateLimitClient>();
+        client.RateLimit.Returns(rateLimitClient);
+
+        var coreResetTime = DateTimeOffset.UtcNow.AddMinutes(50);
+        var searchResetTime = DateTimeOffset.UtcNow.AddMinutes(1);
+        var coreRateLimit = new RateLimit(5000, 4800, coreResetTime.ToUnixTimeSeconds());
+        var searchRateLimit = new RateLimit(30, 25, searchResetTime.ToUnixTimeSeconds());
+
+        var resources = (ResourceRateLimit)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(ResourceRateLimit));
+        typeof(ResourceRateLimit).GetProperty(nameof(ResourceRateLimit.Core))?.SetValue(resources, coreRateLimit);
+        typeof(ResourceRateLimit).GetProperty(nameof(ResourceRateLimit.Search))?.SetValue(resources, searchRateLimit);
+
+        var miscRateLimit = (MiscellaneousRateLimit)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(MiscellaneousRateLimit));
+        typeof(MiscellaneousRateLimit).GetProperty(nameof(MiscellaneousRateLimit.Rate))?.SetValue(miscRateLimit, coreRateLimit);
+        typeof(MiscellaneousRateLimit).GetProperty(nameof(MiscellaneousRateLimit.Resources))?.SetValue(miscRateLimit, resources);
+
+        rateLimitClient.GetRateLimits().Returns(Task.FromResult(miscRateLimit));
+
+        var snapshot = await service.GetRateLimitSnapshotAsync();
+
+        Assert.Equal(4800, snapshot.CoreRemaining);
+        Assert.Equal(coreResetTime.ToUnixTimeSeconds(), snapshot.CoreReset?.ToUnixTimeSeconds());
+        Assert.Equal(25, snapshot.SearchRemaining);
+        Assert.Equal(searchResetTime.ToUnixTimeSeconds(), snapshot.SearchReset?.ToUnixTimeSeconds());
+    }
+
+    [Fact]
+    public async Task GetRateLimitSnapshotAsync_WhenApiThrows_FallsBackToLastApiInfo()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var rateLimitClient = Substitute.For<IRateLimitClient>();
+        client.RateLimit.Returns(rateLimitClient);
+        rateLimitClient.GetRateLimits().Returns(Task.FromException<MiscellaneousRateLimit>(new Exception("Network error")));
+
+        var lastApiInfo = (ApiInfo)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(ApiInfo));
+        typeof(ApiInfo).GetProperty(nameof(ApiInfo.RateLimit))?.SetValue(lastApiInfo, new RateLimit(5000, 4200, 123456789));
+        client.GetLastApiInfo().Returns(lastApiInfo);
+
+        var snapshot = await service.GetRateLimitSnapshotAsync();
+
+        Assert.Equal(4200, snapshot.CoreRemaining);
+        Assert.Equal(123456789, snapshot.CoreReset?.ToUnixTimeSeconds());
+        Assert.Null(snapshot.SearchRemaining);
+        Assert.Null(snapshot.SearchReset);
+    }
+
+    [Fact]
+    public async Task GetPullRequestAsync_WhenNotFound_ReturnsNull()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var prClient = Substitute.For<IPullRequestsClient>();
+        client.PullRequest.Returns(prClient);
+
+        var notFoundEx = (NotFoundException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(NotFoundException));
+        prClient.Get("owner", "repo", 999).Returns(Task.FromException<PullRequest>(notFoundEx));
+
+        var result = await service.GetPullRequestAsync("owner", "repo", 999);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task EnsureAuthenticatedAsync_WhenCalledConcurrently_SerializesTokenCreation()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        // Run 5 concurrent API calls that require authentication
+        var tasks = Enumerable.Range(1, 5)
+            .Select(i => service.CloseIssueAsync("owner", "repo", i))
+            .ToList();
+
+        await Task.WhenAll(tasks);
+
+        // Even with 5 concurrent requests, installation token should only be created once
+        await client.GitHubApps.Received(1).CreateInstallationToken(Arg.Any<long>());
+    }
+
+    [Fact]
+    public async Task SearchStaleCandidatesAsync_WhenMultiplePages_FetchesUntilTotalReachedOrPerPage()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var searchClient = Substitute.For<ISearchClient>();
+        client.Search.Returns(searchClient);
+
+        var page1Items = Enumerable.Range(1, 100).Select(i =>
+        {
+            var issue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+            typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issue, i);
+            return issue;
+        }).ToList();
+
+        var page2Items = Enumerable.Range(101, 50).Select(i =>
+        {
+            var issue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+            typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issue, i);
+            return issue;
+        }).ToList();
+
+        var res1 = (SearchIssuesResult)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SearchIssuesResult));
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.Items))?.SetValue(res1, page1Items);
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.TotalCount))?.SetValue(res1, 150);
+
+        var res2 = (SearchIssuesResult)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SearchIssuesResult));
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.Items))?.SetValue(res2, page2Items);
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.TotalCount))?.SetValue(res2, 150);
+
+        searchClient.SearchIssues(Arg.Is<SearchIssuesRequest>(r => r.Page == 1)).Returns(Task.FromResult(res1));
+        searchClient.SearchIssues(Arg.Is<SearchIssuesRequest>(r => r.Page == 2)).Returns(Task.FromResult(res2));
+
+        var candidates = await service.SearchStaleCandidatesAsync("owner", "repo", DateTimeOffset.UtcNow, isPr: false);
+
+        Assert.Equal(150, candidates.Count);
+    }
+
+    [Fact]
+    public async Task GetRateLimitSnapshotAsync_WhenApiAndLastApiInfoThrow_ReturnsNullCoreRemaining()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var rateLimitClient = Substitute.For<IRateLimitClient>();
+        client.RateLimit.Returns(rateLimitClient);
+        rateLimitClient.GetRateLimits().Returns(Task.FromException<MiscellaneousRateLimit>(new Exception("Auth failed 401")));
+        client.GetLastApiInfo().Returns((ApiInfo?)null);
+
+        var snapshot = await service.GetRateLimitSnapshotAsync();
+
+        Assert.Null(snapshot.CoreRemaining);
+        Assert.Null(snapshot.SearchRemaining);
+    }
+
+    [Fact]
+    public async Task GetRateLimitSnapshotAsync_WhenAuthorizationException_ReturnsNullSnapshot()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var rateLimitClient = Substitute.For<IRateLimitClient>();
+        client.RateLimit.Returns(rateLimitClient);
+        rateLimitClient.GetRateLimits().Returns(Task.FromException<MiscellaneousRateLimit>(new AuthorizationException()));
+
+        var snapshot = await service.GetRateLimitSnapshotAsync();
+
+        Assert.Null(snapshot.CoreRemaining);
+        Assert.Null(snapshot.SearchRemaining);
+    }
+
+    [Fact]
+    public async Task GetRateLimitSnapshotAsync_WhenApiThrowsNonAuthAndLastApiInfoHasValue_ReturnsLastRemaining()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var rateLimitClient = Substitute.For<IRateLimitClient>();
+        client.RateLimit.Returns(rateLimitClient);
+        rateLimitClient.GetRateLimits().Returns(Task.FromException<MiscellaneousRateLimit>(new WebException("Temporary network glitch")));
+        client.GetLastApiInfo().Returns(CreateMockApiInfo(42));
+
+        var snapshot = await service.GetRateLimitSnapshotAsync();
+
+        Assert.Equal(42, snapshot.CoreRemaining);
+        Assert.Null(snapshot.SearchRemaining);
+    }
+
+    [Fact]
+    public async Task GetRateLimitSnapshotAsync_WhenOperationCanceled_ThrowsOperationCanceledException()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var rateLimitClient = Substitute.For<IRateLimitClient>();
+        client.RateLimit.Returns(rateLimitClient);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        rateLimitClient.GetRateLimits().Returns(Task.FromException<MiscellaneousRateLimit>(new OperationCanceledException(cts.Token)));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => service.GetRateLimitSnapshotAsync(cts.Token));
+    }
+
+    [Fact]
+    public async Task SearchStaleCandidatesAsync_WhenRateLimitExceededDuringPagination_LogsDebugAndRethrows()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var logger = Substitute.For<ILogger<GitHubService>>();
+        var (service, client) = CreateTestService(pem, logger: logger);
+
+        var searchClient = Substitute.For<ISearchClient>();
+        client.Search.Returns(searchClient);
+
+        var page1Items = Enumerable.Range(1, 100).Select(i =>
+        {
+            var issue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+            typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issue, i);
+            return issue;
+        }).ToList();
+
+        var res1 = (SearchIssuesResult)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SearchIssuesResult));
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.Items))?.SetValue(res1, page1Items);
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.TotalCount))?.SetValue(res1, 200);
+
+        searchClient.SearchIssues(Arg.Is<SearchIssuesRequest>(r => r.Page == 1)).Returns(Task.FromResult(res1));
+
+        var rateLimitEx = (RateLimitExceededException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(RateLimitExceededException));
+        searchClient.SearchIssues(Arg.Is<SearchIssuesRequest>(r => r.Page == 2)).Returns(Task.FromException<SearchIssuesResult>(rateLimitEx));
+
+        var ex = await Assert.ThrowsAsync<RateLimitExceededException>(() =>
+            service.SearchStaleCandidatesAsync("owner", "repo", DateTimeOffset.UtcNow, isPr: false));
+
+        Assert.Same(rateLimitEx, ex);
+
+        // Verify diagnostic log includes page number and count of discarded items
+        logger.ReceivedWithAnyArgs().Log(
+            LogLevel.Debug,
+            Arg.Any<EventId>(),
+            Arg.Is<object>(o => o.ToString()!.Contains("page 2") && o.ToString()!.Contains("100")),
+            rateLimitEx,
+            Arg.Any<Func<object, Exception?, string>>());
+    }
+
+    [Fact]
+    public async Task SearchStaleCandidatesAsync_WhenResultsExceedMaxPages_LogsWarningAndTruncates()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var logger = Substitute.For<ILogger<GitHubService>>();
+        var (service, client) = CreateTestService(pem, logger: logger);
+
+        var searchClient = Substitute.For<ISearchClient>();
+        client.Search.Returns(searchClient);
+
+        searchClient.SearchIssues(Arg.Any<SearchIssuesRequest>()).Returns(callInfo =>
+        {
+            var req = callInfo.Arg<SearchIssuesRequest>();
+            var pageItems = Enumerable.Range(req.Page * 100, 100).Select(i =>
+            {
+                var issue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+                typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issue, i);
+                return issue;
+            }).ToList();
+
+            var res = (SearchIssuesResult)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SearchIssuesResult));
+            typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.Items))?.SetValue(res, pageItems);
+            typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.TotalCount))?.SetValue(res, 600);
+            return Task.FromResult(res);
+        });
+
+        var candidates = await service.SearchStaleCandidatesAsync("owner", "repo", DateTimeOffset.UtcNow, isPr: false);
+
+        Assert.Equal(500, candidates.Count);
+        logger.ReceivedWithAnyArgs().Log(LogLevel.Warning, Arg.Any<EventId>(), Arg.Any<object>(), Arg.Any<Exception?>(), Arg.Any<Func<object, Exception?, string>>());
     }
 
     [Fact]
@@ -256,6 +626,40 @@ public class GitHubServiceTests
 
         Assert.Same(expectedPr, result);
         await prClient.Received(1).Get("owner", "repo", 77);
+    }
+
+    [Fact]
+    public async Task SearchStaleCandidatesAsync_WhenItemsEmpty_BreaksImmediately()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        var searchClient = Substitute.For<ISearchClient>();
+        client.Search.Returns(searchClient);
+
+        var emptyRes = (SearchIssuesResult)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SearchIssuesResult));
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.Items))?.SetValue(emptyRes, new List<Issue>());
+        typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.TotalCount))?.SetValue(emptyRes, 0);
+
+        searchClient.SearchIssues(Arg.Any<SearchIssuesRequest>()).Returns(Task.FromResult(emptyRes));
+
+        var items = await service.SearchStaleCandidatesAsync("owner", "repo", DateTimeOffset.UtcNow, isPr: false);
+
+        Assert.Empty(items);
+        await searchClient.Received(1).SearchIssues(Arg.Any<SearchIssuesRequest>());
+    }
+
+    [Fact]
+    public async Task SearchStaleCandidatesAsync_WhenCancelled_ThrowsOperationCanceledException()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            service.SearchStaleCandidatesAsync("owner", "repo", DateTimeOffset.UtcNow, isPr: false, ct: cts.Token));
     }
 
     private static PullRequestCommit CreatePullRequestCommit(string authorEmail)
