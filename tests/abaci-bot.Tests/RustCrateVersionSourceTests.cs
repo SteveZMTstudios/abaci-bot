@@ -122,15 +122,26 @@ public class RustCrateVersionSourceTests
         var olderEntries = new List<CrateIndexEntry> { new() { Version = "0.9.0" } };
         Assert.Null(RustCrateVersionSource.SelectLatestVersion(olderEntries, "1.0.0"));
 
-        // Chronological fallback for custom non-System.Version strings
-        var customEntries = new List<CrateIndexEntry>
+        // Unparseable / pre-release entries must never overwrite higher valid versions (Item E)
+        var mixedEntries = new List<CrateIndexEntry>
         {
-            new() { Version = "custom-v1" },
-            new() { Version = "custom-v2" }
+            new() { Version = "1.1.0" },
+            new() { Version = "1.0.0+hotfix" },
+            new() { Version = "unparseable-junk" }
         };
-        var latestCustom = RustCrateVersionSource.SelectLatestVersion(customEntries, "custom-v1");
-        Assert.NotNull(latestCustom);
-        Assert.Equal("custom-v2", latestCustom.Version);
+        var latestMixed = RustCrateVersionSource.SelectLatestVersion(mixedEntries, "1.0.0");
+        Assert.NotNull(latestMixed);
+        Assert.Equal("1.1.0", latestMixed.Version);
+
+        // Metadata-only +suffix at same base version does not downgrade or churn
+        var plusSuffixSameBase = new List<CrateIndexEntry> { new() { Version = "1.0.0+hotfix" } };
+        Assert.Null(RustCrateVersionSource.SelectLatestVersion(plusSuffixSameBase, "1.0.0"));
+
+        // Valid +suffix newer than current IS selected cleanly
+        var plusSuffixNewer = new List<CrateIndexEntry> { new() { Version = "1.0.1+hotfix" } };
+        var latestPlusNewer = RustCrateVersionSource.SelectLatestVersion(plusSuffixNewer, "1.0.0");
+        Assert.NotNull(latestPlusNewer);
+        Assert.Equal("1.0.1+hotfix", latestPlusNewer.Version);
     }
 
     [Fact]
@@ -281,6 +292,295 @@ public class RustCrateVersionSourceTests
         Assert.Equal(2, snap2.ConsecutiveFailures);
         Assert.NotNull(snap2.LastAttemptAt);
         Assert.Null(snap2.LastSuccessAt);
+    }
+
+    [Fact]
+    public async Task GetCandidatesAsync_AdvancesNameWatermarkAcrossSweepsAndRestarts_WithoutOverlapOrDrift()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"rust-watermark-{Guid.NewGuid():N}");
+        var crates = new List<string> { "rust-b", "rust-c", "rust-d", "rust-e", "rust-f" };
+
+        var specCatalog = Substitute.For<ISpecCatalog>();
+        specCatalog.GetAllPackageNamesAsync(Arg.Any<CancellationToken>()).Returns(_ => crates.ToList());
+        specCatalog.GetSpecAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var pkg = call.Arg<string>();
+                return new SpecContext(pkg, pkg, $"%global crate_name {pkg}\nVersion: 1.0.0\n", $"SPECS/{pkg}/{pkg}.spec");
+            });
+
+        var requestedPaths = new List<string>();
+        var handler = new FakeHttpMessageHandler(req =>
+        {
+            requestedPaths.Add(req.RequestUri!.AbsolutePath);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("""{"name":"crate","vers":"1.0.1","yanked":false}""")
+            };
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            RustCratePoller = new RustCratePollerOptions
+            {
+                Enabled = true,
+                IndexBaseUrl = "https://index.crates.io",
+                MaxCratesPerSweep = 2,
+                RequestDelayMilliseconds = 0
+            }
+        });
+        var stateOpts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions { StateDirectory = tempDir });
+
+        try
+        {
+            using (var store1 = new JsonBotStateStore(stateOpts))
+            {
+                var source1 = new RustCrateVersionSource(new HttpClient(handler), options, specCatalog: specCatalog, stateStore: store1);
+
+                var c1 = await source1.GetCandidatesAsync();
+                Assert.Equal(new[] { "rust-b", "rust-c" }, c1.Select(c => c.PackageName));
+                // Phase-2 watermark commit happens after scheduler completes the sweep
+                ((ICandidateSweepCursor)source1).CompleteSweep(c1.Select(c => c.PackageName).ToHashSet(StringComparer.OrdinalIgnoreCase));
+
+                var c2 = await source1.GetCandidatesAsync();
+                Assert.Equal(new[] { "rust-d", "rust-e" }, c2.Select(c => c.PackageName));
+                ((ICandidateSweepCursor)source1).CompleteSweep(c2.Select(c => c.PackageName).ToHashSet(StringComparer.OrdinalIgnoreCase));
+                Assert.Equal("rust-e", store1.GetCursorWatermark(RustCrateVersionSource.GetCursorStateKey(options.Value.TargetRepository)));
+            }
+
+            // Delete rust-b & insert rust-a before simulated restart -> watermark resumes cleanly at rust-f then wraps to rust-a
+            crates.Remove("rust-b");
+            crates.Add("rust-a");
+
+            using var store2 = new JsonBotStateStore(stateOpts);
+            var source2 = new RustCrateVersionSource(new HttpClient(handler), options, specCatalog: specCatalog, stateStore: store2);
+            var c3 = await source2.GetCandidatesAsync();
+            Assert.Equal(new[] { "rust-f", "rust-a" }, c3.Select(c => c.PackageName));
+            ((ICandidateSweepCursor)source2).CompleteSweep(c3.Select(c => c.PackageName).ToHashSet(StringComparer.OrdinalIgnoreCase));
+            Assert.Equal("rust-a", store2.GetCursorWatermark(RustCrateVersionSource.GetCursorStateKey(options.Value.TargetRepository)));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GetCandidatesAsync_WatermarkPolicy_FreezesOnFullOutageAndTransient503_AdvancesPastSingle404()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"rust-wm-policy-{Guid.NewGuid():N}");
+        var crates = new[] { "rust-a", "rust-b", "rust-c" };
+
+        var specCatalog = Substitute.For<ISpecCatalog>();
+        specCatalog.GetAllPackageNamesAsync(Arg.Any<CancellationToken>()).Returns(crates);
+        specCatalog.GetSpecAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var pkg = call.Arg<string>();
+                return new SpecContext(pkg, pkg, $"%global crate_name {pkg}\nVersion: 1.0.0\n", $"SPECS/{pkg}/{pkg}.spec");
+            });
+
+        int mode = 0; // 0 = all 503 outage, 1 = 404 on first + 200 on second, 2 = 200 on b + 503 on c
+        var handler = new FakeHttpMessageHandler(req =>
+        {
+            var path = req.RequestUri!.AbsolutePath;
+            if (mode == 0)
+            {
+                return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+            }
+            if (mode == 1)
+            {
+                return path.Contains("rust-a", StringComparison.Ordinal)
+                    ? new HttpResponseMessage(HttpStatusCode.NotFound)
+                    : new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("""{"name":"rust-b","vers":"1.0.1","yanked":false}""") };
+            }
+
+            if (path.Contains("rust-c", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("""{"name":"rust-c","vers":"1.0.1","yanked":false}""") };
+            }
+            return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            RustCratePoller = new RustCratePollerOptions
+            {
+                Enabled = true,
+                IndexBaseUrl = "https://index.crates.io",
+                MaxCratesPerSweep = 2,
+                RequestDelayMilliseconds = 0
+            }
+        });
+        var stateOpts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions { StateDirectory = tempDir });
+
+        try
+        {
+            using var store = new JsonBotStateStore(stateOpts);
+            var source = new RustCrateVersionSource(new HttpClient(handler), options, specCatalog: specCatalog, stateStore: store);
+
+            var cursorKey = RustCrateVersionSource.GetCursorStateKey(options.Value.TargetRepository);
+
+            // 1. Full 503 outage -> watermark remains null even after CompleteSweep
+            mode = 0;
+            Assert.Empty(await source.GetCandidatesAsync());
+            ((ICandidateSweepCursor)source).CompleteSweep(new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+            Assert.Null(store.GetCursorWatermark(cursorKey));
+
+            // 2. Permanent 404 on rust-a + 200 on rust-b -> CompleteSweep advances past rust-a to rust-b (no poison-pill lock)
+            mode = 1;
+            var res1 = await source.GetCandidatesAsync();
+            Assert.Single(res1);
+            Assert.Equal("rust-b", res1[0].PackageName);
+            ((ICandidateSweepCursor)source).CompleteSweep(res1.Select(c => c.PackageName).ToHashSet(StringComparer.OrdinalIgnoreCase));
+            Assert.Equal("rust-b", store.GetCursorWatermark(cursorKey));
+
+            // 3. Partial 503 on rust-a while rust-c succeeds -> CompleteSweep advances to rust-c (before failed rust-a)
+            mode = 2;
+            var res2 = await source.GetCandidatesAsync();
+            Assert.Single(res2);
+            Assert.Equal("rust-c", res2[0].PackageName);
+            ((ICandidateSweepCursor)source).CompleteSweep(res2.Select(c => c.PackageName).ToHashSet(StringComparer.OrdinalIgnoreCase));
+            Assert.Equal("rust-c", store.GetCursorWatermark(cursorKey));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task CompleteSweep_RewindsWatermarkBeforeUnprocessedCandidate_AndAdvancesAfterItIsProcessed()
+    {
+        var crates = new[] { "rust-a", "rust-b", "rust-c" };
+        var specCatalog = Substitute.For<ISpecCatalog>();
+        specCatalog.GetAllPackageNamesAsync(Arg.Any<CancellationToken>()).Returns(crates);
+        specCatalog.GetSpecAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var pkg = call.Arg<string>();
+                return new SpecContext(pkg, pkg, $"%global crate_name {pkg}\nVersion: 1.0.0\n", $"SPECS/{pkg}/{pkg}.spec");
+            });
+
+        var requestedPaths = new List<string>();
+        var handler = new FakeHttpMessageHandler(req =>
+        {
+            var path = req.RequestUri!.AbsolutePath;
+            requestedPaths.Add(path);
+            var isCandidate = path.Contains("rust-a", StringComparison.Ordinal);
+            var version = isCandidate ? "1.0.1" : "1.0.0";
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent($$"""{"name":"crate","vers":"{{version}}","yanked":false}""")
+            };
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            RustCratePoller = new RustCratePollerOptions
+            {
+                Enabled = true,
+                IndexBaseUrl = "https://index.crates.io",
+                MaxCratesPerSweep = 2,
+                RequestDelayMilliseconds = 0
+            }
+        });
+
+        var source = new RustCrateVersionSource(new HttpClient(handler), options, specCatalog: specCatalog);
+        var cursor = (ICandidateSweepCursor)source;
+
+        var first = await source.GetCandidatesAsync();
+        Assert.Single(first);
+        Assert.Equal("rust-a", first[0].PackageName);
+        Assert.Contains(requestedPaths, p => p.Contains("rust-b", StringComparison.Ordinal));
+
+        // rust-a was discovered but not processed (scheduler quota exhausted):
+        // the cursor must rewind before rust-a so the next sweep retries it.
+        cursor.CompleteSweep(new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+        requestedPaths.Clear();
+        var retried = await source.GetCandidatesAsync();
+        Assert.Contains(retried, c => c.PackageName == "rust-a");
+        Assert.Contains(requestedPaths, p => p.Contains("rust-a", StringComparison.Ordinal));
+
+        // Once rust-a is processed, the normal scan watermark (rust-b) is retained
+        // and the next sweep starts at rust-c.
+        cursor.CompleteSweep(new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "rust-a" });
+        requestedPaths.Clear();
+        await source.GetCandidatesAsync();
+        Assert.Contains(requestedPaths, p => p.Contains("rust-c", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetCandidatesAsync_CrashBeforeCompleteSweep_DoesNotCommitWatermark_AndZeroCandidateCompleteSweepAdvances()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"rust-2pc-{Guid.NewGuid():N}");
+        var crates = new[] { "rust-a", "rust-b", "rust-c", "rust-d" };
+        var specCatalog = Substitute.For<ISpecCatalog>();
+        specCatalog.GetAllPackageNamesAsync(Arg.Any<CancellationToken>()).Returns(crates);
+        specCatalog.GetSpecAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var pkg = call.Arg<string>();
+                return new SpecContext(pkg, pkg, $"%global crate_name {pkg}\nVersion: 1.0.0\n", $"SPECS/{pkg}/{pkg}.spec");
+            });
+
+        var returnUpdates = true;
+        var handler = new FakeHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(returnUpdates
+                ? """{"name":"crate","vers":"1.0.1","yanked":false}"""
+                : """{"name":"crate","vers":"1.0.0","yanked":false}""")
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            RustCratePoller = new RustCratePollerOptions
+            {
+                Enabled = true,
+                IndexBaseUrl = "https://index.crates.io",
+                MaxCratesPerSweep = 2,
+                RequestDelayMilliseconds = 0
+            }
+        });
+        var stateOpts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions { StateDirectory = tempDir });
+
+        try
+        {
+            var cursorKey = RustCrateVersionSource.GetCursorStateKey(options.Value.TargetRepository);
+
+            // 1. Crash/cancellation before CompleteSweep -> disk watermark stays null so next startup retries same slice
+            using (var store1 = new JsonBotStateStore(stateOpts))
+            {
+                var source1 = new RustCrateVersionSource(new HttpClient(handler), options, specCatalog: specCatalog, stateStore: store1);
+                var c1 = await source1.GetCandidatesAsync();
+                Assert.Equal(new[] { "rust-a", "rust-b" }, c1.Select(c => c.PackageName));
+                Assert.Null(store1.GetCursorWatermark(cursorKey));
+            }
+
+            // 2. Restart with 0 candidates discovered -> CompleteSweep commits pending slice watermark ("rust-b")
+            returnUpdates = false;
+            using var store2 = new JsonBotStateStore(stateOpts);
+            var source2 = new RustCrateVersionSource(new HttpClient(handler), options, specCatalog: specCatalog, stateStore: store2);
+            var c2 = await source2.GetCandidatesAsync();
+            Assert.Empty(c2);
+            Assert.Null(store2.GetCursorWatermark(cursorKey));
+
+            ((ICandidateSweepCursor)source2).CompleteSweep(new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+            Assert.Equal("rust-b", store2.GetCursorWatermark(cursorKey));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
     }
 }
 

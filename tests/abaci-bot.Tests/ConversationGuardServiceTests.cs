@@ -207,7 +207,12 @@ public class ConversationGuardServiceTests
     [Fact]
     public async Task HandleCommandAsync_Unlock_WhenUnarchiveThrows_StillUnlocks()
     {
-        var service = CreateService();
+        var service = CreateService(new ConversationGuardOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            ArchiveEnabled = true
+        });
         var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Write);
 
         _gitHub.IsIssueLockedAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
@@ -217,8 +222,89 @@ public class ConversationGuardServiceTests
 
         await service.HandleCommandAsync(context, "@abaci-bot unlock", "maintainer-user", CancellationToken.None);
 
+        await _gitHub.Received(1).UnarchivePullRequestAsync("owner", "repo", 42, null, Arg.Any<CancellationToken>());
         await _gitHub.Received(1).UnlockIssueAsync("owner", "repo", 42, Arg.Any<CancellationToken>());
-        await _gitHub.Received(1).CreateCommentAsync("owner", "repo", 42, Arg.Is<string>(s => s.Contains("unlocked")), Arg.Any<CancellationToken>());
+        await _gitHub.Received(1).CreateCommentAsync(
+            "owner",
+            "repo",
+            42,
+            Arg.Is<string>(s => s.Contains("unlocked") && s.Contains("automatic unarchiving failed", StringComparison.OrdinalIgnoreCase)),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_Unlock_WhenArchiveDisabled_SkipsUnarchiveAndStillUnlocks()
+    {
+        var service = CreateService(new ConversationGuardOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            ArchiveEnabled = false
+        });
+        var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Write);
+        _gitHub.IsIssueLockedAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        await service.HandleCommandAsync(context, "@abaci-bot unlock", "maintainer-user", CancellationToken.None);
+
+        await _gitHub.DidNotReceiveWithAnyArgs().UnarchivePullRequestAsync(default!, default!, default, default);
+        await _gitHub.Received(1).UnlockIssueAsync("owner", "repo", 42, Arg.Any<CancellationToken>());
+        await _gitHub.Received(1).CreateCommentAsync(
+            "owner",
+            "repo",
+            42,
+            Arg.Is<string>(s => s.Contains("unlocked") && !s.Contains("unarchiving", StringComparison.OrdinalIgnoreCase)),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_Unlock_WhenUnlockThrowsForbidden_PostsErrorNoticeWithoutThrowing()
+    {
+        var service = CreateService(new ConversationGuardOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            ArchiveEnabled = false
+        });
+        var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Write);
+        _gitHub.IsIssueLockedAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(true);
+        var forbiddenResp = Substitute.For<IResponse>();
+        forbiddenResp.StatusCode.Returns(System.Net.HttpStatusCode.Forbidden);
+        _gitHub.UnlockIssueAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new ForbiddenException(forbiddenResp));
+
+        var ex = await Record.ExceptionAsync(() =>
+            service.HandleCommandAsync(context, "@abaci-bot unlock", "maintainer-user", CancellationToken.None));
+
+        Assert.Null(ex);
+        await _gitHub.Received(1).CreateCommentAsync(
+            "owner",
+            "repo",
+            42,
+            Arg.Is<string>(s => s.Contains("@maintainer-user") && !s.Contains("has been unlocked")),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_Hide_WhenGetIssueCommentsThrows_PostsErrorNoticeWithoutThrowing()
+    {
+        var service = CreateService();
+        var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Write);
+        _gitHub.GetIssueCommentsAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns<Task<IReadOnlyList<IssueComment>>>(_ => throw new HttpRequestException("API unavailable"));
+
+        var ex = await Record.ExceptionAsync(() =>
+            service.HandleCommandAsync(context, "@abaci-bot hide @spammer", "maintainer-user", CancellationToken.None));
+
+        Assert.Null(ex);
+        await _gitHub.DidNotReceiveWithAnyArgs().MinimizeCommentAsync(default!, default!, default, default, default!);
+        await _gitHub.Received(1).CreateCommentAsync(
+            "owner",
+            "repo",
+            42,
+            Arg.Is<string>(s => s.Contains("@maintainer-user") && s.Contains("Failed", StringComparison.OrdinalIgnoreCase)),
+            Arg.Any<CancellationToken>());
     }
 
     [Fact]

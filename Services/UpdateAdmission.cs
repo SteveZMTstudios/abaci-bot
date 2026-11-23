@@ -18,6 +18,44 @@ public static class UpdateAdmission
         @"^Version:\s*(?<ver>\S+)",
         RegexOptions.Compiled | RegexOptions.Multiline);
 
+    /// <summary>
+    /// Extracts the authoritative non-macro current version from RPM SPEC content,
+    /// preferring <c>%global full_version</c> and falling back to <c>Version:</c>.
+    /// Rejects unresolved RPM macro placeholders containing <c>%</c>.
+    /// </summary>
+    public static bool TryExtractCurrentVersion(string? specContent, out string version)
+    {
+        version = string.Empty;
+        if (string.IsNullOrWhiteSpace(specContent))
+        {
+            return false;
+        }
+
+        var fullMatch = FullVersionRegex.Match(specContent);
+        if (fullMatch.Success)
+        {
+            var candidate = fullMatch.Groups["ver"].Value.Trim();
+            if (!string.IsNullOrEmpty(candidate) && !candidate.Contains('%'))
+            {
+                version = candidate;
+                return true;
+            }
+        }
+
+        var verMatch = VersionRegex.Match(specContent);
+        if (verMatch.Success)
+        {
+            var candidate = verMatch.Groups["ver"].Value.Trim();
+            if (!string.IsNullOrEmpty(candidate) && !candidate.Contains('%'))
+            {
+                version = candidate;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static readonly Regex SafePackageNameRegex = new(
         @"^[a-zA-Z0-9_\-+.]+$",
         RegexOptions.Compiled);
@@ -262,8 +300,13 @@ public static class UpdateAdmission
         if (string.IsNullOrWhiteSpace(cleanCurrent) || string.IsNullOrWhiteSpace(cleanTarget))
             return false;
 
-        var currentMajor = ExtractMajorComponent(cleanCurrent);
-        var targetMajor = ExtractMajorComponent(cleanTarget);
+        var (currentEpoch, currentBody) = SplitEpoch(cleanCurrent);
+        var (targetEpoch, targetBody) = SplitEpoch(cleanTarget);
+        if (currentEpoch != targetEpoch)
+            return true;
+
+        var currentMajor = ExtractMajorComponent(currentBody);
+        var targetMajor = ExtractMajorComponent(targetBody);
 
         if (currentMajor != null && targetMajor != null)
         {

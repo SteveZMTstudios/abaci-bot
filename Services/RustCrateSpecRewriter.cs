@@ -27,7 +27,15 @@ public class RustCrateSpecRewriter : ISpecVersionRewriter
         if (string.IsNullOrWhiteSpace(context?.Content))
             return false;
 
-        return CrateNameRegex.IsMatch(context.Content);
+        if (!CrateNameRegex.IsMatch(context.Content))
+            return false;
+
+        var verMatches = VersionLineRegex.Matches(context.Content);
+        if (verMatches.Count != 1)
+            return false;
+
+        var verToken = verMatches[0].Groups["ver"].Value;
+        return !verToken.Contains("%{");
     }
 
     public SpecRewriteResult Rewrite(SpecContext context, string targetVersion)
@@ -41,6 +49,9 @@ public class RustCrateSpecRewriter : ISpecVersionRewriter
         // RPM Version tag cannot contain hyphens
         if (targetVersion.Contains('-'))
             return new SpecRewriteResult(false, context.Content, $"Target version '{targetVersion}' contains hyphen (pre-release versions not permitted in RPM Version tag)");
+
+        if (!UpdateAdmission.IsValidTargetVersion(targetVersion))
+            return new SpecRewriteResult(false, context.Content, $"Target version '{targetVersion}' is not a valid RPM version token");
 
         var crateMatch = CrateNameRegex.Match(context.Content);
         if (!crateMatch.Success)
@@ -61,10 +72,17 @@ public class RustCrateSpecRewriter : ISpecVersionRewriter
         }
 
         var fullVerMatch = FullVersionRegex.Match(context.Content);
-        var verMatch = VersionLineRegex.Match(context.Content);
+        var verMatches = VersionLineRegex.Matches(context.Content);
 
-        if (!verMatch.Success)
+        if (verMatches.Count == 0)
             return new SpecRewriteResult(false, context.Content, "No 'Version:' tag found in SPEC");
+
+        if (verMatches.Count > 1)
+            return new SpecRewriteResult(false, context.Content, "Multiple 'Version:' tags found in SPEC; refusing ambiguous rewrite");
+
+        var verMatch = verMatches[0];
+        if (verMatch.Groups["ver"].Value.Contains("%{"))
+            return new SpecRewriteResult(false, context.Content, "Macro-based 'Version:' tag is not supported by automated rewriter");
 
         // Check if both already match targetVersion
         bool verAlreadyTarget = string.Equals(verMatch.Groups["ver"].Value, targetVersion, StringComparison.Ordinal);

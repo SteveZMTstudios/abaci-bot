@@ -8,7 +8,8 @@ public sealed record IgnoredPackageEntry(
 
 public sealed record PackageFailureEntry(
     int ConsecutiveFailures,
-    DateTimeOffset? CooldownUntil);
+    DateTimeOffset? CooldownUntil,
+    DateTimeOffset? LastFailureAt = null);
 
 public sealed record PendingEphemeralComment(
     string Owner,
@@ -46,4 +47,7 @@ public interface IBotStateStore
     IReadOnlyList<PendingEphemeralComment> GetDueEphemeralComments(DateTimeOffset now);
     void RemovePendingEphemeralComment(string owner, string repo, long commentId);
     bool RecordEphemeralRetry(string owner, string repo, long commentId, DateTimeOffset nextAttemptAt, int maxRetries = 5);
+
+    string? GetCursorWatermark(string cursorKey);
+    void SetCursorWatermark(string cursorKey, string? watermark);
 }

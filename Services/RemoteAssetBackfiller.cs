@@ -9,6 +9,10 @@ namespace abaci_bot.Services;
 /// </summary>
 public class RemoteAssetBackfiller : IRemoteAssetBackfiller
 {
+    private static readonly Regex SafeSpecPathRegex = new(
+        @"^SPECS/[^/\\\s]+/[^/\\\s]+\.spec$",
+        RegexOptions.Compiled);
+
     private readonly IGitHubService _gitHubService;
     private readonly ILogger<RemoteAssetBackfiller>? _logger;
 
@@ -18,6 +22,41 @@ public class RemoteAssetBackfiller : IRemoteAssetBackfiller
     {
         _gitHubService = gitHubService ?? throw new ArgumentNullException(nameof(gitHubService));
         _logger = logger;
+    }
+
+    internal static bool IsSafeSpecPath(string? specPath)
+    {
+        if (string.IsNullOrWhiteSpace(specPath))
+            return false;
+
+        var normalized = specPath.Trim().Replace('\\', '/');
+        if (normalized.Contains("..", StringComparison.Ordinal))
+            return false;
+
+        return SafeSpecPathRegex.IsMatch(normalized);
+    }
+
+    internal static string ReplaceFirstExactLine(string content, string oldLine, string newLine)
+    {
+        if (string.IsNullOrEmpty(content) || string.IsNullOrEmpty(oldLine))
+            return content;
+
+        var trimmedOld = oldLine.Trim();
+        var segments = Regex.Split(content, @"(\r\n|\r|\n)");
+        for (int i = 0; i < segments.Length; i += 2)
+        {
+            if (string.Equals(segments[i].Trim(), trimmedOld, StringComparison.Ordinal))
+            {
+                var leadingLen = segments[i].Length - segments[i].TrimStart().Length;
+                var trailingLen = segments[i].Length - segments[i].TrimEnd().Length;
+                var prefix = leadingLen > 0 ? segments[i][..leadingLen] : string.Empty;
+                var suffix = trailingLen > 0 ? segments[i][^trailingLen..] : string.Empty;
+                segments[i] = string.Concat(prefix, newLine.Trim(), suffix);
+                return string.Concat(segments);
+            }
+        }
+
+        return content;
     }
 
     public async Task<bool> TryBackfillAsync(
@@ -45,11 +84,17 @@ public class RemoteAssetBackfiller : IRemoteAssetBackfiller
 
             bool backfilledAny = false;
 
-            // Extract file path from diff header and process each modified spec file safely
-            var fileMatches = Regex.Matches(diffContent, @"\+\+\+\s+b/(?<path>SPECS/\S+)", RegexOptions.Multiline);
+            // Extract file path from diff header and validate strict SPECS/<pkg>/<file>.spec path without traversal
+            var fileMatches = Regex.Matches(diffContent, @"^\+\+\+\s+(?:b/)?(?<path>\S+)", RegexOptions.Multiline);
             foreach (Match fileMatch in fileMatches)
             {
                 var specPath = fileMatch.Groups["path"].Value.Trim();
+                if (!IsSafeSpecPath(specPath))
+                {
+                    _logger?.LogWarning("Rejected unsafe RemoteAsset spec path '{Path}' in diff artifact for PR #{PrNumber}", specPath, prNumber);
+                    continue;
+                }
+
                 var changes = ArtifactDiffExtractor.ExtractFileRemoteAssetChanges(diffContent, specPath);
                 if (changes.Count == 0)
                     continue;
@@ -71,10 +116,7 @@ public class RemoteAssetBackfiller : IRemoteAssetBackfiller
                 var updatedSpec = currentSpec;
                 foreach (var (oldLine, newLine) in changes)
                 {
-                    if (updatedSpec.Contains(oldLine, StringComparison.Ordinal))
-                    {
-                        updatedSpec = updatedSpec.Replace(oldLine, newLine);
-                    }
+                    updatedSpec = ReplaceFirstExactLine(updatedSpec, oldLine, newLine);
                 }
 
                 if (!string.Equals(updatedSpec, currentSpec, StringComparison.Ordinal))

@@ -347,25 +347,71 @@ public partial class ConversationGuardService : IConversationGuardService
         _logger?.LogInformation("Unlocking conversation for {Owner}/{Repo}#{PrNumber} requested by maintainer {Sender}",
             context.Owner, context.Repo, context.PrNumber, senderLogin);
 
+        bool unarchiveFailed = false;
+        if (_options.ArchiveEnabled)
+        {
+            try
+            {
+                await _gitHub.UnarchivePullRequestAsync(context.Owner, context.Repo, context.PrNumber, null, cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                unarchiveFailed = true;
+                _logger?.LogWarning(ex, "Unarchive attempt failed during unlock for {Owner}/{Repo}#{PrNumber}",
+                    context.Owner, context.Repo, context.PrNumber);
+            }
+        }
+
         try
         {
-            await _gitHub.UnarchivePullRequestAsync(context.Owner, context.Repo, context.PrNumber, null, cancellationToken);
+            await _gitHub.UnlockIssueAsync(context.Owner, context.Repo, context.PrNumber, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger?.LogDebug(ex, "Unarchive attempt ignored or not applicable for {Owner}/{Repo}#{PrNumber}",
+            _logger?.LogWarning(ex, "Failed to unlock conversation for {Owner}/{Repo}#{PrNumber}",
                 context.Owner, context.Repo, context.PrNumber);
+            try
+            {
+                await _gitHub.CreateCommentAsync(
+                    context.Owner,
+                    context.Repo,
+                    context.PrNumber,
+                    isZh
+                        ? $"@{senderLogin} 解锁此对话时发生 GitHub API/权限错误，请检查机器人权限后重试。"
+                        : $"@{senderLogin} Failed to unlock this conversation due to a GitHub API/permission error.",
+                    cancellationToken);
+            }
+            catch (Exception commentEx) when (commentEx is not OperationCanceledException)
+            {
+                _logger?.LogDebug(commentEx, "Failed to post unlock error notice on {Owner}/{Repo}#{PrNumber}",
+                    context.Owner, context.Repo, context.PrNumber);
+            }
+
+            return;
         }
 
-        await _gitHub.UnlockIssueAsync(context.Owner, context.Repo, context.PrNumber, cancellationToken);
-        await _gitHub.CreateCommentAsync(
-            context.Owner,
-            context.Repo,
-            context.PrNumber,
-            isZh
+        var unlockMessage = unarchiveFailed
+            ? (isZh
+                ? $"此对话已由 @{senderLogin} 解锁（注意：自动取消归档未成功，请确认归档权限）。"
+                : $"This conversation has been unlocked by @{senderLogin} (note: automatic unarchiving failed; please verify archive permissions).")
+            : (isZh
                 ? $"此对话已由 @{senderLogin} 解锁。"
-                : $"This conversation has been unlocked by @{senderLogin}.",
-            cancellationToken);
+                : $"This conversation has been unlocked by @{senderLogin}.");
+
+        try
+        {
+            await _gitHub.CreateCommentAsync(
+                context.Owner,
+                context.Repo,
+                context.PrNumber,
+                unlockMessage,
+                cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogWarning(ex, "Conversation unlocked on {Owner}/{Repo}#{PrNumber}, but posting unlock notice failed",
+                context.Owner, context.Repo, context.PrNumber);
+        }
     }
 
     private async Task HandleHideCommandAsync(
@@ -422,7 +468,35 @@ public partial class ConversationGuardService : IConversationGuardService
             return;
         }
 
-        var comments = await _gitHub.GetIssueCommentsAsync(context.Owner, context.Repo, context.PrNumber, cancellationToken);
+        IReadOnlyList<IssueComment> comments;
+        try
+        {
+            comments = await _gitHub.GetIssueCommentsAsync(context.Owner, context.Repo, context.PrNumber, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogWarning(ex, "Failed to retrieve comments while handling hide command on {Owner}/{Repo}#{PrNumber}",
+                context.Owner, context.Repo, context.PrNumber);
+            try
+            {
+                await _gitHub.CreateCommentAsync(
+                    context.Owner,
+                    context.Repo,
+                    context.PrNumber,
+                    isZh
+                        ? $"@{senderLogin} 查询评论列表时发生 GitHub API 错误，请稍后重试。"
+                        : $"@{senderLogin} Failed to inspect comments due to a GitHub API error.",
+                    cancellationToken);
+            }
+            catch (Exception commentEx) when (commentEx is not OperationCanceledException)
+            {
+                _logger?.LogDebug(commentEx, "Failed to post hide error notice on {Owner}/{Repo}#{PrNumber}",
+                    context.Owner, context.Repo, context.PrNumber);
+            }
+
+            return;
+        }
+
         var targetComments = comments
             .Where(c => string.Equals(c.User?.Login, targetUser, StringComparison.OrdinalIgnoreCase))
             .ToList();
@@ -477,12 +551,20 @@ public partial class ConversationGuardService : IConversationGuardService
             _ => $"{hiddenCount} comment(s) authored by @{targetUser} have been minimized by @{senderLogin}."
         };
 
-        await _gitHub.CreateCommentAsync(
-            context.Owner,
-            context.Repo,
-            context.PrNumber,
-            summaryMessage,
-            cancellationToken);
+        try
+        {
+            await _gitHub.CreateCommentAsync(
+                context.Owner,
+                context.Repo,
+                context.PrNumber,
+                summaryMessage,
+                cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogWarning(ex, "Failed to post hide summary notice on {Owner}/{Repo}#{PrNumber}",
+                context.Owner, context.Repo, context.PrNumber);
+        }
     }
 
     private async Task HandleArchiveCommandAsync(

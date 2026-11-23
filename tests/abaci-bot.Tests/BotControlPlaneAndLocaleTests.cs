@@ -937,13 +937,58 @@ public class BotControlPlaneAndLocaleTests
             services.AddSingleton<IFileContentCache, FileContentCache>();
             services.Configure<FileCacheOptions>(_ => { });
             services.AddSingleton<ISpecCatalog, GitHubSpecCatalog>();
+            services.AddSingleton<IPagedIssueSearchGateway>(Substitute.For<IPagedIssueSearchGateway>());
+            services.AddSingleton<IOpenPullRequestInventoryGateway>(Substitute.For<IOpenPullRequestInventoryGateway>());
+            services.AddSingleton<IObsBuildService>(Substitute.For<IObsBuildService>());
+            services.AddSingleton<IObsBuildFreshnessGateway>(Substitute.For<IObsBuildFreshnessGateway>());
+            services.AddSingleton<IPackageUpdatePublisher>(Substitute.For<IPackageUpdatePublisher>());
+            services.AddSingleton<IRemoteAssetBackfiller>(Substitute.For<IRemoteAssetBackfiller>());
+            services.AddSingleton<ObsPostMergeVerifier>();
+            services.AddSingleton<PackageUpdateService>();
             services.AddSingleton<LookoutVersionSource>();
             services.AddSingleton<RustCrateVersionSource>();
 
             using var provider = services.BuildServiceProvider();
             Assert.IsType<GitHubSpecCatalog>(provider.GetRequiredService<ISpecCatalog>());
+            Assert.NotNull(provider.GetRequiredService<IOpenPullRequestInventoryGateway>());
+            Assert.NotNull(provider.GetRequiredService<IObsBuildFreshnessGateway>());
+            Assert.NotNull(provider.GetRequiredService<ObsPostMergeVerifier>());
+            Assert.NotNull(provider.GetRequiredService<PackageUpdateService>());
             Assert.NotNull(provider.GetRequiredService<LookoutVersionSource>());
             Assert.NotNull(provider.GetRequiredService<RustCrateVersionSource>());
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void JsonBotStateStore_PersistsCursorWatermarksAcrossRestart()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"bot-state-cursor-{Guid.NewGuid():N}");
+        try
+        {
+            var opts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions { StateDirectory = tempDir });
+            using (var store1 = new JsonBotStateStore(opts))
+            {
+                Assert.Null(store1.GetCursorWatermark("rust-crates"));
+                store1.SetCursorWatermark("rust-crates", "rust-serde");
+                Assert.Equal("rust-serde", store1.GetCursorWatermark("rust-crates"));
+            }
+
+            using (var store2 = new JsonBotStateStore(opts))
+            {
+                Assert.Equal("rust-serde", store2.GetCursorWatermark("rust-crates"));
+                store2.SetCursorWatermark("rust-crates", null);
+                Assert.Null(store2.GetCursorWatermark("rust-crates"));
+            }
+
+            using var store3 = new JsonBotStateStore(opts);
+            Assert.Null(store3.GetCursorWatermark("rust-crates"));
         }
         finally
         {

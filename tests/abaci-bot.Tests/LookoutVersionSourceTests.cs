@@ -277,13 +277,23 @@ public class LookoutVersionSourceTests
         Assert.Empty(await sourceBadJson.GetCandidatesAsync());
     }
 
+    private sealed class MutableTimeProvider : TimeProvider
+    {
+        private DateTimeOffset _utcNow;
+        public MutableTimeProvider(DateTimeOffset utcNow) => _utcNow = utcNow;
+        public void SetUtcNow(DateTimeOffset value) => _utcNow = value;
+        public override DateTimeOffset GetUtcNow() => _utcNow;
+    }
+
     [Fact]
     public async Task GetCandidatesAsync_PersistsFirstSeenAcrossRestarts_AndResetsOnVersionChangeOrPrune()
     {
         var statePath = Path.Combine(Path.GetTempPath(), $"lookout-state-{Guid.NewGuid():N}.json");
         var firstObserved = new DateTimeOffset(2026, 11, 17, 10, 0, 0, TimeSpan.Zero);
+        var staleMonitorUpdatedAt = firstObserved.AddHours(-48);
         var laterPoll = new DateTimeOffset(2026, 11, 20, 12, 0, 0, TimeSpan.Zero);
-        var currentPoll = firstObserved;
+        var timeProvider = new MutableTimeProvider(firstObserved);
+        var currentPoll = staleMonitorUpdatedAt;
         var currentLatest = "2.0.0";
         var includePkg = true;
 
@@ -331,16 +341,17 @@ public class LookoutVersionSourceTests
 
         try
         {
-            // 1. First instance observes dnf5@2.0.0 at firstObserved
-            var source1 = new LookoutVersionSource(new HttpClient(handler), options);
+            // 1. First instance observes dnf5@2.0.0 at firstObserved (conservative TimeProvider clock, ignoring older monitor updated_at)
+            var source1 = new LookoutVersionSource(new HttpClient(handler), options, timeProvider: timeProvider);
             var c1 = await source1.GetCandidatesAsync();
             Assert.Single(c1);
             Assert.Equal(firstObserved, c1[0].PublishedAt);
             Assert.True(File.Exists(statePath));
 
             // 2. Simulated process restart with newer Lookout updated_at -> must preserve firstObserved
+            timeProvider.SetUtcNow(laterPoll);
             currentPoll = laterPoll;
-            var source2 = new LookoutVersionSource(new HttpClient(handler), options);
+            var source2 = new LookoutVersionSource(new HttpClient(handler), options, timeProvider: timeProvider);
             var c2 = await source2.GetCandidatesAsync();
             Assert.Single(c2);
             Assert.Equal(firstObserved, c2[0].PublishedAt);
@@ -355,9 +366,10 @@ public class LookoutVersionSourceTests
             includePkg = false;
             Assert.Empty(await source2.GetCandidatesAsync());
 
-            var source3 = new LookoutVersionSource(new HttpClient(handler), options);
-            includePkg = true;
             var newerPoll = laterPoll.AddHours(2);
+            timeProvider.SetUtcNow(newerPoll);
+            var source3 = new LookoutVersionSource(new HttpClient(handler), options, timeProvider: timeProvider);
+            includePkg = true;
             currentPoll = newerPoll;
             var c4 = await source3.GetCandidatesAsync();
             Assert.Single(c4);

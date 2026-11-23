@@ -25,7 +25,32 @@ public record ObsPackageBuildResult(
     string Arch,
     ObsStatusCode Code,
     string RawCode,
-    string? Details = null);
+    string? Details = null,
+    bool IsDirty = false);
+
+/// <summary>
+/// Authoritative OBS source-to-job freshness evidence read from <c>/public/source</c> and <c>_jobhistory</c>.
+/// </summary>
+public sealed record ObsPackageBuildFreshness(
+    bool IsServiceReady,
+    string? SourceMd5,
+    string? LatestJobSrcMd5,
+    DateTimeOffset? LatestJobStartTime,
+    ObsStatusCode LatestJobCode);
+
+/// <summary>
+/// Narrow freshness verification gateway implemented by <see cref="ObsBuildService"/> to decouple
+/// multi-endpoint cryptographic freshness checks from the primary <see cref="IObsBuildService"/> status contract.
+/// </summary>
+public interface IObsBuildFreshnessGateway
+{
+    Task<ObsPackageBuildFreshness?> GetPackageBuildFreshnessAsync(
+        string project,
+        string package,
+        string repository,
+        string arch,
+        CancellationToken ct = default);
+}
 
 /// <summary>
 /// Deep module abstraction over Open Build Service (OBS) REST API.

@@ -781,4 +781,262 @@ public class ObsPostMergeVerifierTests
             Arg.Is<string>(body => body.Contains($"Verified via `{expectedEndpoint}` read-model.")),
             Arg.Any<CancellationToken>());
     }
+
+    [Fact]
+    public async Task VerifyMergedPullRequestsAsync_RequireObsSuccessAfterMerge_CreatesBlockedTrackingIssueIdempotently_AndClosesOnRecovery()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        var pagedSearchMock = Substitute.For<IPagedIssueSearchGateway>();
+        var obsServiceMock = Substitute.For<IObsBuildService>();
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            TargetRepository = "owner/repo",
+            DryRun = false,
+            Obs = new ObsOptions
+            {
+                Project = "openruyi",
+                TargetRepository = "riscv64",
+                TargetArch = "riscv64",
+                RequireObsSuccessAfterMerge = true
+            }
+        });
+
+        var pr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(pr, 90);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Title))?.SetValue(pr, "SPECS: bump curl to 8.22.0");
+        typeof(PullRequest).GetProperty(nameof(PullRequest.MergeCommitSha))?.SetValue(pr, "shaObs90");
+
+        gitHubMock.SearchMergedPullRequestsAsync("owner", "repo", Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(new[] { pr });
+        obsServiceMock.GetPackageServiceRevisionAsync("openruyi", "curl", Arg.Any<CancellationToken>())
+            .Returns("shaObs90");
+        gitHubMock.GetIssueCommentsAsync("owner", "repo", 90, Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<IssueComment>());
+
+        var expectedTitle = ObsPostMergeVerifier.BuildObsBlockedIssueTitle("curl");
+        var createdIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(createdIssue, 950);
+        typeof(Issue).GetProperty(nameof(Issue.Title))?.SetValue(createdIssue, expectedTitle);
+
+        // Sweep 1: no existing blocked tracking issue; OBS build fails -> creates tracking issue once
+        obsServiceMock.GetPackageBuildResultAsync("openruyi", "curl", "riscv64", "riscv64", Arg.Any<CancellationToken>())
+            .Returns(new ObsPackageBuildResult("openruyi", "curl", "riscv64", "riscv64", ObsStatusCode.Failed, "failed"));
+        pagedSearchMock.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.AutoUpdateBlocked, Arg.Any<CancellationToken>())
+            .Returns(new GitHubSearchPageResult<Issue>(Array.Empty<Issue>(), 0, false));
+        gitHubMock.CreateIssueAsync(
+                "owner", "repo", expectedTitle, Arg.Any<string>(), Arg.Any<string[]>(), Arg.Any<CancellationToken>())
+            .Returns(createdIssue);
+
+        var verifier = new ObsPostMergeVerifier(gitHubMock, obsServiceMock, options, pagedIssueSearch: pagedSearchMock);
+        await verifier.VerifyMergedPullRequestsAsync("owner/repo");
+
+        await gitHubMock.Received(1).AddLabelsAsync(
+            "owner", "repo", 90, Arg.Is<string[]>(l => l.Contains(GitHubLabels.AutoUpdateBlocked)), Arg.Any<CancellationToken>());
+        await gitHubMock.Received(1).CreateIssueAsync(
+            "owner", "repo", expectedTitle, Arg.Any<string>(),
+            Arg.Is<string[]>(l => l.Contains(GitHubLabels.AutoUpdateBlocked) && l.Contains(GitHubLabels.StatusStaleExempt)),
+            Arg.Any<CancellationToken>());
+
+        // Sweep 2: tracking issue already open; OBS still fails -> must NOT create duplicate tracking issue
+        pagedSearchMock.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.AutoUpdateBlocked, Arg.Any<CancellationToken>())
+            .Returns(new GitHubSearchPageResult<Issue>(new[] { createdIssue }, 1, false));
+        await verifier.VerifyMergedPullRequestsAsync("owner/repo");
+        await gitHubMock.Received(1).CreateIssueAsync(
+            "owner", "repo", expectedTitle, Arg.Any<string>(), Arg.Any<string[]>(), Arg.Any<CancellationToken>());
+
+        // Sweep 3: OBS recovers to Succeeded -> removes Blocked label on PR & closes tracking issue
+        var blockedLabel = (Label)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Label));
+        typeof(Label).GetProperty(nameof(Label.Name))?.SetValue(blockedLabel, GitHubLabels.AutoUpdateBlocked);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(pr, new List<Label> { blockedLabel });
+        obsServiceMock.GetPackageBuildResultAsync("openruyi", "curl", "riscv64", "riscv64", Arg.Any<CancellationToken>())
+            .Returns(new ObsPackageBuildResult("openruyi", "curl", "riscv64", "riscv64", ObsStatusCode.Succeeded, "succeeded"));
+
+        await verifier.VerifyMergedPullRequestsAsync("owner/repo");
+
+        await gitHubMock.Received(1).RemoveLabelAsync("owner", "repo", 90, GitHubLabels.AutoUpdateBlocked, Arg.Any<CancellationToken>());
+        await gitHubMock.Received(1).CreateCommentAsync(
+            "owner", "repo", 950, Arg.Is<string>(b => b.Contains("OBS build succeeded", StringComparison.Ordinal)), Arg.Any<CancellationToken>());
+        await gitHubMock.Received(1).CloseIssueAsync("owner", "repo", 950, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task VerifyMergedPullRequestsAsync_DeferWhenStaleJobPreDatesMerge_AndRecoverBlockedIssueBeyondSevenDaysOrMainUpgrade()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        var pagedSearchMock = Substitute.For<IPagedIssueSearchGateway>();
+        var obsServiceMock = Substitute.For<IObsBuildService>();
+        var freshnessMock = Substitute.For<IObsBuildFreshnessGateway>();
+        var specCatalogMock = Substitute.For<ISpecCatalog>();
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            TargetRepository = "owner/repo",
+            DryRun = false,
+            Obs = new ObsOptions
+            {
+                Project = "openruyi",
+                TargetRepository = "riscv64",
+                TargetArch = "riscv64",
+                RequireObsSuccessAfterMerge = true
+            }
+        });
+
+        var mergedAt = new DateTimeOffset(2026, 11, 20, 12, 0, 0, TimeSpan.Zero);
+        var pr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(pr, 91);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Title))?.SetValue(pr, "SPECS: bump curl 8.21.0 -> 8.22.0");
+        typeof(PullRequest).GetProperty(nameof(PullRequest.MergeCommitSha))?.SetValue(pr, "shaNew91");
+        typeof(PullRequest).GetProperty(nameof(PullRequest.MergedAt))?.SetValue(pr, mergedAt);
+        var headBranch = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
+        typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headBranch, "autoupdate/curl");
+        var headRepo = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(headRepo, "owner/repo");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headBranch, headRepo);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(pr, headBranch);
+
+        gitHubMock.SearchMergedPullRequestsAsync("owner", "repo", Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(new[] { pr });
+        obsServiceMock.GetPackageServiceRevisionAsync("openruyi", "curl", Arg.Any<CancellationToken>()).Returns("shaNew91");
+        obsServiceMock.GetPackageBuildResultAsync("openruyi", "curl", "riscv64", "riscv64", Arg.Any<CancellationToken>())
+            .Returns(new ObsPackageBuildResult("openruyi", "curl", "riscv64", "riscv64", ObsStatusCode.Succeeded, "succeeded"));
+
+        // 1. Stale job (starttime < MergedAt & mismatched xsrcmd5) must NOT delete branch or close anything!
+        freshnessMock.GetPackageBuildFreshnessAsync("openruyi", "curl", "riscv64", "riscv64", Arg.Any<CancellationToken>())
+            .Returns(new ObsPackageBuildFreshness(true, "hash-new", "hash-old", mergedAt.AddHours(-2), ObsStatusCode.Succeeded));
+
+        // Beyond 7-day open blocked issues:
+        // - pkg-obs-recovered: no merged PR in 7d window, OBS now succeeds cleanly
+        // - pkg-main-upgraded: main branch moved beyond recorded version 1.0.0
+        var obsRecoveredIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(obsRecoveredIssue, 701);
+        typeof(Issue).GetProperty(nameof(Issue.Title))?.SetValue(obsRecoveredIssue, ObsPostMergeVerifier.BuildObsBlockedIssueTitle("pkg-obs-recovered"));
+        typeof(Issue).GetProperty(nameof(Issue.CreatedAt))?.SetValue(obsRecoveredIssue, mergedAt.AddDays(-14));
+
+        var mainUpgradedIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(mainUpgradedIssue, 702);
+        typeof(Issue).GetProperty(nameof(Issue.Title))?.SetValue(mainUpgradedIssue, ObsPostMergeVerifier.BuildObsBlockedIssueTitle("pkg-main-upgraded"));
+        typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(mainUpgradedIssue, "- **Package Version**: `1.0.0`\n<!-- abaci-obs-blocked: pkg-main-upgraded -->");
+        typeof(Issue).GetProperty(nameof(Issue.CreatedAt))?.SetValue(mainUpgradedIssue, mergedAt.AddDays(-20));
+
+        pagedSearchMock.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.AutoUpdateBlocked, Arg.Any<CancellationToken>())
+            .Returns(new GitHubSearchPageResult<Issue>(new[] { obsRecoveredIssue, mainUpgradedIssue }, 2, false));
+
+        obsServiceMock.GetPackageBuildResultAsync("openruyi", "pkg-obs-recovered", "riscv64", "riscv64", Arg.Any<CancellationToken>())
+            .Returns(new ObsPackageBuildResult("openruyi", "pkg-obs-recovered", "riscv64", "riscv64", ObsStatusCode.Succeeded, "succeeded"));
+        freshnessMock.GetPackageBuildFreshnessAsync("openruyi", "pkg-obs-recovered", "riscv64", "riscv64", Arg.Any<CancellationToken>())
+            .Returns(new ObsPackageBuildFreshness(true, "hash-r", "hash-r", mergedAt.AddDays(-1), ObsStatusCode.Succeeded));
+
+        specCatalogMock.GetSpecAsync("pkg-main-upgraded", Arg.Any<CancellationToken>())
+            .Returns(new SpecContext("pkg-main-upgraded", "pkg-main-upgraded", "Name: pkg-main-upgraded\nVersion: 1.0.1\n", "SPECS/pkg-main-upgraded/pkg-main-upgraded.spec"));
+
+        var verifier = new ObsPostMergeVerifier(
+            gitHubMock, obsServiceMock, options,
+            pagedIssueSearch: pagedSearchMock,
+            freshnessGateway: freshnessMock,
+            specCatalog: specCatalogMock);
+
+        await verifier.VerifyMergedPullRequestsAsync("owner/repo");
+
+        // PR #91 with stale OBS job must NOT trigger branch deletion
+        await gitHubMock.DidNotReceive().DeleteRefAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>());
+
+        // Both >7-day open blocked issues must recover and close automatically
+        await gitHubMock.Received(1).CloseIssueAsync("owner", "repo", 701, Arg.Any<CancellationToken>());
+        await gitHubMock.Received(1).CloseIssueAsync("owner", "repo", 702, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ReconcileOpenObsBlockedIssuesAsync_LateRecovery_ReclaimsMergedBranchFromBlockedIssuePrNumber()
+    {
+        var mergedAt = DateTimeOffset.UtcNow.AddDays(-20);
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.SearchMergedPullRequestsAsync("owner", "repo", string.Empty, Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<PullRequest>());
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            DryRun = false,
+            BranchPrefix = "autoupdate/",
+            Obs = new ObsOptions
+            {
+                Project = "openruyi",
+                TargetRepository = "riscv64",
+                TargetArch = "riscv64",
+                RequireObsSuccessAfterMerge = true
+            }
+        });
+
+        var obsServiceMock = Substitute.For<IObsBuildService>();
+        var freshnessMock = Substitute.For<IObsBuildFreshnessGateway>();
+        var specCatalogMock = Substitute.For<ISpecCatalog>();
+        var pagedSearchMock = Substitute.For<IPagedIssueSearchGateway>();
+
+        static Issue MakeBlockedIssue(int number, string pkg, string version, int mergedPrNumber, DateTimeOffset createdAt)
+        {
+            var issue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+            typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issue, number);
+            typeof(Issue).GetProperty(nameof(Issue.Title))?.SetValue(issue, ObsPostMergeVerifier.BuildObsBlockedIssueTitle(pkg));
+            typeof(Issue).GetProperty(nameof(Issue.CreatedAt))?.SetValue(issue, createdAt);
+            typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(issue, $"""
+                Package `{pkg}` failed post-merge Open Build Service verification after merging PR #{mergedPrNumber}.
+                - **Package Version**: `{version}`
+                <!-- abaci-obs-blocked: {pkg} -->
+                """);
+            return issue;
+        }
+
+        static PullRequest MakeMergedPr(int number, string branch, string sha)
+        {
+            var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+            typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "owner/repo");
+            var head = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
+            typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(head, branch);
+            typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(head, sha);
+            typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(head, repoObj);
+            var pr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+            typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(pr, number);
+            typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(pr, head);
+            return pr;
+        }
+
+        var lateObsIssue = MakeBlockedIssue(801, "pkg-late-obs", "1.0.0", 811, mergedAt);
+        var mainUpgradedIssue = MakeBlockedIssue(802, "pkg-main-up", "1.0.0", 812, mergedAt);
+
+        pagedSearchMock.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.AutoUpdateBlocked, Arg.Any<CancellationToken>())
+            .Returns(new GitHubSearchPageResult<Issue>(new[] { lateObsIssue, mainUpgradedIssue }, 2, false));
+
+        obsServiceMock.GetPackageBuildResultAsync("openruyi", "pkg-late-obs", "riscv64", "riscv64", Arg.Any<CancellationToken>())
+            .Returns(new ObsPackageBuildResult("openruyi", "pkg-late-obs", "riscv64", "riscv64", ObsStatusCode.Succeeded, "succeeded"));
+        freshnessMock.GetPackageBuildFreshnessAsync("openruyi", "pkg-late-obs", "riscv64", "riscv64", Arg.Any<CancellationToken>())
+            .Returns(new ObsPackageBuildFreshness(true, "hash-ok", "hash-ok", mergedAt.AddDays(1), ObsStatusCode.Succeeded));
+
+        specCatalogMock.GetSpecAsync("pkg-main-up", Arg.Any<CancellationToken>())
+            .Returns(new SpecContext("pkg-main-up", "pkg-main-up", "Name: pkg-main-up\nVersion: 1.0.2\n", "SPECS/pkg-main-up/pkg-main-up.spec"));
+
+        gitHubMock.GetPullRequestAsync("owner", "repo", 811, Arg.Any<CancellationToken>())
+            .Returns(MakeMergedPr(811, "autoupdate/pkg-late-obs", "sha-811"));
+        gitHubMock.GetRefShaAsync("owner", "repo", "autoupdate/pkg-late-obs", Arg.Any<CancellationToken>())
+            .Returns("sha-811");
+
+        gitHubMock.GetPullRequestAsync("owner", "repo", 812, Arg.Any<CancellationToken>())
+            .Returns(MakeMergedPr(812, "autoupdate/pkg-main-up", "sha-812"));
+        gitHubMock.FindOpenPullRequestByHeadAsync("owner", "repo", "autoupdate/pkg-main-up", Arg.Any<CancellationToken>())
+            .Returns(MakeMergedPr(999, "autoupdate/pkg-main-up", "sha-new"));
+
+        var verifier = new ObsPostMergeVerifier(
+            gitHubMock, obsServiceMock, options,
+            pagedIssueSearch: pagedSearchMock,
+            freshnessGateway: freshnessMock,
+            specCatalog: specCatalogMock);
+
+        await verifier.VerifyMergedPullRequestsAsync("owner/repo");
+
+        await gitHubMock.Received(1).CloseIssueAsync("owner", "repo", 801, Arg.Any<CancellationToken>());
+        await gitHubMock.Received(1).CloseIssueAsync("owner", "repo", 802, Arg.Any<CancellationToken>());
+        // Late OBS recovery reclaims safe branch...
+        await gitHubMock.Received(1).DeleteRefAsync("owner", "repo", "autoupdate/pkg-late-obs", Arg.Any<CancellationToken>());
+        // ...while branch reused by an active open PR (#999) is protected.
+        await gitHubMock.DidNotReceive().DeleteRefAsync("owner", "repo", "autoupdate/pkg-main-up", Arg.Any<CancellationToken>());
+    }
 }

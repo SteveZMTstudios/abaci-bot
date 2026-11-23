@@ -1288,7 +1288,7 @@ public class GitHubServiceTests
     }
 
     [Fact]
-    public async Task VerifyCollaboratorPermissionProbeAsync_CallsCollaboratorGetAll()
+    public async Task VerifyCollaboratorPermissionProbeAsync_CallsReviewPermission_AndAllowsNotFound()
     {
         var (pem, _) = GenerateRsaKeyPair();
         var (service, client) = CreateTestService(pem);
@@ -1298,12 +1298,45 @@ public class GitHubServiceTests
         client.Repository.Returns(reposClient);
         reposClient.Collaborator.Returns(collabClient);
 
-        collabClient.GetAll("owner", "repo", Arg.Any<ApiOptions>())
-            .Returns(Task.FromResult<IReadOnlyList<Collaborator>>(Array.Empty<Collaborator>()));
+        var appModel = (GitHubApp)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitHubApp));
+        typeof(GitHubApp).GetProperty(nameof(GitHubApp.Slug))?.SetValue(appModel, "abaci-bot");
+        client.GitHubApps.GetCurrent().Returns(Task.FromResult(appModel));
 
-        await service.VerifyCollaboratorPermissionProbeAsync("owner", "repo");
+        // 1. 200 OK succeeds
+        collabClient.ReviewPermission("owner", "repo1", "abaci-bot")
+            .Returns(Task.FromResult(new CollaboratorPermissionResponse("read", "read", new Collaborator())));
+        await service.VerifyCollaboratorPermissionProbeAsync("owner", "repo1");
+        await collabClient.Received(1).ReviewPermission("owner", "repo1", "abaci-bot");
 
-        await collabClient.Received(1).GetAll("owner", "repo", Arg.Is<ApiOptions>(o => o.PageSize == 1 && o.PageCount == 1));
+        // 2. 404 NotFound still confirms ReviewPermission endpoint authorization succeeded
+        var (service2, client2) = CreateTestService(pem);
+        var reposClient2 = Substitute.For<IRepositoriesClient>();
+        var collabClient2 = Substitute.For<IRepoCollaboratorsClient>();
+        client2.Repository.Returns(reposClient2);
+        reposClient2.Collaborator.Returns(collabClient2);
+        client2.GitHubApps.GetCurrent().Returns(Task.FromResult(appModel));
+
+        var notFoundResp = Substitute.For<IResponse>();
+        notFoundResp.StatusCode.Returns(HttpStatusCode.NotFound);
+        collabClient2.ReviewPermission("owner", "repo2", "abaci-bot")
+            .Returns<Task<CollaboratorPermissionResponse>>(_ => throw new NotFoundException(notFoundResp));
+        await service2.VerifyCollaboratorPermissionProbeAsync("owner", "repo2");
+        await collabClient2.Received(1).ReviewPermission("owner", "repo2", "abaci-bot");
+
+        // 3. 403 Forbidden fails closed by throwing ForbiddenException
+        var (service3, client3) = CreateTestService(pem);
+        var reposClient3 = Substitute.For<IRepositoriesClient>();
+        var collabClient3 = Substitute.For<IRepoCollaboratorsClient>();
+        client3.Repository.Returns(reposClient3);
+        reposClient3.Collaborator.Returns(collabClient3);
+        client3.GitHubApps.GetCurrent().Returns(Task.FromResult(appModel));
+
+        var forbiddenResp = Substitute.For<IResponse>();
+        forbiddenResp.StatusCode.Returns(HttpStatusCode.Forbidden);
+        collabClient3.ReviewPermission("owner", "repo3", "abaci-bot")
+            .Returns<Task<CollaboratorPermissionResponse>>(_ => throw new ForbiddenException(forbiddenResp));
+        await Assert.ThrowsAsync<ForbiddenException>(() => service3.VerifyCollaboratorPermissionProbeAsync("owner", "repo3"));
+        await collabClient3.Received(1).ReviewPermission("owner", "repo3", "abaci-bot");
     }
 
     [Fact]
@@ -1429,19 +1462,26 @@ public class GitHubServiceTests
         typeof(GitHubCommit).GetProperty(nameof(GitHubCommit.Sha))?.SetValue(ghCommit, "headsha");
         var gitCommitObj = (Octokit.Commit)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.Commit));
         typeof(Octokit.Commit).GetProperty(nameof(Octokit.Commit.Message))?.SetValue(gitCommitObj, "bump");
+        var authorIdentity = (Committer)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Committer));
+        typeof(Committer).GetProperty(nameof(Committer.Email))?.SetValue(authorIdentity, "author@openruyi.org");
+        typeof(Octokit.Commit).GetProperty(nameof(Octokit.Commit.Author))?.SetValue(gitCommitObj, authorIdentity);
         var committerIdentity = (Committer)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Committer));
-        typeof(Committer).GetProperty(nameof(Committer.Email))?.SetValue(committerIdentity, "bot@openruyi.org");
+        typeof(Committer).GetProperty(nameof(Committer.Email))?.SetValue(committerIdentity, "noreply@github.com");
         typeof(Octokit.Commit).GetProperty(nameof(Octokit.Commit.Committer))?.SetValue(gitCommitObj, committerIdentity);
         typeof(GitHubCommit).GetProperty(nameof(GitHubCommit.Commit))?.SetValue(ghCommit, gitCommitObj);
-        var ghUser = (Author)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Author));
-        typeof(Author).GetProperty(nameof(Author.Login))?.SetValue(ghUser, "aqua-rium");
-        typeof(GitHubCommit).GetProperty(nameof(GitHubCommit.Committer))?.SetValue(ghCommit, ghUser);
+        var ghAuthorUser = (Author)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Author));
+        typeof(Author).GetProperty(nameof(Author.Login))?.SetValue(ghAuthorUser, "aqua-rium");
+        typeof(GitHubCommit).GetProperty(nameof(GitHubCommit.Author))?.SetValue(ghCommit, ghAuthorUser);
+        var ghCommitterUser = (Author)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Author));
+        typeof(Author).GetProperty(nameof(Author.Login))?.SetValue(ghCommitterUser, "web-flow");
+        typeof(GitHubCommit).GetProperty(nameof(GitHubCommit.Committer))?.SetValue(ghCommit, ghCommitterUser);
         commitsClient.Get("owner", "repo", "headsha").Returns(Task.FromResult(ghCommit));
 
         var latest = await service.GetBranchLatestCommitAsync("owner", "repo", "feat");
         Assert.NotNull(latest);
-        Assert.Equal("headsha", latest.Value.Sha);
-        Assert.Equal("aqua-rium", latest.Value.CommitterLogin);
+        Assert.Equal("headsha", latest.Sha);
+        Assert.Equal("aqua-rium", latest.AuthorLogin);
+        Assert.Equal("web-flow", latest.CommitterLogin);
 
         branchesClient.Get("owner", "repo", "gone")
             .Returns(Task.FromException<Branch>(notFoundEx));
@@ -1619,8 +1659,9 @@ public class GitHubServiceTests
 
         var authorMeta = await service.GetBranchLatestCommitAsync("owner", "repo", "author-only");
         Assert.NotNull(authorMeta);
-        Assert.Equal("alice", authorMeta.Value.CommitterLogin);
-        Assert.Equal("author@openruyi.org", authorMeta.Value.CommitterEmail);
+        Assert.Equal("alice", authorMeta.AuthorLogin);
+        Assert.Equal("author@openruyi.org", authorMeta.AuthorEmail);
+        Assert.Equal(string.Empty, authorMeta.CommitterLogin);
 
         // Additional simple branches: null ReviewPermission, RateLimitExceeded during paginated search, milestone matching date
         var collabClient = Substitute.For<IRepoCollaboratorsClient>();
@@ -1849,6 +1890,265 @@ public class GitHubServiceTests
             Assert.Equal(500, result.Items.Count);
             Assert.Equal(600, result.TotalCount);
             Assert.True(result.IsTruncated);
+        }
+    }
+
+    [Fact]
+    public async Task ListOpenPullRequestsByHeadPrefixAsync_FiltersByPrefixAndMapsRequests()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+        var prClient = Substitute.For<IPullRequestsClient>();
+        client.PullRequest.Returns(prClient);
+
+        var baseRepo = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(baseRepo, "owner/repo");
+
+        var pr1 = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(pr1, 101);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.State))?.SetValue(pr1, new StringEnum<ItemState>(ItemState.Open));
+        var head1 = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
+        typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(head1, "autoupdate/rust-zip");
+        typeof(GitReference).GetProperty(nameof(GitReference.Label))?.SetValue(head1, "owner:autoupdate/rust-zip");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(head1, baseRepo);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(pr1, head1);
+
+        var pr2 = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(pr2, 102);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.State))?.SetValue(pr2, new StringEnum<ItemState>(ItemState.Open));
+        var head2 = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
+        typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(head2, "feature/manual-pr");
+        typeof(GitReference).GetProperty(nameof(GitReference.Label))?.SetValue(head2, "owner:feature/manual-pr");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(head2, baseRepo);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(pr2, head2);
+
+        IReadOnlyList<PullRequest> prs = new[] { pr1, pr2 };
+        prClient.GetAllForRepository("owner", "repo", Arg.Any<PullRequestRequest>(), Arg.Any<ApiOptions>())
+            .Returns(Task.FromResult(prs));
+        prClient.GetAllForRepository("owner", "repo", Arg.Any<PullRequestRequest>())
+            .Returns(Task.FromResult(prs));
+        prClient.GetAllForRepository("owner", "repo", Arg.Any<ApiOptions>())
+            .Returns(Task.FromResult(prs));
+
+        var result = await ((IOpenPullRequestInventoryGateway)service)
+            .ListOpenPullRequestsByHeadPrefixAsync("owner", "repo", "autoupdate/");
+
+        var matched = Assert.Single(result);
+        Assert.Equal(101, matched.Number);
+    }
+
+    [Fact]
+    public async Task EnsureRequiredLabelsVerifiedAsync_HandlesExistingCreateRaceAndFailureFailClosed()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var existingLabel = new Label(1, "", "Auto-Update", "", "ededed", "", false);
+        var createdLabel = new Label(2, "", "Status: stale-exempt", "", "ededed", "", false);
+
+        // 1. Missing label created cleanly -> returns true
+        var (svc1, client1) = CreateTestService(pem);
+        var issues1 = Substitute.For<IIssuesClient>();
+        var labels1 = Substitute.For<IIssuesLabelsClient>();
+        client1.Issue.Returns(issues1);
+        issues1.Labels.Returns(labels1);
+        labels1.GetAllForRepository("owner", "repo")
+            .Returns(Task.FromResult<IReadOnlyList<Label>>(new[] { existingLabel }));
+        labels1.Create("owner", "repo", Arg.Any<NewLabel>())
+            .Returns(Task.FromResult(createdLabel));
+
+        var ok1 = await ((IOpenPullRequestInventoryGateway)svc1).EnsureRequiredLabelsVerifiedAsync(
+            "owner",
+            "repo",
+            new[] { ("Auto-Update", "ededed", "desc1"), ("Status: stale-exempt", "ededed", "desc2") });
+        Assert.True(ok1);
+        await labels1.Received(1).Create("owner", "repo", Arg.Is<NewLabel>(l => l.Name == "Status: stale-exempt"));
+
+        // 2. 422 race on Create where re-check sees label -> returns true
+        var (svc2, client2) = CreateTestService(pem);
+        var issues2 = Substitute.For<IIssuesClient>();
+        var labels2 = Substitute.For<IIssuesLabelsClient>();
+        client2.Issue.Returns(issues2);
+        issues2.Labels.Returns(labels2);
+        labels2.GetAllForRepository("owner", "repo").Returns(
+            Task.FromResult<IReadOnlyList<Label>>(new[] { existingLabel }),
+            Task.FromResult<IReadOnlyList<Label>>(new[] { existingLabel, createdLabel }));
+        var unprocessableResp = Substitute.For<IResponse>();
+        unprocessableResp.StatusCode.Returns(HttpStatusCode.UnprocessableEntity);
+        labels2.Create("owner", "repo", Arg.Any<NewLabel>())
+            .Returns<Task<Label>>(_ => throw new ApiValidationException(unprocessableResp));
+
+        var ok2 = await ((IOpenPullRequestInventoryGateway)svc2).EnsureRequiredLabelsVerifiedAsync(
+            "owner",
+            "repo",
+            new[] { ("Auto-Update", "ededed", "desc1"), ("Status: stale-exempt", "ededed", "desc2") });
+        Assert.True(ok2);
+
+        // 3. Create fails with non-race error -> fails closed returning false
+        var (svc3, client3) = CreateTestService(pem);
+        var issues3 = Substitute.For<IIssuesClient>();
+        var labels3 = Substitute.For<IIssuesLabelsClient>();
+        client3.Issue.Returns(issues3);
+        issues3.Labels.Returns(labels3);
+        labels3.GetAllForRepository("owner", "repo")
+            .Returns(Task.FromResult<IReadOnlyList<Label>>(Array.Empty<Label>()));
+        labels3.Create("owner", "repo", Arg.Any<NewLabel>())
+            .Returns<Task<Label>>(_ => throw new HttpRequestException("permission denied"));
+
+        var ok3 = await ((IOpenPullRequestInventoryGateway)svc3).EnsureRequiredLabelsVerifiedAsync(
+            "owner",
+            "repo",
+            new[] { ("Auto-Update", "ededed", "desc1") });
+        Assert.False(ok3);
+    }
+
+    [Fact]
+    public async Task SearchMergedPullRequestsAsync_PaginatesUpToThreePages_AndStopsWhenPageIncomplete()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+        var (service, client) = CreateTestService(pem);
+        var searchClient = Substitute.For<ISearchClient>();
+        var prClient = Substitute.For<IPullRequestsClient>();
+        client.Search.Returns(searchClient);
+        client.PullRequest.Returns(prClient);
+
+        prClient.Get("owner", "repo", Arg.Any<int>()).Returns(callInfo =>
+        {
+            var number = callInfo.ArgAt<int>(2);
+            var pr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+            typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(pr, number);
+            typeof(PullRequest).GetProperty(nameof(PullRequest.Title))?.SetValue(pr, $"chore(pkg-{number}): update");
+            typeof(PullRequest).GetProperty(nameof(PullRequest.MergedAt))?.SetValue(pr, (DateTimeOffset?)DateTimeOffset.UtcNow);
+            return Task.FromResult(pr);
+        });
+
+        static Issue MakeMergedPrIssue(int number)
+        {
+            var prRef = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+            var issue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+            typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issue, number);
+            typeof(Issue).GetProperty(nameof(Issue.Title))?.SetValue(issue, $"chore(pkg-{number}): update");
+            typeof(Issue).GetProperty(nameof(Issue.HtmlUrl))?.SetValue(issue, $"https://github.com/owner/repo/pull/{number}");
+            typeof(Issue).GetProperty(nameof(Issue.UpdatedAt))?.SetValue(issue, (DateTimeOffset?)DateTimeOffset.UtcNow);
+            typeof(Issue).GetProperty(nameof(Issue.ClosedAt))?.SetValue(issue, (DateTimeOffset?)DateTimeOffset.UtcNow);
+            typeof(Issue).GetProperty(nameof(Issue.PullRequest))?.SetValue(issue, prRef);
+            return issue;
+        }
+
+        searchClient.SearchIssues(Arg.Any<SearchIssuesRequest>()).Returns(callInfo =>
+        {
+            var req = callInfo.Arg<SearchIssuesRequest>();
+            int count = req.Page switch
+            {
+                1 => 100,
+                2 => 100,
+                _ => 5
+            };
+            var items = Enumerable.Range((req.Page - 1) * 100 + 1, count).Select(MakeMergedPrIssue).ToList();
+            var res = (SearchIssuesResult)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SearchIssuesResult));
+            typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.Items))?.SetValue(res, items);
+            typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.TotalCount))?.SetValue(res, 205);
+            return Task.FromResult(res);
+        });
+
+        var merged = await service.SearchMergedPullRequestsAsync("owner", "repo", "aqua-rium", DateTimeOffset.UtcNow.AddDays(-7));
+        Assert.Equal(205, merged.Count);
+        await searchClient.Received(3).SearchIssues(Arg.Any<SearchIssuesRequest>());
+    }
+
+    [Fact]
+    public async Task TransportConstructors_JwtCallsDoNotOverwriteSharedInstallationCredentials()
+    {
+        var (pem, rsa) = GenerateRsaKeyPair();
+        using (rsa)
+        {
+            var appEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseApp = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var sawNonBearerOnPr = false;
+            string? prAuthHeader = null;
+            string? probeAuthHeader = null;
+
+            var handler = new ControllableHttpMessageHandler(async (req, ct) =>
+            {
+                var path = req.RequestUri?.AbsolutePath ?? string.Empty;
+                var authHeader = req.Headers.Authorization?.ToString() ?? string.Empty;
+
+                if (path.EndsWith("/access_tokens", StringComparison.Ordinal))
+                {
+                    Assert.StartsWith("Bearer ", authHeader, StringComparison.Ordinal);
+                    return new HttpResponseMessage(HttpStatusCode.Created)
+                    {
+                        Content = new StringContent(
+                            JsonSerializer.Serialize(new { token = "ghs_install_tok", expires_at = DateTimeOffset.UtcNow.AddHours(1) }),
+                            Encoding.UTF8,
+                            "application/json")
+                    };
+                }
+
+                if (string.Equals(path, "/app", StringComparison.Ordinal))
+                {
+                    Assert.StartsWith("Bearer ", authHeader, StringComparison.Ordinal);
+                    appEntered.TrySetResult();
+                    await releaseApp.Task.WaitAsync(ct);
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(JsonSerializer.Serialize(new { id = 1, slug = "abaci-bot" }), Encoding.UTF8, "application/json")
+                    };
+                }
+
+                if (path.Contains("/app/installations/67890", StringComparison.Ordinal))
+                {
+                    probeAuthHeader = authHeader;
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(
+                            JsonSerializer.Serialize(new { id = 67890, permissions = new { administration = "write" } }),
+                            Encoding.UTF8,
+                            "application/json")
+                    };
+                }
+
+                if (path.EndsWith("/pulls/1", StringComparison.Ordinal))
+                {
+                    prAuthHeader = authHeader;
+                    sawNonBearerOnPr = !authHeader.StartsWith("Bearer ", StringComparison.Ordinal);
+                    releaseApp.TrySetResult();
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(JsonSerializer.Serialize(new { id = 1, number = 1, title = "pr" }), Encoding.UTF8, "application/json")
+                    };
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+            });
+
+            var service = new GitHubService(12345, pem, 67890, handler);
+
+            // Warm installation token first
+            await service.GetPullRequestAsync("owner", "repo", 1);
+            Assert.Contains("ghs_install_tok", prAuthHeader, StringComparison.Ordinal);
+
+            // Reset signal and start /app JWT request in flight, then issue concurrent installation request
+            appEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            releaseApp = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            prAuthHeader = null;
+            sawNonBearerOnPr = false;
+
+            var botLoginTask = service.GetBotLoginAsync();
+            await appEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var prTask = service.GetPullRequestAsync("owner", "repo", 1);
+            await Task.WhenAll(botLoginTask, prTask);
+
+            Assert.Equal("abaci-bot", await botLoginTask);
+            Assert.True(sawNonBearerOnPr);
+            Assert.Contains("ghs_install_tok", prAuthHeader, StringComparison.Ordinal);
+
+            await service.VerifyArchivePermissionProbeAsync("owner", "repo");
+            Assert.StartsWith("Bearer ", probeAuthHeader ?? string.Empty, StringComparison.Ordinal);
+
+            // Shared client still retains installation credentials after archive JWT probe
+            prAuthHeader = null;
+            await service.GetPullRequestAsync("owner", "repo", 1);
+            Assert.Contains("ghs_install_tok", prAuthHeader, StringComparison.Ordinal);
         }
     }
 

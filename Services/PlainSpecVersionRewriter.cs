@@ -26,12 +26,12 @@ public class PlainSpecVersionRewriter : ISpecVersionRewriter
         if (RustCrateMarker.IsMatch(context.Content))
             return false;
 
-        var match = VersionLineRegex.Match(context.Content);
-        if (!match.Success)
+        var matches = VersionLineRegex.Matches(context.Content);
+        if (matches.Count != 1)
             return false;
 
         // Reject macro versions (e.g. Version: %{base_version})
-        var verToken = match.Groups["ver"].Value;
+        var verToken = matches[0].Groups["ver"].Value;
         if (verToken.Contains("%{"))
             return false;
 
@@ -50,11 +50,20 @@ public class PlainSpecVersionRewriter : ISpecVersionRewriter
         if (targetVersion.Contains('-'))
             return new SpecRewriteResult(false, context.Content, $"Target version '{targetVersion}' contains hyphen (pre-release versions not permitted in RPM Version tag)");
 
-        var match = VersionLineRegex.Match(context.Content);
-        if (!match.Success)
+        if (!UpdateAdmission.IsValidTargetVersion(targetVersion))
+            return new SpecRewriteResult(false, context.Content, $"Target version '{targetVersion}' is not a valid RPM version token");
+
+        var matches = VersionLineRegex.Matches(context.Content);
+        if (matches.Count == 0)
             return new SpecRewriteResult(false, context.Content, "No 'Version:' tag found in SPEC content");
 
+        if (matches.Count > 1)
+            return new SpecRewriteResult(false, context.Content, "Multiple 'Version:' tags found in SPEC; refusing ambiguous rewrite");
+
+        var match = matches[0];
         var currentVersion = match.Groups["ver"].Value;
+        if (currentVersion.Contains("%{"))
+            return new SpecRewriteResult(false, context.Content, "Macro-based 'Version:' tag is not supported by automated rewriter");
         if (string.Equals(currentVersion, targetVersion, StringComparison.Ordinal))
         {
             // Empty update guard: version is already identical

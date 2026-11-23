@@ -36,7 +36,7 @@ Configured under the `BotState` JSON section:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `StateDirectory` | `string` | `""` | Absolute directory path storing `bot-state.json` (runtime ignores, failure cooldowns, user locales) and default `lookout-first-seen.json` (relative paths fail startup validation). When empty, resolves in order: `LocalApplicationData/abaci-bot` -> `$XDG_DATA_HOME/abaci-bot` -> `$HOME/.local/share/abaci-bot` -> ephemeral temp directory (logging a warning). Mount this directory as a persistent volume in container deployments. |
+| `StateDirectory` | `string` | `""` | Absolute directory path storing `bot-state.json` (runtime ignores, failure cooldowns with `LastFailureAt` decay timestamps, user locales, cursor watermarks under `Cursors` such as `rust-crates` and `candidate-scheduler-origin`) and default `lookout-first-seen.json` (relative paths fail startup validation). When empty, resolves in order: `LocalApplicationData/abaci-bot` -> `$XDG_DATA_HOME/abaci-bot` -> `$HOME/.local/share/abaci-bot` -> ephemeral temp directory (logging a warning). Mount this directory as a persistent volume in container deployments. |
 | `LocaleRetentionDays` | `int` | `180` | Days to retain inactive user language preferences before pruning (`>= 1`). |
 | `DefaultLocale` | `string` | `"en"` | Global fallback locale (`"en"` or `"zh"`). |
 | `RepositoryForcedLocales` | `object` | `{}` | Map of `"owner/repo"` to `"en"` or `"zh"`. Locks the repository language and disables `@<bot> lang`. |

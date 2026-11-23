@@ -14,6 +14,10 @@ public class UpdateAdmissionTests
     [InlineData("1.2.3", "2.0.0", true)]        // Standard SemVer major update
     [InlineData("v1.2.3", "v1.4.0", false)]     // Leading 'v' prefix
     [InlineData("0.4.88+curl-8.19.0", "0.4.89", false)] // Strips build suffix
+    [InlineData("1:2.0.0", "2.0.0", true)]       // Epoch 1 -> Epoch 0 crosses epoch boundary
+    [InlineData("1:2.0.0", "2:2.0.0", true)]     // Epoch 1 -> Epoch 2 crosses epoch boundary
+    [InlineData("1:2.0.0", "1:2.1.0", false)]    // Same epoch + same major version
+    [InlineData("1:2.0.0", "1:3.0.0", true)]     // Same epoch + cross major version
     public void IsCrossMajorVersion_EvaluatesCorrectly(string current, string target, bool expected)
     {
         var result = UpdateAdmission.IsCrossMajorVersion(current, target);
@@ -180,5 +184,25 @@ public class UpdateAdmissionTests
         Assert.True(UpdateAdmission.IsVersionCompatibleWithBranch("0.10.1", "0.10."));
         Assert.True(UpdateAdmission.IsVersionCompatibleWithBranch("0.10", "0.10"));
         Assert.True(UpdateAdmission.IsVersionCompatibleWithBranch("0.10.1", ""));
+    }
+
+    [Fact]
+    public void TryExtractCurrentVersion_HandlesFullVersionPlainVersionAndRejectsMacros()
+    {
+        Assert.False(UpdateAdmission.TryExtractCurrentVersion(null, out _));
+        Assert.False(UpdateAdmission.TryExtractCurrentVersion("Name: curl\n", out _));
+        Assert.False(UpdateAdmission.TryExtractCurrentVersion("Name: curl\nVersion: %{base_ver}\n", out _));
+
+        Assert.True(UpdateAdmission.TryExtractCurrentVersion("Name: curl\nVersion: 8.11.0\n", out var plain));
+        Assert.Equal("8.11.0", plain);
+
+        Assert.True(UpdateAdmission.TryExtractCurrentVersion(
+            "%global full_version 0.4.88+curl-8.19.0\nVersion: 0.4.88\n", out var full));
+        Assert.Equal("0.4.88+curl-8.19.0", full);
+
+        // If %global full_version contains a macro, falls back to explicit Version:
+        Assert.True(UpdateAdmission.TryExtractCurrentVersion(
+            "%global full_version %{version}\nVersion: 1.2.3\n", out var fallback));
+        Assert.Equal("1.2.3", fallback);
     }
 }

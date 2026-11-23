@@ -7,7 +7,7 @@ using System.Text.Json;
 
 namespace abaci_bot.Services;
 
-public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotIdentityProvider, IEphemeralCommentGateway, IRepositoryArchiveGateway, IPagedIssueSearchGateway, IDisposable
+public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotIdentityProvider, IEphemeralCommentGateway, IRepositoryArchiveGateway, IPagedIssueSearchGateway, IOpenPullRequestInventoryGateway, IDisposable
 {
     private static readonly AsyncLocal<CancellationToken> _ambientCancellationToken = new();
 
@@ -15,7 +15,8 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
     private readonly string _privateKey;
     private readonly long _installationId;
     private readonly string? _botPat;
-    private IGitHubClient _client;
+    private readonly IGitHubClient _client;
+    private readonly Func<Credentials, IGitHubClient>? _jwtClientFactory;
     private DateTimeOffset _tokenExpiry;
     private readonly SemaphoreSlim _authLock = new(1, 1);
     private readonly SemaphoreSlim _botLoginLock = new(1, 1);
@@ -23,47 +24,83 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
     private readonly ILogger<GitHubService>? _logger;
 
     public GitHubService(int appId, string privateKey, long installationId, ILogger<GitHubService>? logger = null)
-        : this(appId, privateKey, installationId, (string?)null, CreateDefaultClient(), logger)
+        : this(appId, privateKey, installationId, (string?)null, CreateDefaultTransport(), logger)
     {
     }
 
     public GitHubService(int appId, string privateKey, long installationId, string? botPat, ILogger<GitHubService>? logger = null)
-        : this(appId, privateKey, installationId, botPat, CreateDefaultClient(), logger)
+        : this(appId, privateKey, installationId, botPat, CreateDefaultTransport(), logger)
     {
     }
 
     internal GitHubService(int appId, string privateKey, long installationId, HttpMessageHandler httpMessageHandler, ILogger<GitHubService>? logger = null)
-        : this(appId, privateKey, installationId, null, CreateClientWithTransport(new HttpClientAdapter(() => httpMessageHandler)), logger)
+        : this(appId, privateKey, installationId, null, CreateCancellableTransport(new HttpClientAdapter(() => httpMessageHandler)), logger)
+    {
+    }
+
+    private GitHubService(
+        int appId,
+        string privateKey,
+        long installationId,
+        string? botPat,
+        Octokit.Internal.IHttpClient cancellableTransport,
+        ILogger<GitHubService>? logger)
+        : this(
+            appId,
+            privateKey,
+            installationId,
+            botPat,
+            CreateClientForTransport(cancellableTransport),
+            creds => CreateClientForTransport(cancellableTransport, creds),
+            logger)
     {
     }
 
     internal GitHubService(int appId, string privateKey, long installationId, IGitHubClient client, ILogger<GitHubService>? logger = null)
-        : this(appId, privateKey, installationId, null, client, logger)
+        : this(appId, privateKey, installationId, null, client, null, logger)
     {
     }
 
     internal GitHubService(int appId, string privateKey, long installationId, string? botPat, IGitHubClient client, ILogger<GitHubService>? logger = null)
+        : this(appId, privateKey, installationId, botPat, client, null, logger)
+    {
+    }
+
+    private GitHubService(
+        int appId,
+        string privateKey,
+        long installationId,
+        string? botPat,
+        IGitHubClient client,
+        Func<Credentials, IGitHubClient>? jwtClientFactory,
+        ILogger<GitHubService>? logger)
     {
         _appId = appId;
         _privateKey = privateKey;
         _installationId = installationId;
         _botPat = botPat;
         _client = client;
+        _jwtClientFactory = jwtClientFactory;
         _logger = logger;
     }
 
-    private static IGitHubClient CreateDefaultClient()
-    {
-        var adapter = new HttpClientAdapter(() => new HttpClientHandler());
-        return CreateClientWithTransport(adapter);
-    }
+    private static Octokit.Internal.IHttpClient CreateDefaultTransport() =>
+        CreateCancellableTransport(new HttpClientAdapter(() => new HttpClientHandler()));
 
-    private static IGitHubClient CreateClientWithTransport(Octokit.Internal.IHttpClient httpClient)
+    private static Octokit.Internal.IHttpClient CreateCancellableTransport(Octokit.Internal.IHttpClient httpClient) =>
+        new CancellableHttpClient(httpClient, () => _ambientCancellationToken.Value);
+
+    private static IGitHubClient CreateClientForTransport(
+        Octokit.Internal.IHttpClient cancellableTransport,
+        Credentials? credentials = null)
     {
-        var productHeader = new ProductHeaderValue("abaci-bot");
-        var cancellable = new CancellableHttpClient(httpClient, () => _ambientCancellationToken.Value);
-        var connection = new Connection(productHeader, cancellable);
-        return new GitHubClient(connection);
+        var connection = new Connection(new ProductHeaderValue("abaci-bot"), cancellableTransport);
+        var client = new GitHubClient(connection);
+        if (credentials != null)
+        {
+            client.Credentials = credentials;
+        }
+        return client;
     }
 
     private static IDisposable SetAmbientToken(CancellationToken cancellationToken)
@@ -103,8 +140,17 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
 
             var jwt = GenerateJwt();
 
-            _client.Connection.Credentials = new Credentials(jwt, AuthenticationType.Bearer);
-            var token = await _client.GitHubApps.CreateInstallationToken(_installationId);
+            AccessToken token;
+            if (_jwtClientFactory != null)
+            {
+                var jwtClient = _jwtClientFactory(new Credentials(jwt, AuthenticationType.Bearer));
+                token = await jwtClient.GitHubApps.CreateInstallationToken(_installationId);
+            }
+            else
+            {
+                _client.Connection.Credentials = new Credentials(jwt, AuthenticationType.Bearer);
+                token = await _client.GitHubApps.CreateInstallationToken(_installationId);
+            }
 
             _client.Connection.Credentials = new Credentials(token.Token);
             _tokenExpiry = token.ExpiresAt;
@@ -676,6 +722,61 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
         return prs != null && prs.Count > 0 ? prs[0] : null;
     }
 
+    public async Task<IReadOnlyList<PullRequest>> ListOpenPullRequestsByHeadPrefixAsync(
+        string owner, string repo, string branchPrefix, CancellationToken ct = default)
+    {
+        using var _ = SetAmbientToken(ct);
+        ct.ThrowIfCancellationRequested();
+        await EnsureAuthenticatedAsync(ct);
+        ct.ThrowIfCancellationRequested();
+
+        if (string.IsNullOrWhiteSpace(branchPrefix))
+        {
+            return Array.Empty<PullRequest>();
+        }
+
+        const int perPage = 100;
+        const int maxPages = 5;
+        var expectedHeadRepo = $"{owner}/{repo}";
+        var matched = new List<PullRequest>();
+        var request = new PullRequestRequest { State = ItemStateFilter.Open };
+
+        for (int page = 1; page <= maxPages; page++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var pageItems = await _client.PullRequest.GetAllForRepository(
+                owner,
+                repo,
+                request,
+                new ApiOptions { PageSize = perPage, PageCount = 1, StartPage = page });
+
+            if (pageItems == null || pageItems.Count == 0)
+            {
+                break;
+            }
+
+            foreach (var pr in pageItems)
+            {
+                var headRepo = pr.Head?.Repository?.FullName;
+                var headRef = pr.Head?.Ref;
+                if (headRepo != null &&
+                    string.Equals(headRepo, expectedHeadRepo, StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(headRef) &&
+                    headRef.StartsWith(branchPrefix, StringComparison.Ordinal))
+                {
+                    matched.Add(pr);
+                }
+            }
+
+            if (pageItems.Count < perPage)
+            {
+                break;
+            }
+        }
+
+        return matched;
+    }
+
     public async Task<PullRequest> CreatePullRequestAsync(
         string owner, string repo, string title, string head, string baseBranch, string body, CancellationToken ct = default)
     {
@@ -746,31 +847,46 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
         var authorFilter = !string.IsNullOrWhiteSpace(author) ? $"author:{author} " : "";
         var query = $"repo:{owner}/{repo} is:pr is:merged label:\"{GitHubLabels.AutoUpdate}\" {authorFilter}updated:>{dateStr}";
 
-        var searchResult = await _client.Search.SearchIssues(new SearchIssuesRequest(query)
-        {
-            PerPage = 30
-        });
-
-        if (searchResult?.Items == null || searchResult.Items.Count == 0)
-            return Array.Empty<PullRequest>();
-
+        const int perPage = 100;
+        const int maxPages = 3;
+        var seenPrNumbers = new HashSet<int>();
         var prList = new List<PullRequest>();
-        foreach (var issue in searchResult.Items)
+
+        for (int page = 1; page <= maxPages; page++)
         {
-            if (ct.IsCancellationRequested)
+            ct.ThrowIfCancellationRequested();
+            var searchResult = await _client.Search.SearchIssues(new SearchIssuesRequest(query)
+            {
+                Page = page,
+                PerPage = perPage
+            });
+
+            if (searchResult?.Items == null || searchResult.Items.Count == 0)
                 break;
 
-            var pr = await GetPullRequestAsync(owner, repo, issue.Number, ct);
-            if (pr != null)
+            foreach (var issue in searchResult.Items)
             {
-                prList.Add(pr);
+                if (ct.IsCancellationRequested)
+                    break;
+
+                if (!seenPrNumbers.Add(issue.Number))
+                    continue;
+
+                var pr = await GetPullRequestAsync(owner, repo, issue.Number, ct);
+                if (pr != null)
+                {
+                    prList.Add(pr);
+                }
             }
+
+            if (searchResult.Items.Count < perPage)
+                break;
         }
 
         return prList;
     }
 
-    public async Task<(string Sha, string Message, string CommitterLogin, string CommitterEmail)?> GetBranchLatestCommitAsync(
+    public async Task<BranchCommitInfo?> GetBranchLatestCommitAsync(
         string owner, string repo, string branch, CancellationToken ct = default)
     {
         using var _ = SetAmbientToken(ct);
@@ -790,10 +906,12 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
 
             var sha = commit.Sha;
             var msg = commit.Commit?.Message ?? string.Empty;
-            var login = commit.Committer?.Login ?? commit.Author?.Login ?? string.Empty;
-            var email = commit.Commit?.Committer?.Email ?? commit.Commit?.Author?.Email ?? string.Empty;
+            var authorLogin = commit.Author?.Login ?? string.Empty;
+            var authorEmail = commit.Commit?.Author?.Email ?? string.Empty;
+            var committerLogin = commit.Committer?.Login ?? string.Empty;
+            var committerEmail = commit.Commit?.Committer?.Email ?? string.Empty;
 
-            return (sha, msg, login, email);
+            return new BranchCommitInfo(sha, msg, authorLogin, authorEmail, committerLogin, committerEmail);
         }
         catch (NotFoundException)
         {
@@ -871,6 +989,18 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
     public async Task EnsureLabelsExistAsync(
         string owner, string repo, IEnumerable<(string Name, string Color, string Description)> labels, CancellationToken ct = default)
     {
+        _ = await EnsureLabelsInternalAsync(owner, repo, labels, ct);
+    }
+
+    public Task<bool> EnsureRequiredLabelsVerifiedAsync(
+        string owner, string repo, IEnumerable<(string Name, string Color, string Description)> labels, CancellationToken ct = default)
+    {
+        return EnsureLabelsInternalAsync(owner, repo, labels, ct);
+    }
+
+    private async Task<bool> EnsureLabelsInternalAsync(
+        string owner, string repo, IEnumerable<(string Name, string Color, string Description)> labels, CancellationToken ct)
+    {
         using var _ = SetAmbientToken(ct);
         ct.ThrowIfCancellationRequested();
         await EnsureAuthenticatedAsync(ct);
@@ -881,13 +1011,14 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
         {
             existingLabels = await _client.Issue.Labels.GetAllForRepository(owner, repo);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger?.LogWarning(ex, "Failed to query existing labels for {Owner}/{Repo}", owner, repo);
-            return;
+            return false;
         }
 
         var existingSet = new HashSet<string>(existingLabels.Select(l => l.Name), StringComparer.OrdinalIgnoreCase);
+        bool allEnsured = true;
 
         foreach (var (name, color, description) in labels)
         {
@@ -904,11 +1035,33 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
                 _logger?.LogInformation("Successfully created missing label '{Label}' in {Owner}/{Repo}", name, owner, repo);
                 existingSet.Add(name);
             }
-            catch (Exception ex)
+            catch (ApiValidationException ex)
             {
+                try
+                {
+                    var refreshed = await _client.Issue.Labels.GetAllForRepository(owner, repo);
+                    if (refreshed.Any(l => string.Equals(l.Name, name, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        existingSet.Add(name);
+                        continue;
+                    }
+                }
+                catch
+                {
+                    // Fall through to fail-closed logging below.
+                }
+
+                allEnsured = false;
+                _logger?.LogWarning(ex, "Failed to verify/create label '{Label}' in {Owner}/{Repo}", name, owner, repo);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                allEnsured = false;
                 _logger?.LogWarning(ex, "Failed to create label '{Label}' in {Owner}/{Repo}", name, owner, repo);
             }
         }
+
+        return allEnsured;
     }
 
     public async Task<IReadOnlyList<Milestone>> GetMilestonesAsync(
@@ -1274,11 +1427,33 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
         await EnsureAuthenticatedAsync(ct);
         ct.ThrowIfCancellationRequested();
 
-        await _client.Repository.Collaborator.GetAll(owner, repo, new ApiOptions
+        var probeUser = owner;
+        try
         {
-            PageSize = 1,
-            PageCount = 1
-        });
+            var resolved = await GetBotLoginAsync(ct);
+            if (!string.IsNullOrWhiteSpace(resolved))
+            {
+                probeUser = resolved.Trim();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            probeUser = owner;
+        }
+
+        try
+        {
+            await _client.Repository.Collaborator.ReviewPermission(owner, repo, probeUser);
+        }
+        catch (NotFoundException)
+        {
+            // HTTP 404 confirms the ReviewPermission endpoint is reachable with sufficient permission;
+            // lacking collaborator permission fails with HTTP 403 Forbidden.
+        }
     }
 
     public async Task VerifyArchivePermissionProbeAsync(
@@ -1298,6 +1473,21 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
             {
                 throw new InvalidOperationException(
                     $"Configured BotPat lacks triage+ permission on '{owner}/{repo}' required for ConversationGuard:ArchiveEnabled=true.");
+            }
+
+            return;
+        }
+
+        if (_jwtClientFactory != null)
+        {
+            var jwtClient = _jwtClientFactory(new Credentials(GenerateJwt(), AuthenticationType.Bearer));
+            var installation = await jwtClient.GitHubApps.GetInstallationForCurrent(_installationId);
+            var adminPermission = installation?.Permissions?.Administration;
+            if (adminPermission != InstallationReadWritePermissionLevel.Write)
+            {
+                throw new InvalidOperationException(
+                    $"GitHub App installation {_installationId} has Administration='{adminPermission?.StringValue ?? "none"}' " +
+                    $"for '{owner}/{repo}'; ConversationGuard:ArchiveEnabled=true requires 'Administration: Read & write' (or a triage+ BotPat).");
             }
 
             return;
@@ -1343,6 +1533,31 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
         {
             if (!string.IsNullOrWhiteSpace(_cachedBotLogin))
             {
+                return _cachedBotLogin;
+            }
+
+            if (_jwtClientFactory != null)
+            {
+                string? isolatedLogin;
+                if (!string.IsNullOrWhiteSpace(_botPat))
+                {
+                    var patClient = _jwtClientFactory(new Credentials(_botPat));
+                    var currentUser = await patClient.User.Current();
+                    isolatedLogin = currentUser?.Login;
+                }
+                else
+                {
+                    var jwtClient = _jwtClientFactory(new Credentials(GenerateJwt(), AuthenticationType.Bearer));
+                    var app = await jwtClient.GitHubApps.GetCurrent();
+                    isolatedLogin = app?.Slug;
+                }
+
+                if (string.IsNullOrWhiteSpace(isolatedLogin))
+                {
+                    throw new InvalidOperationException("GitHub API returned an empty bot login/slug.");
+                }
+
+                _cachedBotLogin = isolatedLogin.Trim();
                 return _cachedBotLogin;
             }
 

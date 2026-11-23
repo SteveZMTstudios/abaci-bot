@@ -24,6 +24,14 @@ public class CveActiveWatchOptions
     public int PackagesPerSweep { get; set; }
 
     /// <summary>
+    /// When false (default), only packages with an authoritative OSV ecosystem (<c>crates.io</c>, <c>PyPI</c>)
+    /// are queried against OSV.dev; native RPM specs are skipped as unverified to avoid cross-distribution false positives.
+    /// When true, native RPM packages with valid non-macro versions are queried best-effort without an ecosystem
+    /// and flagged with a best-effort warning in generated issues. Default: false.
+    /// </summary>
+    public bool IncludeUnverifiedNativePackages { get; set; }
+
+    /// <summary>
     /// Daily cap on queries dispatched to NVD when OSV lacks CVSS metrics.
     /// </summary>
     public int MaxNvdQueriesPerDay { get; set; } = 200;

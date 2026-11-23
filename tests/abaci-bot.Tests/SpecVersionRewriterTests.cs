@@ -35,6 +35,15 @@ public class SpecVersionRewriterTests
 
         Assert.True(NoAutoUpdateMarker.HasNoAutoUpdate(specWithBlankReason, out var fallbackReason));
         Assert.Equal("No reason specified", fallbackReason);
+
+        var specWithCrossLineDirective = """
+            #!
+            NoAutoUpdate: cross-line
+            Name:           example
+            Version:        1.0.0
+            """;
+
+        Assert.False(NoAutoUpdateMarker.HasNoAutoUpdate(specWithCrossLineDirective, out _));
     }
 
     [Fact]
@@ -300,5 +309,26 @@ public class SpecVersionRewriterTests
         var noChangeRes = rewriter.Rewrite(validContext, "8.21.0");
         Assert.True(noChangeRes.Success);
         Assert.False(noChangeRes.HasChanged);
+
+        // 3. Duplicate Version: tags fail closed cleanly
+        var dupSpec = new SpecContext("curl", "curl", "Name: curl\nVersion: 8.21.0\nVersion: 8.21.0\n", "path");
+        Assert.False(rewriter.CanHandle(dupSpec));
+        var dupRes = rewriter.Rewrite(dupSpec, "8.22.0");
+        Assert.False(dupRes.Success);
+        Assert.Contains("Multiple 'Version:' tags", dupRes.ErrorMessage);
+
+        // 4. RustCrateSpecRewriter rejects macro Version: and duplicate Version: tags cleanly
+        var rustRewriter = new RustCrateSpecRewriter();
+        var rustMacro = new SpecContext("rust-foo", "rust-foo", "%global crate_name foo\nVersion: %{base_version}\n", "path");
+        Assert.False(rustRewriter.CanHandle(rustMacro));
+        Assert.False(rustRewriter.Rewrite(rustMacro, "1.0.1").Success);
+
+        var rustDup = new SpecContext("rust-foo", "rust-foo", "%global crate_name foo\nVersion: 1.0.0\nVersion: 1.0.0\n", "path");
+        Assert.False(rustRewriter.CanHandle(rustDup));
+        Assert.False(rustRewriter.Rewrite(rustDup, "1.0.1").Success);
+
+        // 5. Invalid shell metacharacters fail UpdateAdmission.IsValidTargetVersion
+        Assert.False(rewriter.Rewrite(validContext, "8.22.0;id").Success);
+        Assert.False(rustRewriter.Rewrite(new SpecContext("rust-foo", "rust-foo", "%global crate_name foo\nVersion: 1.0.0\n", "path"), "1.0.1;id").Success);
     }
 }

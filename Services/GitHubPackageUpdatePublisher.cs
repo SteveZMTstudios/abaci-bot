@@ -19,14 +19,6 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
     private readonly ILocaleResolver? _localeResolver;
     private readonly ILogger<GitHubPackageUpdatePublisher>? _logger;
 
-    private static readonly Regex VersionRegex = new(
-        @"^Version:\s*(?<ver>\S+)",
-        RegexOptions.Compiled | RegexOptions.Multiline);
-
-    private static readonly Regex FullVersionRegex = new(
-        @"^%global\s+full_version\s+(?<ver>\S+)",
-        RegexOptions.Compiled | RegexOptions.Multiline);
-
     public GitHubPackageUpdatePublisher(
         IGitHubService gitHubService,
         IOptions<PackageUpdateOptions> options,
@@ -72,13 +64,26 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         var branchName = $"{branchPrefix}{candidate.PackageName}";
         var finalSpecPath = specPath;
 
+        string? botLogin = null;
+        if (_botIdentity != null)
+        {
+            try
+            {
+                botLogin = await _botIdentity.GetBotLoginAsync(ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger?.LogDebug(ex, "Could not resolve live bot login");
+            }
+        }
+
         var existingBranchSha = await _gitHubService.GetRefShaAsync(owner, repo, branchName, ct);
         var existingPr = await _gitHubService.FindOpenPullRequestByHeadAsync(owner, repo, branchName, ct);
 
         if (!string.IsNullOrEmpty(existingBranchSha))
         {
-            // 1. Human committer check (protect human edits on the branch)
-            (string Sha, string Message, string CommitterLogin, string CommitterEmail)? latestCommit;
+            // 1. Author-first own-bot commit check (protect web-flow edits, external bots, local amends, and empty identities)
+            BranchCommitInfo? latestCommit;
             try
             {
                 latestCommit = await _gitHubService.GetBranchLatestCommitAsync(owner, repo, branchName, ct);
@@ -89,26 +94,52 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
                 return new PublishResult(false, false, $"Failed to verify committer identity on branch '{branchName}' (fail-closed)");
             }
 
-            if (!latestCommit.HasValue)
+            if (latestCommit == null)
             {
                 _logger?.LogWarning("Could not retrieve latest commit info for branch {Branch}; failing closed", branchName);
                 return new PublishResult(false, false, $"Branch commit details unavailable for '{branchName}' (fail-closed)");
             }
 
-            if (!IsWhitelistedCommitter(latestCommit.Value.CommitterLogin, latestCommit.Value.CommitterEmail))
+            if (!IsOwnBotCommit(latestCommit, botLogin))
             {
-                _logger?.LogWarning("Human commits detected on branch {Branch} by {User} ({Email}); stepping aside",
-                    branchName, latestCommit.Value.CommitterLogin, latestCommit.Value.CommitterEmail);
+                var authorDisplay = !string.IsNullOrWhiteSpace(latestCommit.AuthorLogin)
+                    ? latestCommit.AuthorLogin.Trim()
+                    : (!string.IsNullOrWhiteSpace(latestCommit.CommitterLogin) ? latestCommit.CommitterLogin.Trim() : "unknown");
+                var actorMention = !string.IsNullOrWhiteSpace(latestCommit.AuthorLogin)
+                    ? $"@{authorDisplay}"
+                    : $"`{authorDisplay}`";
+
+                _logger?.LogWarning(
+                    "Non-automated commits detected on branch {Branch} (author={Author}, committer={Committer}); stepping aside",
+                    branchName, latestCommit.AuthorLogin, latestCommit.CommitterLogin);
 
                 if (existingPr != null && !_options.DryRun)
                 {
-                    var warningComment = $"A newer upstream version `{candidate.TargetVersion}` is available for `{candidate.PackageName}`, " +
-                                         $"but branch `{branchName}` contains human commits by @{latestCommit.Value.CommitterLogin}. " +
-                                         "Automated update has stepped aside to prevent overwriting manual work.";
-                    await _gitHubService.CreateCommentAsync(owner, repo, existingPr.Number, warningComment, ct);
+                    bool alreadyCommented = false;
+                    try
+                    {
+                        var existingComments = await _gitHubService.GetIssueCommentsAsync(owner, repo, existingPr.Number, ct);
+                        alreadyCommented = existingComments != null && existingComments.Any(c =>
+                            c.Body != null &&
+                            c.Body.Contains("stepped aside", StringComparison.OrdinalIgnoreCase) &&
+                            c.Body.Contains(branchName, StringComparison.OrdinalIgnoreCase) &&
+                            c.Body.Contains($"`{candidate.TargetVersion}`", StringComparison.OrdinalIgnoreCase));
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _logger?.LogDebug(ex, "Failed to inspect existing stepped-aside comments on PR #{PrNumber}", existingPr.Number);
+                    }
+
+                    if (!alreadyCommented)
+                    {
+                        var warningComment = $"A newer upstream version `{candidate.TargetVersion}` is available for `{candidate.PackageName}`, " +
+                                             $"but branch `{branchName}` contains human commits by {actorMention}. " +
+                                             "Automated update has stepped aside to prevent overwriting manual work.";
+                        await _gitHubService.CreateCommentAsync(owner, repo, existingPr.Number, warningComment, ct);
+                    }
                 }
 
-                return new PublishResult(true, true, $"Human commits by {latestCommit.Value.CommitterLogin} detected on branch");
+                return new PublishResult(true, true, $"Human commits by {authorDisplay} detected on branch");
             }
 
             // 2. Branch SPEC version reading (strong idempotency: skip if already at target version, ignoring +suffix)
@@ -147,19 +178,6 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         var commitMessage = $"SPECS: bump {candidate.PackageName} {candidate.CurrentVersion} -> {candidate.TargetVersion}";
         var prTitle = commitMessage;
         var locale = _localeResolver?.ResolveForBotPullRequest(owner, repo);
-        string? botLogin = null;
-        if (!_options.DryRun && _botIdentity != null)
-        {
-            try
-            {
-                botLogin = await _botIdentity.GetBotLoginAsync(ct);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger?.LogDebug(ex, "Could not resolve live bot login for PR body hint");
-            }
-        }
-
         var prBody = GeneratePullRequestBody(candidate, locale, botLogin);
 
         if (_options.DryRun)
@@ -172,66 +190,89 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         await _gitHubService.UpdateFileContentAsync(
             owner, repo, finalSpecPath, commitMessage, rewriteResult.UpdatedContent, branchName, ct);
 
+        var requiredLabels = GetRequiredLabels(candidate);
         PullRequest pr;
         if (existingPr != null)
         {
             _logger?.LogInformation("Updating existing PR #{PrNumber} for branch {Branch}", existingPr.Number, branchName);
             pr = await _gitHubService.UpdatePullRequestAsync(owner, repo, existingPr.Number, prTitle, prBody, ct);
-            await _gitHubService.AddLabelsAsync(owner, repo, existingPr.Number, new[] { GitHubLabels.StatusStaleExempt }, ct);
+
+            var labelsToApply = existingPr.Labels != null && existingPr.Labels.Count > 0
+                ? requiredLabels
+                    .Where(req => !existingPr.Labels.Any(l => string.Equals(l.Name, req, StringComparison.OrdinalIgnoreCase)))
+                    .ToArray()
+                : requiredLabels;
+
+            if (labelsToApply.Length > 0 && !await TryEnsurePullRequestLabelsAsync(owner, repo, existingPr.Number, labelsToApply, ct))
+            {
+                return new PublishResult(false, false, $"Failed to apply required labels to existing PR #{existingPr.Number}", pr.Number, pr.HtmlUrl);
+            }
         }
         else
         {
             _logger?.LogInformation("Creating new PR for branch {Branch}", branchName);
             pr = await _gitHubService.CreatePullRequestAsync(owner, repo, prTitle, branchName, baseBranch, prBody, ct);
 
-            // Add baseline Auto-Update label, status stale-exempt, and optional source-specific label
-            var labels = new List<string> { GitHubLabels.AutoUpdate, GitHubLabels.StatusStaleExempt };
-            if (candidate.Origin == CandidateOrigin.RustCrate)
+            if (!await TryEnsurePullRequestLabelsAsync(owner, repo, pr.Number, requiredLabels, ct))
             {
-                labels.Add(GitHubLabels.AutoUpdateRust);
+                return new PublishResult(false, false, $"Failed to apply required labels to new PR #{pr.Number}", pr.Number, pr.HtmlUrl);
             }
-            await _gitHubService.AddLabelsAsync(owner, repo, pr.Number, labels.ToArray(), ct);
         }
 
         return new PublishResult(true, false, null, pr.Number, pr.HtmlUrl);
     }
 
-    internal bool IsWhitelistedCommitter(string? login, string? email)
+    internal static string[] GetRequiredLabels(UpdateCandidate candidate)
     {
-        if (string.IsNullOrWhiteSpace(login) && string.IsNullOrWhiteSpace(email))
-            return true;
+        var labels = new List<string>(3)
+        {
+            GitHubLabels.AutoUpdate,
+            GitHubLabels.StatusStaleExempt
+        };
+        if (candidate.Origin == CandidateOrigin.RustCrate)
+        {
+            labels.Add(GitHubLabels.AutoUpdateRust);
+        }
 
-        var botLogin = _options.BotLogin?.Trim() ?? "aqua-rium";
-        if (string.Equals(login, botLogin, StringComparison.OrdinalIgnoreCase))
-            return true;
+        return labels.ToArray();
+    }
 
-        if (login?.EndsWith("[bot]", StringComparison.OrdinalIgnoreCase) == true)
-            return true;
-
-        // GitHub Web UI merge commits
-        if (string.Equals(login, "web-flow", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        if (string.Equals(email, "noreply@github.com", StringComparison.OrdinalIgnoreCase))
-            return true;
+    private async Task<bool> TryEnsurePullRequestLabelsAsync(
+        string owner,
+        string repo,
+        int prNumber,
+        string[] labels,
+        CancellationToken ct)
+    {
+        const int maxAttempts = 2;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                await _gitHubService.AddLabelsAsync(owner, repo, prNumber, labels, ct);
+                return true;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                if (attempt == maxAttempts)
+                {
+                    _logger?.LogError(ex, "Failed to apply required labels ({Labels}) to PR #{PrNumber} after {Attempts} attempts",
+                        string.Join(", ", labels), prNumber, maxAttempts);
+                }
+                else
+                {
+                    _logger?.LogWarning(ex, "Attempt {Attempt} to apply labels to PR #{PrNumber} failed; retrying", attempt, prNumber);
+                }
+            }
+        }
 
         return false;
     }
 
-    private static string ExtractVersionFromSpec(string specContent)
+    internal bool IsOwnBotCommit(BranchCommitInfo commit, string? liveBotLogin = null)
     {
-        if (string.IsNullOrWhiteSpace(specContent))
-            return string.Empty;
-
-        var fullMatch = FullVersionRegex.Match(specContent);
-        if (fullMatch.Success)
-            return fullMatch.Groups["ver"].Value.Trim();
-
-        var verMatch = VersionRegex.Match(specContent);
-        if (verMatch.Success)
-            return verMatch.Groups["ver"].Value.Trim();
-
-        return string.Empty;
+        var ownLogins = BotCommitOwnership.BuildOwnBotLoginSet(liveBotLogin, _options.BotLogin);
+        return BotCommitOwnership.IsOwnBotCommit(commit, ownLogins);
     }
 
     public static string GeneratePullRequestBody(UpdateCandidate candidate, string? locale = null, string? botLogin = null)

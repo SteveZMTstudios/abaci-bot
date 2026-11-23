@@ -18,6 +18,7 @@ public class LookoutVersionSource : IUpdateCandidateSource
     private readonly LookoutUpdateOptions _options;
     private readonly ILogger<LookoutVersionSource>? _logger;
     private readonly RuntimeHealthState? _healthState;
+    private readonly TimeProvider _timeProvider;
     private readonly string _stateFilePath;
     private readonly object _stateWriteLock = new();
     private readonly ConcurrentDictionary<string, (string Version, DateTimeOffset FirstSeen)> _firstSeenVersions = new(StringComparer.OrdinalIgnoreCase);
@@ -29,12 +30,14 @@ public class LookoutVersionSource : IUpdateCandidateSource
         IOptions<PackageUpdateOptions> options,
         ILogger<LookoutVersionSource>? logger = null,
         IBotStateStore? stateStore = null,
-        RuntimeHealthState? healthState = null)
+        RuntimeHealthState? healthState = null,
+        TimeProvider? timeProvider = null)
     {
         _httpClient = httpClient;
         _options = options.Value.Lookout;
         _logger = logger;
         _healthState = healthState;
+        _timeProvider = timeProvider ?? TimeProvider.System;
         var defaultStateDir = stateStore?.StateDirectory
             ?? BotStatePathResolver.ResolveStateDirectory(null);
         _stateFilePath = string.IsNullOrWhiteSpace(_options.FirstSeenStatePath)
@@ -148,7 +151,7 @@ public class LookoutVersionSource : IUpdateCandidateSource
                 // 3. Stale filter: if stale == true and older than threshold
                 if (isStale && updatedAt.HasValue)
                 {
-                    var age = DateTimeOffset.UtcNow - updatedAt.Value;
+                    var age = _timeProvider.GetUtcNow() - updatedAt.Value;
                     if (age.TotalHours > _options.StaleThresholdHours)
                     {
                         _logger?.LogDebug("SKIP: lookout stale (last observed: {UpdatedAt}) for {Package}", updatedAt.Value, pkg.Name);
@@ -175,7 +178,7 @@ public class LookoutVersionSource : IUpdateCandidateSource
                 }
                 else
                 {
-                    var observedTime = updatedAt ?? DateTimeOffset.UtcNow;
+                    var observedTime = _timeProvider.GetUtcNow();
                     if (_firstSeenVersions.TryGetValue(pkg.Name, out var existing) &&
                         string.Equals(existing.Version, latestVer, StringComparison.Ordinal))
                     {

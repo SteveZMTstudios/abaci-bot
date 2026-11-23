@@ -235,5 +235,72 @@ public class ObsBuildServiceTests
         Assert.Equal("riscv64", res.Repository);
         Assert.Equal("riscv64", res.Arch);
     }
+
+    [Fact]
+    public async Task GetPackageBuildResultAsync_ParsesDirtyFlag_AndFreshnessReadsSourceAndJobHistory()
+    {
+        var handler = new FakeHttpMessageHandler(req =>
+        {
+            var pathAndQuery = req.RequestUri!.PathAndQuery;
+            if (pathAndQuery.Contains("_result", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""
+                        <resultlist>
+                          <result project="openruyi" repository="riscv64" arch="riscv64" dirty="true" code="building">
+                            <status package="curl" code="succeeded" />
+                          </result>
+                        </resultlist>
+                        """)
+                };
+            }
+
+            if (pathAndQuery.EndsWith("/public/source/openruyi/curl", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""
+                        <directory name="curl" srcmd5="raw111">
+                          <serviceinfo code="succeeded" xsrcmd5="expanded999" />
+                        </directory>
+                        """)
+                };
+            }
+
+            if (pathAndQuery.Contains("_jobhistory", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""
+                        <jobhistlist>
+                          <jobhist package="curl" srcmd5="old888" starttime="1700000000" code="succeeded" />
+                          <jobhist package="curl" srcmd5="expanded999" starttime="1790000000" code="succeeded" />
+                        </jobhistlist>
+                        """)
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            Obs = new ObsOptions { BaseUrl = "https://build.openruyi.cn", Project = "openruyi" }
+        });
+        var service = new ObsBuildService(new HttpClient(handler), options);
+
+        var result = await service.GetPackageBuildResultAsync("openruyi", "curl", "riscv64", "riscv64");
+        Assert.Equal(ObsStatusCode.Succeeded, result.Code);
+        Assert.True(result.IsDirty);
+
+        var freshness = await service.GetPackageBuildFreshnessAsync("openruyi", "curl", "riscv64", "riscv64");
+        Assert.NotNull(freshness);
+        Assert.True(freshness.IsServiceReady);
+        Assert.Equal("expanded999", freshness.SourceMd5);
+        Assert.Equal("expanded999", freshness.LatestJobSrcMd5);
+        Assert.Equal(ObsStatusCode.Succeeded, freshness.LatestJobCode);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1790000000), freshness.LatestJobStartTime);
+    }
 }
 

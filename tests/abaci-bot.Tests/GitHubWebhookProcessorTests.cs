@@ -2291,11 +2291,11 @@ public class GitHubWebhookProcessorTests
             return Task.FromResult<IReadOnlyList<Octokit.PullRequest>>(Array.Empty<Octokit.PullRequest>());
         }
 
-        public Task<(string Sha, string Message, string CommitterLogin, string CommitterEmail)?> GetBranchLatestCommitAsync(
+        public Task<BranchCommitInfo?> GetBranchLatestCommitAsync(
             string owner, string repo, string branch, CancellationToken ct = default)
         {
-            return Task.FromResult<(string Sha, string Message, string CommitterLogin, string CommitterEmail)?>((
-                "dummy_sha", "commit message", "aqua-rium", "bot@openruyi.org"));
+            return Task.FromResult<BranchCommitInfo?>(new BranchCommitInfo(
+                "dummy_sha", "commit message", "aqua-rium", "bot@openruyi.org", "web-flow", "noreply@github.com"));
         }
 
         public Task<IReadOnlyList<Octokit.IssueComment>> GetIssueCommentsAsync(

@@ -9,7 +9,7 @@ namespace abaci_bot.Services;
 /// Implementation of OBS REST API queries using public endpoints.
 /// Strictly appends '?package=' to prevent massive whole-project 6000+ package XML downloads.
 /// </summary>
-public class ObsBuildService : IObsBuildService
+public class ObsBuildService : IObsBuildService, IObsBuildFreshnessGateway
 {
     private readonly HttpClient _httpClient;
     private readonly ObsOptions _options;
@@ -107,6 +107,7 @@ public class ObsBuildService : IObsBuildService
 
             string? currentRepo = null;
             string? currentArch = null;
+            bool currentResultDirty = false;
 
             while (await reader.ReadAsync())
             {
@@ -114,12 +115,14 @@ public class ObsBuildService : IObsBuildService
                 {
                     currentRepo = reader.GetAttribute("repository");
                     currentArch = reader.GetAttribute("arch");
+                    currentResultDirty = string.Equals(reader.GetAttribute("dirty"), "true", StringComparison.OrdinalIgnoreCase);
                 }
                 else if (reader.NodeType == XmlNodeType.Element && reader.Name == "status")
                 {
                     var statusPkg = reader.GetAttribute("package");
                     var statusCodeStr = reader.GetAttribute("code") ?? string.Empty;
                     var details = reader.GetAttribute("details");
+                    var statusDirty = string.Equals(reader.GetAttribute("dirty"), "true", StringComparison.OrdinalIgnoreCase);
 
                     // Check if matches the desired repository and arch if specified
                     bool repoMatch = string.IsNullOrEmpty(repository) || string.Equals(currentRepo, repository, StringComparison.OrdinalIgnoreCase);
@@ -136,7 +139,8 @@ public class ObsBuildService : IObsBuildService
                             currentArch ?? arch,
                             code,
                             statusCodeStr,
-                            details);
+                            details,
+                            currentResultDirty || statusDirty);
                     }
                 }
             }
@@ -147,6 +151,128 @@ public class ObsBuildService : IObsBuildService
         }
 
         return defaultResult;
+    }
+
+    public async Task<ObsPackageBuildFreshness?> GetPackageBuildFreshnessAsync(
+        string project,
+        string package,
+        string repository,
+        string arch,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(project) ||
+            string.IsNullOrWhiteSpace(package) ||
+            string.IsNullOrWhiteSpace(repository) ||
+            string.IsNullOrWhiteSpace(arch))
+        {
+            return null;
+        }
+
+        var baseUrl = _options.BaseUrl.TrimEnd('/');
+        var sourceUrl = $"{baseUrl}/public/source/{Uri.EscapeDataString(project)}/{Uri.EscapeDataString(package)}";
+
+        bool isServiceReady = true;
+        string? directorySrcMd5 = null;
+        string? serviceXsrcMd5 = null;
+
+        try
+        {
+            using var sourceResponse = await _httpClient.GetAsync(sourceUrl, ct);
+            if (!sourceResponse.IsSuccessStatusCode)
+            {
+                _logger?.LogDebug("OBS /public/source returned {StatusCode} for {Project}/{Package}", sourceResponse.StatusCode, project, package);
+                return null;
+            }
+
+            await using var sourceStream = await sourceResponse.Content.ReadAsStreamAsync(ct);
+            using var sourceReader = XmlReader.Create(sourceStream, new XmlReaderSettings { Async = true, IgnoreWhitespace = true });
+            while (await sourceReader.ReadAsync())
+            {
+                if (sourceReader.NodeType != XmlNodeType.Element)
+                    continue;
+
+                if (sourceReader.Name == "directory")
+                {
+                    directorySrcMd5 = sourceReader.GetAttribute("srcmd5")?.Trim();
+                }
+                else if (sourceReader.Name == "serviceinfo")
+                {
+                    var serviceCode = sourceReader.GetAttribute("code")?.Trim();
+                    isServiceReady = string.IsNullOrEmpty(serviceCode) ||
+                                     string.Equals(serviceCode, "succeeded", StringComparison.OrdinalIgnoreCase);
+                    serviceXsrcMd5 = sourceReader.GetAttribute("xsrcmd5")?.Trim();
+                }
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogWarning(ex, "Failed to inspect OBS source metadata for {Project}/{Package}", project, package);
+            return null;
+        }
+
+        var sourceMd5 = !string.IsNullOrWhiteSpace(serviceXsrcMd5) ? serviceXsrcMd5 : directorySrcMd5;
+
+        // OBS _jobhistory?package={pkg}&limit=5 returns the 5 newest jobs in ascending starttime order;
+        // dependency-triggered rebuilds of the same commit preserve srcmd5 with newer starttime, so the latest job is always present.
+        var jobHistoryUrl = $"{baseUrl}/public/build/{Uri.EscapeDataString(project)}/{Uri.EscapeDataString(repository)}/{Uri.EscapeDataString(arch)}/_jobhistory?package={Uri.EscapeDataString(package)}&limit=5";
+        string? bestSrcMd5 = null;
+        DateTimeOffset? bestStartTime = null;
+        ObsStatusCode bestCode = ObsStatusCode.Unknown;
+        long bestStartSeconds = long.MinValue;
+        bool foundAnyJob = false;
+
+        try
+        {
+            using var jobResponse = await _httpClient.GetAsync(jobHistoryUrl, ct);
+            if (!jobResponse.IsSuccessStatusCode)
+            {
+                _logger?.LogDebug("OBS _jobhistory returned {StatusCode} for {Project}/{Repo}/{Arch}/{Package}",
+                    jobResponse.StatusCode, project, repository, arch, package);
+                return null;
+            }
+
+            await using var jobStream = await jobResponse.Content.ReadAsStreamAsync(ct);
+            using var jobReader = XmlReader.Create(jobStream, new XmlReaderSettings { Async = true, IgnoreWhitespace = true });
+            while (await jobReader.ReadAsync())
+            {
+                if (jobReader.NodeType != XmlNodeType.Element || jobReader.Name != "jobhist")
+                    continue;
+
+                var jobPkg = jobReader.GetAttribute("package");
+                if (!string.IsNullOrEmpty(jobPkg) && !string.Equals(jobPkg, package, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var startRaw = jobReader.GetAttribute("starttime");
+                long startSeconds = long.TryParse(
+                    startRaw,
+                    System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var parsedSec)
+                    ? parsedSec
+                    : long.MinValue;
+
+                if (!foundAnyJob || startSeconds >= bestStartSeconds)
+                {
+                    foundAnyJob = true;
+                    bestStartSeconds = startSeconds;
+                    bestSrcMd5 = jobReader.GetAttribute("srcmd5")?.Trim();
+                    bestCode = ParseStatusCode(jobReader.GetAttribute("code") ?? string.Empty);
+                    bestStartTime = startSeconds >= 0 ? DateTimeOffset.FromUnixTimeSeconds(startSeconds) : null;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogWarning(ex, "Failed to query OBS _jobhistory for {Project}/{Package}", project, package);
+            return null;
+        }
+
+        if (!foundAnyJob)
+        {
+            return new ObsPackageBuildFreshness(isServiceReady, sourceMd5, null, null, ObsStatusCode.Unknown);
+        }
+
+        return new ObsPackageBuildFreshness(isServiceReady, sourceMd5, bestSrcMd5, bestStartTime, bestCode);
     }
 
     private static ObsStatusCode ParseStatusCode(string rawCode)

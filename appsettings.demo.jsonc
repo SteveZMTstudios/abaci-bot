@@ -470,8 +470,9 @@
 
   // ==============================================================================
   // CveActiveWatchOptions: active repository-wide CVE vulnerability watch service
-  // Periodically scans all distribution packages against OSV.dev and NIST NVD,
-  // files prioritized security tracking issues, and closes resolved issues.
+  // Periodically scans authoritative-ecosystem distribution packages (and optionally
+  // best-effort native RPMs) against OSV.dev and NIST NVD, files prioritized security
+  // tracking issues, and closes resolved issues.
   // ==============================================================================
   "CveActiveWatch": {
     // Default: false.
@@ -492,6 +493,10 @@
     // 0: every package in the catalog is evaluated during a sweep.
     // Non-zero: packages scanned per sweep, advancing sequentially through the catalog across successive cycles.
     "PackagesPerSweep": 0,
+    // Allowed values: true, false. Default: false.
+    // false: skips native RPM specs lacking an authoritative OSV ecosystem feed (crates.io or PyPI) to avoid cross-distribution false positives.
+    // true: queries non-macro native RPM packages best-effort without an ecosystem and adds a best-effort warning banner to generated issues.
+    "IncludeUnverifiedNativePackages": false,
     // Unit: queries per day. Range: >= 0. Default: 200.
     // 0: no NVD fallback queries are issued.
     "MaxNvdQueriesPerDay": 200,

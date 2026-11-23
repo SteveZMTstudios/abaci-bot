@@ -27,8 +27,26 @@ public class CveActiveWatchService : BackgroundService
         @"^\[Security\]\s*Outstanding CVEs detected in\s+(?<pkg>\S+)",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+    private static readonly Regex PackageIssueBodyMarkerRegex = new(
+        @"<!--\s*abaci-cve-package:\s*(?<pkg>\S+)\s*-->",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    internal const string UnverifiedNoticeMarker = "<!-- abaci-cve-unverified-notice -->";
+
+    private static readonly Regex FullVersionRegex = new(
+        @"^%global\s+full_version\s+(?<ver>\S+)",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+
     private static readonly Regex VersionRegex = new(
         @"^Version:\s*(?<ver>\S+)",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+
+    private static readonly Regex CrateNameRegex = new(
+        @"^%global\s+crate_name\s+(?<name>\S+)",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+
+    private static readonly Regex PypiNameRegex = new(
+        @"^%global\s+(?:pypi_name|srcname)\s+(?<name>\S+)",
         RegexOptions.Compiled | RegexOptions.Multiline);
 
     public CveActiveWatchService(
@@ -97,22 +115,22 @@ public class CveActiveWatchService : BackgroundService
 
         _logger?.LogInformation("Starting CveActiveWatchService scan sweep for {TargetRepo} (DryRun={DryRun})", targetRepo, _options.DryRun);
 
-        // Rate limit snapshot check before starting expensive scan
+        // Fail-closed rate limit snapshot check before starting expensive OSV/GitHub scans
         var rateLimit = await _gitHubService.GetRateLimitSnapshotAsync(ct);
-        if (rateLimit != null && rateLimit.CoreRemaining.HasValue && rateLimit.CoreRemaining < 500)
+        if (rateLimit == null || !rateLimit.CoreRemaining.HasValue || rateLimit.CoreRemaining.Value < 500)
         {
-            _logger?.LogWarning("Rate limit remaining ({Remaining}) is low; deferring CVE scan sweep",
-                rateLimit.CoreRemaining.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            _logger?.LogWarning("Rate limit remaining ({Remaining}) is unknown or low; deferring CVE scan sweep",
+                rateLimit?.CoreRemaining?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown");
             return;
         }
-        if (rateLimit != null && rateLimit.SearchRemaining.HasValue && rateLimit.SearchRemaining < 5)
+        if (!rateLimit.SearchRemaining.HasValue || rateLimit.SearchRemaining.Value < 5)
         {
-            _logger?.LogWarning("GitHub Search API rate limit remaining ({Remaining}) is low; deferring CVE scan sweep",
-                rateLimit.SearchRemaining.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            _logger?.LogWarning("GitHub Search API rate limit remaining ({Remaining}) is unknown or low; deferring CVE scan sweep",
+                rateLimit.SearchRemaining?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown");
             return;
         }
 
-        IReadOnlyList<(string PackageName, string Version)> packagesToScan = Array.Empty<(string PackageName, string Version)>();
+        IReadOnlyList<PackageScanTarget> targetsToScan = Array.Empty<PackageScanTarget>();
         var slicedUpstream = false;
 
         // Slice package names BEFORE calling GetSpecAsync so fallback mode never fetches O(N) specs.
@@ -121,7 +139,7 @@ public class CveActiveWatchService : BackgroundService
             var allNames = await _specCatalog.GetAllPackageNamesAsync(ct);
             if (allNames.Count > 0)
             {
-                packagesToScan = await FetchSlicedSpecCatalogAsync(allNames, _options.PackagesPerSweep, ct);
+                targetsToScan = await FetchSlicedSpecCatalogAsync(allNames, _options.PackagesPerSweep, ct);
                 slicedUpstream = true;
             }
         }
@@ -138,35 +156,38 @@ public class CveActiveWatchService : BackgroundService
             if (_options.PackagesPerSweep > 0 && _options.PackagesPerSweep < packages.Count)
             {
                 var offset = _catalogOffset % packages.Count;
-                var chunk = new List<(string PackageName, string Version)>(_options.PackagesPerSweep);
+                var chunk = new List<PackageScanTarget>(_options.PackagesPerSweep);
                 for (int i = 0; i < _options.PackagesPerSweep; i++)
                 {
                     chunk.Add(packages[(offset + i) % packages.Count]);
                 }
                 _catalogOffset = (offset + _options.PackagesPerSweep) % packages.Count;
-                packagesToScan = chunk;
+                targetsToScan = chunk;
             }
             else
             {
-                packagesToScan = packages;
+                targetsToScan = packages;
             }
         }
 
-        if (packagesToScan.Count == 0)
+        if (targetsToScan.Count == 0)
         {
             _logger?.LogInformation("No packages found in catalog to scan for vulnerabilities");
             return;
         }
 
-        _logger?.LogInformation("Dispatching OSV scan for {Count} packages", packagesToScan.Count);
+        _logger?.LogInformation("Dispatching OSV scan for {Count} catalog packages", targetsToScan.Count);
 
-        var scanResult = await _scanner.ScanPackagesAsync(packagesToScan, ct);
+        var scanResult = _scanner is ITargetedPackageVulnerabilityScanner targetedScanner
+            ? await targetedScanner.ScanTargetsAsync(targetsToScan, ct)
+            : await _scanner.ScanPackagesAsync(targetsToScan.Select(t => (t.PackageName, t.Version)).ToList(), ct);
         var findings = scanResult.Findings;
-        var vulnerablePackages = findings.ToDictionary(f => f.PackageName, f => f, StringComparer.OrdinalIgnoreCase);
+        var vulnerablePackages = BuildVulnerablePackagesMap(findings);
+        var hasUnverifiedPackages = scanResult.UnverifiedNativePackages != null && scanResult.UnverifiedNativePackages.Count > 0;
 
         _logger?.LogInformation("Vulnerability scan identified {Count} packages with outstanding CVEs", findings.Count);
 
-        if (findings.Count == 0 && scanResult.SuccessfullyScannedPackages.Count == 0)
+        if (findings.Count == 0 && scanResult.SuccessfullyScannedPackages.Count == 0 && !hasUnverifiedPackages)
         {
             return;
         }
@@ -216,12 +237,12 @@ public class CveActiveWatchService : BackgroundService
                 owner, repo, openVulnerabilityIssues.Count, totalOpenIssues);
         }
 
-        var openIssuesByTitle = new Dictionary<string, Issue>(StringComparer.OrdinalIgnoreCase);
+        var openIssuesByPackage = new Dictionary<string, Issue>(StringComparer.OrdinalIgnoreCase);
         foreach (var openIssue in openVulnerabilityIssues)
         {
-            if (!string.IsNullOrWhiteSpace(openIssue.Title))
+            if (openIssue != null && TryExtractTrackedPackageName(openIssue, out var trackedPkg))
             {
-                openIssuesByTitle.TryAdd(openIssue.Title, openIssue);
+                openIssuesByPackage.TryAdd(trackedPkg, openIssue);
             }
         }
 
@@ -231,11 +252,112 @@ public class CveActiveWatchService : BackgroundService
             if (ct.IsCancellationRequested)
                 break;
 
-            await ProcessPackageFindingAsync(owner, repo, finding, issueLabel, openIssuesByTitle, isIndexTruncated, ct);
+            await ProcessPackageFindingAsync(owner, repo, finding, issueLabel, openIssuesByPackage, isIndexTruncated, ct);
         }
 
         // 2. Pure scan-based auto-close: reuse the pre-fetched index so resolved checks emit zero extra Search API calls
         await CheckAndCloseResolvedIssuesAsync(owner, repo, issueLabel, openVulnerabilityIssues, scanResult.SuccessfullyScannedPackages, vulnerablePackages, ct);
+
+        // 3. Notify maintainers once on pre-existing open issues for native RPMs skipped by the authoritative ecosystem gate
+        if (!_options.IncludeUnverifiedNativePackages && hasUnverifiedPackages)
+        {
+            await NotifyUnverifiedLegacyIssuesAsync(owner, repo, openIssuesByPackage, scanResult.UnverifiedNativePackages!, ct);
+        }
+    }
+
+    private static Dictionary<string, PackageVulnerabilityFinding> BuildVulnerablePackagesMap(
+        IReadOnlyList<PackageVulnerabilityFinding> findings)
+    {
+        var map = new Dictionary<string, PackageVulnerabilityFinding>(StringComparer.OrdinalIgnoreCase);
+        foreach (var finding in findings)
+        {
+            if (finding == null || string.IsNullOrWhiteSpace(finding.PackageName))
+            {
+                continue;
+            }
+
+            if (!map.TryGetValue(finding.PackageName, out var existing))
+            {
+                map[finding.PackageName] = finding;
+                continue;
+            }
+
+            var mergedCveIds = existing.CveIds
+                .Concat(finding.CveIds)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var mergedReports = existing.DetailedReports
+                .Concat(finding.DetailedReports)
+                .GroupBy(r => r.CveId, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .ToList();
+            var mergedTotal = Math.Max(
+                Math.Max(existing.TotalVulnerabilityCount, finding.TotalVulnerabilityCount),
+                mergedCveIds.Count);
+            map[finding.PackageName] = existing with
+            {
+                CveIds = mergedCveIds,
+                DetailedReports = mergedReports,
+                TotalVulnerabilityCount = mergedTotal,
+                IsUnverifiedEcosystem = existing.IsUnverifiedEcosystem && finding.IsUnverifiedEcosystem
+            };
+        }
+
+        return map;
+    }
+
+    private async Task NotifyUnverifiedLegacyIssuesAsync(
+        string owner,
+        string repo,
+        IReadOnlyDictionary<string, Issue> openIssuesByPackage,
+        IReadOnlySet<string> unverifiedPackages,
+        CancellationToken ct)
+    {
+        foreach (var packageName in unverifiedPackages)
+        {
+            if (ct.IsCancellationRequested)
+                break;
+
+            if (!openIssuesByPackage.TryGetValue(packageName, out var openIssue))
+                continue;
+
+            if (_options.DryRun)
+            {
+                _logger?.LogInformation(
+                    "[DryRun] Would post one-time unverified native ecosystem notice on legacy CVE issue #{Number} for {Package}",
+                    openIssue.Number, packageName);
+                continue;
+            }
+
+            try
+            {
+                var comments = await _gitHubService.GetIssueCommentsAsync(owner, repo, openIssue.Number, ct);
+                if (comments != null && comments.Any(c =>
+                        c.Body != null && c.Body.Contains(UnverifiedNoticeMarker, StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
+                var notice = $"""
+                    > ℹ️ **Unverified Native RPM Ecosystem Notice**
+                    >
+                    > Package `{packageName}` does not declare an authoritative upstream OSV ecosystem (`crates.io` or `PyPI`). By default (`CveActiveWatch:IncludeUnverifiedNativePackages = false`), automated scanning now skips unverified native RPM packages to prevent cross-distribution false positives, so this tracking issue will no longer be automatically updated or auto-closed.
+                    >
+                    > Please verify whether any listed CVEs apply to openRuyi's packaging and manually close this issue when resolved, or explicitly set `CveActiveWatch:IncludeUnverifiedNativePackages = true` if you want best-effort package-name scanning to continue maintaining it.
+
+                    {UnverifiedNoticeMarker}
+                    """;
+
+                await _gitHubService.CreateCommentAsync(owner, repo, openIssue.Number, notice, ct);
+                _logger?.LogInformation(
+                    "Posted one-time unverified ecosystem migration notice on legacy CVE issue #{Number} for {Package}",
+                    openIssue.Number, packageName);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger?.LogWarning(ex, "Failed to post unverified ecosystem notice on issue #{Number} for {Package}", openIssue.Number, packageName);
+            }
+        }
     }
 
     private async Task ProcessPackageFindingAsync(
@@ -243,7 +365,7 @@ public class CveActiveWatchService : BackgroundService
         string repo,
         PackageVulnerabilityFinding finding,
         string issueLabel,
-        IReadOnlyDictionary<string, Issue> openIssuesByTitle,
+        IReadOnlyDictionary<string, Issue> openIssuesByPackage,
         bool isIndexTruncated,
         CancellationToken ct)
     {
@@ -263,17 +385,18 @@ public class CveActiveWatchService : BackgroundService
 
         try
         {
-            openIssuesByTitle.TryGetValue(issueTitle, out var existingIssue);
+            openIssuesByPackage.TryGetValue(finding.PackageName, out var existingIssue);
 
             if (existingIssue != null)
             {
                 _logger?.LogInformation("Updating existing vulnerability issue #{Number} for {Package}", existingIssue.Number, finding.PackageName);
                 if (!_options.DryRun)
                 {
-                    await _gitHubService.UpdateIssueAsync(owner, repo, existingIssue.Number, issueTitle, body, ct);
+                    var updateTitle = !string.IsNullOrWhiteSpace(existingIssue.Title) ? existingIssue.Title : issueTitle;
+                    await _gitHubService.UpdateIssueAsync(owner, repo, existingIssue.Number, updateTitle, body, ct);
 
                     // Reconcile severity labels: remove obsolete Severity:* labels
-                    var currentSeverityLabels = existingIssue.Labels
+                    var currentSeverityLabels = (existingIssue.Labels ?? Array.Empty<Label>())
                         .Where(l => l.Name != null && l.Name.StartsWith("Severity:", StringComparison.OrdinalIgnoreCase))
                         .Select(l => l.Name)
                         .ToList();
@@ -335,13 +458,10 @@ public class CveActiveWatchService : BackgroundService
                 if (ct.IsCancellationRequested)
                     break;
 
-                var match = PackageIssueTitleRegex.Match(issue.Title ?? string.Empty);
-                if (!match.Success)
+                if (issue == null || !TryExtractTrackedPackageName(issue, out var packageName))
                     continue;
 
-                var packageName = match.Groups["pkg"].Value.Trim();
-
-                // Only auto-close if this package was verified in a successful scan batch without outstanding CVEs
+                // Only auto-close if this package was verified in a successful authoritative scan batch without outstanding CVEs
                 if (!successfullyScannedPackages.Contains(packageName))
                     continue;
 
@@ -365,6 +485,38 @@ public class CveActiveWatchService : BackgroundService
         {
             _logger?.LogWarning(ex, "Failed to verify and close resolved vulnerability issues");
         }
+    }
+
+    internal static bool TryExtractTrackedPackageName(Issue issue, out string packageName)
+    {
+        if (!string.IsNullOrWhiteSpace(issue.Body))
+        {
+            var markerMatch = PackageIssueBodyMarkerRegex.Match(issue.Body);
+            if (markerMatch.Success)
+            {
+                packageName = markerMatch.Groups["pkg"].Value.Trim();
+                if (!string.IsNullOrEmpty(packageName))
+                {
+                    return true;
+                }
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(issue.Title))
+        {
+            var titleMatch = PackageIssueTitleRegex.Match(issue.Title);
+            if (titleMatch.Success)
+            {
+                packageName = titleMatch.Groups["pkg"].Value.Trim();
+                if (!string.IsNullOrEmpty(packageName))
+                {
+                    return true;
+                }
+            }
+        }
+
+        packageName = string.Empty;
+        return false;
     }
 
     public static string? CalculateMaxSeverity(IEnumerable<CveReport> reports)
@@ -398,8 +550,8 @@ public class CveActiveWatchService : BackgroundService
 
     public static string GenerateIssueBody(PackageVulnerabilityFinding finding)
     {
-        const int maxDisplayCount = 100;
-        var totalCount = finding.DetailedReports.Count;
+        const int maxDisplayCount = 20;
+        var totalCount = Math.Max(finding.TotalVulnerabilityCount, finding.DetailedReports.Count);
         var displayReports = finding.DetailedReports
             .OrderByDescending(r => r.CvssScore ?? 0)
             .Take(maxDisplayCount)
@@ -412,12 +564,17 @@ public class CveActiveWatchService : BackgroundService
             return $"| {idCell} | `{r.SeverityLabel ?? "Unknown"}` | {r.CvssScore?.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) ?? "N/A"} | {EscapeMarkdown(r.Summary ?? "Vulnerability details unavailable")} |";
         }));
 
-        var truncationNotice = totalCount > maxDisplayCount
-            ? $"\n\n> ⚠️ **Notice**: Truncated. Displaying top {maxDisplayCount} highest severity CVEs out of {totalCount} total vulnerabilities."
+        var truncationNotice = totalCount > displayReports.Count
+            ? $"\n\n> ⚠️ **Notice**: Truncated. Displaying top {displayReports.Count} highest severity CVEs out of {totalCount} total vulnerabilities."
             : string.Empty;
 
+        var bestEffortBanner = finding.IsUnverifiedEcosystem
+            ? "\n\n> ⚠️ **Best-Effort / Unverified Ecosystem**: This native RPM package has no authoritative openRuyi OSV ecosystem feed; results are matched by package name across upstream distributions and may contain false positives."
+            : string.Empty;
+
+        var marker = $"\n\n<!-- abaci-cve-package: {finding.PackageName} -->";
         var body = $"""
-            ## Vulnerability Assessment for `{finding.PackageName}` ({finding.Version})
+            ## Vulnerability Assessment for `{finding.PackageName}` ({finding.Version}){bestEffortBanner}
 
             The following unpatched CVE vulnerabilities were actively detected in `{finding.PackageName}`:
 
@@ -428,13 +585,15 @@ public class CveActiveWatchService : BackgroundService
             > Automatically tracked by abaci-bot. When this package is updated and CVEs are cleared, this issue will close automatically.
             """;
 
-        // Hard cap at 60,000 characters to prevent GitHub 422 limit (65536 max)
-        if (body.Length > 60000)
+        // Hard cap at 60,000 characters to prevent GitHub 422 limit (65536 max) while keeping identity marker intact
+        const string overflowNotice = "\n\n> ⚠️ [Content truncated due to size limits]";
+        var maxContentLength = 60000 - marker.Length - overflowNotice.Length;
+        if (body.Length + marker.Length > 60000)
         {
-            body = string.Concat(body.AsSpan(0, 59900), "\n\n> ⚠️ [Content truncated due to size limits]");
+            body = string.Concat(body.AsSpan(0, Math.Max(0, maxContentLength)), overflowNotice);
         }
 
-        return body;
+        return body + marker;
     }
 
     private static string EscapeMarkdown(string text)
@@ -442,7 +601,56 @@ public class CveActiveWatchService : BackgroundService
         return text.Replace("|", "\\|").Replace("\r\n", " ").Replace("\n", " ").Trim();
     }
 
-    private async Task<IReadOnlyList<(string PackageName, string Version)>> FetchSlicedSpecCatalogAsync(
+    internal static PackageScanTarget? TryExtractScanTargetFromSpec(string packageName, string? specContent)
+    {
+        if (string.IsNullOrWhiteSpace(packageName) || string.IsNullOrWhiteSpace(specContent))
+        {
+            return null;
+        }
+
+        var fullVerMatch = FullVersionRegex.Match(specContent);
+        var verMatch = VersionRegex.Match(specContent);
+        string? version = fullVerMatch.Success
+            ? fullVerMatch.Groups["ver"].Value.Trim()
+            : (verMatch.Success ? verMatch.Groups["ver"].Value.Trim() : null);
+
+        if (string.IsNullOrWhiteSpace(version))
+        {
+            return null;
+        }
+
+        string? ecosystem = null;
+        string? upstreamName = null;
+
+        var crateMatch = CrateNameRegex.Match(specContent);
+        if (crateMatch.Success)
+        {
+            ecosystem = "crates.io";
+            var candidateName = crateMatch.Groups["name"].Value.Trim();
+            if (!string.IsNullOrWhiteSpace(candidateName) && !candidateName.Contains('%'))
+            {
+                upstreamName = candidateName;
+            }
+        }
+        else if (packageName.StartsWith("python-", StringComparison.OrdinalIgnoreCase) ||
+                 packageName.StartsWith("python3-", StringComparison.OrdinalIgnoreCase))
+        {
+            ecosystem = "PyPI";
+            var pypiMatch = PypiNameRegex.Match(specContent);
+            if (pypiMatch.Success)
+            {
+                var candidateName = pypiMatch.Groups["name"].Value.Trim();
+                if (!string.IsNullOrWhiteSpace(candidateName) && !candidateName.Contains('%'))
+                {
+                    upstreamName = candidateName;
+                }
+            }
+        }
+
+        return new PackageScanTarget(packageName, version, ecosystem, upstreamName);
+    }
+
+    private async Task<IReadOnlyList<PackageScanTarget>> FetchSlicedSpecCatalogAsync(
         IReadOnlyList<string> allNames,
         int packagesPerSweep,
         CancellationToken ct)
@@ -461,57 +669,52 @@ public class CveActiveWatchService : BackgroundService
 
         _catalogOffset = (offset + sliceCount) % sortedNames.Count;
 
-        var result = new List<(string PackageName, string Version)>(sliceCount);
+        var result = new List<PackageScanTarget>(sliceCount);
         foreach (var name in selectedNames)
         {
             if (ct.IsCancellationRequested)
                 break;
 
             var spec = await _specCatalog!.GetSpecAsync(name, ct);
-            if (spec != null)
+            var target = TryExtractScanTargetFromSpec(name, spec?.Content);
+            if (target != null)
             {
-                var match = VersionRegex.Match(spec.Content);
-                if (match.Success)
-                {
-                    result.Add((name, match.Groups["ver"].Value.Trim()));
-                }
+                result.Add(target);
             }
         }
 
         return result;
     }
 
-    private async Task<IReadOnlyList<(string PackageName, string Version)>> LoadPackageCatalogAsync(CancellationToken ct)
+    private async Task<IReadOnlyList<PackageScanTarget>> LoadPackageCatalogAsync(CancellationToken ct)
     {
         if (_catalogProvider != null)
         {
-            return await _catalogProvider(ct);
+            var supplied = await _catalogProvider(ct);
+            return supplied.Select(p => new PackageScanTarget(p.PackageName, p.Version)).ToList();
         }
 
         if (_specCatalog != null)
         {
             var names = await _specCatalog.GetAllPackageNamesAsync(ct);
-            var result = new List<(string PackageName, string Version)>();
+            var result = new List<PackageScanTarget>();
             foreach (var name in names)
             {
                 if (ct.IsCancellationRequested)
                     break;
 
                 var spec = await _specCatalog.GetSpecAsync(name, ct);
-                if (spec != null)
+                var target = TryExtractScanTargetFromSpec(name, spec?.Content);
+                if (target != null)
                 {
-                    var match = VersionRegex.Match(spec.Content);
-                    if (match.Success)
-                    {
-                        result.Add((name, match.Groups["ver"].Value.Trim()));
-                    }
+                    result.Add(target);
                 }
             }
             if (result.Count > 0)
                 return result;
         }
 
-        var list = new List<(string PackageName, string Version)>();
+        var list = new List<PackageScanTarget>();
         const string specsDir = "SPECS";
         if (!Directory.Exists(specsDir))
             return list;
@@ -529,10 +732,10 @@ public class CveActiveWatchService : BackgroundService
             try
             {
                 var content = await File.ReadAllTextAsync(specFiles[0], ct);
-                var match = VersionRegex.Match(content);
-                if (match.Success)
+                var target = TryExtractScanTargetFromSpec(dirName, content);
+                if (target != null)
                 {
-                    list.Add((dirName, match.Groups["ver"].Value.Trim()));
+                    list.Add(target);
                 }
             }
             catch

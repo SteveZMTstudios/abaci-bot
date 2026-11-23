@@ -240,9 +240,9 @@ public interface IGitHubService
         string owner, string repo, string author, DateTimeOffset updatedAfter, CancellationToken ct = default);
 
     /// <summary>
-    /// Retrieves the latest commit information on a branch (SHA, commit message, committer login/email).
+    /// Retrieves the latest commit metadata on a branch (SHA, commit message, author and committer identity).
     /// </summary>
-    Task<(string Sha, string Message, string CommitterLogin, string CommitterEmail)?> GetBranchLatestCommitAsync(
+    Task<BranchCommitInfo?> GetBranchLatestCommitAsync(
         string owner, string repo, string branch, CancellationToken ct = default);
 
     /// <summary>

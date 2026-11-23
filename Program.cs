@@ -73,6 +73,7 @@ builder.Services.AddSingleton<IBotIdentityProvider>(sp => sp.GetRequiredService<
 builder.Services.AddSingleton<IEphemeralCommentGateway>(sp => sp.GetRequiredService<GitHubService>());
 builder.Services.AddSingleton<IRepositoryArchiveGateway>(sp => sp.GetRequiredService<GitHubService>());
 builder.Services.AddSingleton<IPagedIssueSearchGateway>(sp => sp.GetRequiredService<GitHubService>());
+builder.Services.AddSingleton<IOpenPullRequestInventoryGateway>(sp => sp.GetRequiredService<GitHubService>());
 
 builder.Services.AddHttpClient();
 
@@ -151,7 +152,9 @@ builder.Services.AddSingleton<ISpecVersionRewriter, PlainSpecVersionRewriter>();
 builder.Services.AddSingleton<ISpecVersionRewriter, RustCrateSpecRewriter>();
 builder.Services.AddSingleton<IUpdateCandidateSource, LookoutVersionSource>();
 builder.Services.AddSingleton<IUpdateCandidateSource, RustCrateVersionSource>();
-builder.Services.AddSingleton<IObsBuildService, ObsBuildService>();
+builder.Services.AddSingleton<ObsBuildService>();
+builder.Services.AddSingleton<IObsBuildService>(sp => sp.GetRequiredService<ObsBuildService>());
+builder.Services.AddSingleton<IObsBuildFreshnessGateway>(sp => sp.GetRequiredService<ObsBuildService>());
 builder.Services.AddSingleton<IRemoteAssetBackfiller, RemoteAssetBackfiller>();
 builder.Services.AddSingleton<IPackageUpdatePublisher, GitHubPackageUpdatePublisher>();
 builder.Services.AddSingleton<ObsPostMergeVerifier>();

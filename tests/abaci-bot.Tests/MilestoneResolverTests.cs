@@ -284,7 +284,7 @@ public class MilestoneResolverTests
             => throw new NotImplementedException();
         public Task<IReadOnlyList<PullRequest>> SearchMergedPullRequestsAsync(string owner, string repo, string author, DateTimeOffset updatedAfter, CancellationToken ct = default)
             => throw new NotImplementedException();
-        public Task<(string Sha, string Message, string CommitterLogin, string CommitterEmail)?> GetBranchLatestCommitAsync(string owner, string repo, string branch, CancellationToken ct = default)
+        public Task<BranchCommitInfo?> GetBranchLatestCommitAsync(string owner, string repo, string branch, CancellationToken ct = default)
             => throw new NotImplementedException();
         public Task<IReadOnlyList<IssueComment>> GetIssueCommentsAsync(string owner, string repo, int number, CancellationToken ct = default)
             => throw new NotImplementedException();

@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -12,29 +13,34 @@ namespace abaci_bot.Services;
 /// Operates independently of external trackers, using 4-tier hashing and NDJSON streaming.
 /// Filters yanked and pre-release versions, strictly enforcing branch constraints.
 /// </summary>
-public class RustCrateVersionSource : IUpdateCandidateSource
+public class RustCrateVersionSource : IUpdateCandidateSource, ICandidateSweepCursor
 {
+    public const string CursorStateKey = "rust-crates";
+
     private readonly HttpClient _httpClient;
     private readonly RustCratePollerOptions _options;
     private readonly ILogger<RustCrateVersionSource>? _logger;
     private readonly ISpecCatalog? _specCatalog;
     private readonly Func<CancellationToken, Task<IReadOnlyList<SpecContext>>>? _specCatalogProvider;
     private readonly RuntimeHealthState? _healthState;
-    private int _crateCursor;
+    private readonly IBotStateStore? _stateStore;
+    private readonly string _cursorStateKey;
+    private string? _lastWatermark;
+    private string? _pendingSweepWatermark;
+    private bool _hasPendingSweepCommit;
+    private IReadOnlyList<string> _allSortedNames = Array.Empty<string>();
+    private IReadOnlyList<string> _lastCandidateNames = Array.Empty<string>();
 
     private static readonly Regex CrateNameRegex = new(
         @"^%global\s+crate_name\s+(?<name>\S+)",
         RegexOptions.Compiled | RegexOptions.Multiline);
 
-    private static readonly Regex FullVersionRegex = new(
-        @"^%global\s+full_version\s+(?<ver>\S+)",
-        RegexOptions.Compiled | RegexOptions.Multiline);
-
-    private static readonly Regex VersionRegex = new(
-        @"^Version:\s*(?<ver>\S+)",
-        RegexOptions.Compiled | RegexOptions.Multiline);
-
     public string SourceName => "RustCrates";
+
+    public static string GetCursorStateKey(string? targetRepository) =>
+        string.IsNullOrWhiteSpace(targetRepository)
+            ? CursorStateKey
+            : $"{CursorStateKey}:{targetRepository.Trim().ToLowerInvariant()}";
 
     public RustCrateVersionSource(
         HttpClient httpClient,
@@ -42,7 +48,8 @@ public class RustCrateVersionSource : IUpdateCandidateSource
         ILogger<RustCrateVersionSource>? logger = null,
         ISpecCatalog? specCatalog = null,
         Func<CancellationToken, Task<IReadOnlyList<SpecContext>>>? specCatalogProvider = null,
-        RuntimeHealthState? healthState = null)
+        RuntimeHealthState? healthState = null,
+        IBotStateStore? stateStore = null)
     {
         _httpClient = httpClient;
         _options = options.Value.RustCratePoller;
@@ -50,6 +57,8 @@ public class RustCrateVersionSource : IUpdateCandidateSource
         _specCatalog = specCatalog;
         _specCatalogProvider = specCatalogProvider;
         _healthState = healthState;
+        _stateStore = stateStore;
+        _cursorStateKey = GetCursorStateKey(options.Value.TargetRepository);
     }
 
     /// <summary>
@@ -83,7 +92,11 @@ public class RustCrateVersionSource : IUpdateCandidateSource
             return Array.Empty<UpdateCandidate>();
         }
 
-        var (specs, totalSpecs, startIndex, nextCursorStart, alreadySliced) = await LoadRustSpecsForSweepAsync(ct);
+        var currentWatermark = _lastWatermark ?? _stateStore?.GetCursorWatermark(_cursorStateKey);
+        _pendingSweepWatermark = null;
+        _hasPendingSweepCommit = false;
+        _lastCandidateNames = Array.Empty<string>();
+        var specs = await LoadRustSpecsForSweepAsync(currentWatermark, ct);
         if (specs.Count == 0)
         {
             _logger?.LogInformation("No Rust crate SPEC files found to evaluate");
@@ -96,11 +109,12 @@ public class RustCrateVersionSource : IUpdateCandidateSource
         int processedCount = 0;
         int queriedCount = 0;
         int failedCount = 0;
-        int iterated = 0;
+        int transientFailedCount = 0;
         string? lastError = null;
+        string? candidateWatermark = null;
+        bool hitTransientError = false;
 
-        var loopCount = alreadySliced ? specs.Count : totalSpecs;
-        for (int i = 0; i < loopCount; i++)
+        foreach (var spec in specs)
         {
             if (ct.IsCancellationRequested)
                 break;
@@ -111,17 +125,26 @@ public class RustCrateVersionSource : IUpdateCandidateSource
                 break;
             }
 
-            iterated++;
-            var spec = alreadySliced ? specs[i] : specs[(startIndex + i) % totalSpecs];
-
             var crateMatch = CrateNameRegex.Match(spec.Content);
             if (!crateMatch.Success)
+            {
+                if (!hitTransientError)
+                {
+                    candidateWatermark = spec.PackageName;
+                }
                 continue;
+            }
 
             var crateName = crateMatch.Groups["name"].Value.Trim();
             var currentVersion = ExtractCurrentVersion(spec.Content);
             if (string.IsNullOrWhiteSpace(currentVersion))
+            {
+                if (!hitTransientError)
+                {
+                    candidateWatermark = spec.PackageName;
+                }
                 continue;
+            }
 
             // Deduce branch via unified UpdateAdmission helper
             var branch = UpdateAdmission.DeduceBranch(spec.DirectoryName, crateName);
@@ -144,6 +167,8 @@ public class RustCrateVersionSource : IUpdateCandidateSource
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 failedCount++;
+                transientFailedCount++;
+                hitTransientError = true;
                 lastError = $"{crateName}: {ex.GetType().Name}: {ex.Message}";
                 _logger?.LogWarning(ex, "Failed to query sparse index for crate {Crate} at {Url}", crateName, url);
                 continue;
@@ -153,8 +178,26 @@ public class RustCrateVersionSource : IUpdateCandidateSource
             {
                 failedCount++;
                 lastError = $"{crateName}: HTTP {(int)response.StatusCode} ({response.StatusCode})";
+                if (response.StatusCode == HttpStatusCode.NotFound)
+                {
+                    // Advance past permanent 404s so deleted/unlisted crates cannot wedge the catalog cursor.
+                    if (!hitTransientError)
+                    {
+                        candidateWatermark = spec.PackageName;
+                    }
+                }
+                else
+                {
+                    transientFailedCount++;
+                    hitTransientError = true;
+                }
                 _logger?.LogWarning("Sparse index returned status {StatusCode} for crate {Crate} at {Url}", response.StatusCode, crateName, url);
                 continue;
+            }
+
+            if (!hitTransientError)
+            {
+                candidateWatermark = spec.PackageName;
             }
 
             var stream = await response.Content.ReadAsStreamAsync(ct);
@@ -210,9 +253,14 @@ public class RustCrateVersionSource : IUpdateCandidateSource
                 PublishedAt: targetEntry.Pubtime));
         }
 
-        _crateCursor = alreadySliced
-            ? nextCursorStart
-            : (startIndex + iterated) % Math.Max(1, totalSpecs);
+        if (candidateWatermark != null && (queriedCount == 0 || transientFailedCount < queriedCount))
+        {
+            // Stage watermark in memory only; CompleteSweep persists after scheduler completion (2PC cursor).
+            _pendingSweepWatermark = candidateWatermark;
+            _hasPendingSweepCommit = true;
+        }
+
+        _lastCandidateNames = candidates.Select(c => c.PackageName).ToList();
 
         if (queriedCount > 0 && failedCount == queriedCount)
         {
@@ -233,36 +281,94 @@ public class RustCrateVersionSource : IUpdateCandidateSource
             _healthState?.RecordSourceOutcome(SourceName, "healthy", candidates.Count);
         }
 
-        _logger?.LogInformation("Rust crates poller discovered {Count} candidates from {Processed} queried crates (cursor moved to {Cursor})", candidates.Count, processedCount, _crateCursor);
+        _logger?.LogInformation(
+            "Rust crates poller discovered {Count} candidates from {Processed} queried crates (confirmedWatermark={ConfirmedWatermark}, pendingWatermark={PendingWatermark})",
+            candidates.Count, processedCount, _lastWatermark ?? "<start>", _pendingSweepWatermark ?? "<unchanged>");
         return candidates;
     }
 
+    public void CompleteSweep(IReadOnlySet<string> processedPackageNames)
+    {
+        if (_lastCandidateNames.Count > 0 && _allSortedNames.Count > 0)
+        {
+            var earliestUnprocessedIndex = -1;
+            foreach (var candidateName in _lastCandidateNames)
+            {
+                if (processedPackageNames.Contains(candidateName))
+                {
+                    continue;
+                }
+
+                var index = IndexOfName(_allSortedNames, candidateName);
+                if (index >= 0 && (earliestUnprocessedIndex < 0 || index < earliestUnprocessedIndex))
+                {
+                    earliestUnprocessedIndex = index;
+                }
+            }
+
+            if (earliestUnprocessedIndex >= 0)
+            {
+                var previous = earliestUnprocessedIndex > 0
+                    ? _allSortedNames[earliestUnprocessedIndex - 1]
+                    : null;
+                _lastWatermark = previous;
+                _stateStore?.SetCursorWatermark(_cursorStateKey, previous);
+                _pendingSweepWatermark = null;
+                _hasPendingSweepCommit = false;
+                _logger?.LogInformation(
+                    "Rust crates poller rewound cursor before unprocessed candidate {Package} (watermark={Watermark})",
+                    _allSortedNames[earliestUnprocessedIndex], previous ?? "<start>");
+                return;
+            }
+        }
+
+        if (_hasPendingSweepCommit)
+        {
+            _lastWatermark = _pendingSweepWatermark;
+            _stateStore?.SetCursorWatermark(_cursorStateKey, _pendingSweepWatermark);
+            _logger?.LogInformation(
+                "Rust crates poller committed sweep watermark={Watermark}",
+                _pendingSweepWatermark ?? "<start>");
+        }
+
+        _pendingSweepWatermark = null;
+        _hasPendingSweepCommit = false;
+    }
+
+    private static int IndexOfName(IReadOnlyList<string> names, string name)
+    {
+        for (int i = 0; i < names.Count; i++)
+        {
+            if (string.Equals(names[i], name, StringComparison.OrdinalIgnoreCase))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
     /// <summary>
-    /// Selects the highest/latest version strictly newer than currentVersion.
-    /// Sparse index orders versions chronologically; validates target is strictly newer.
+    /// Selects the highest/latest version strictly newer than currentVersion using unified RPM/SemVer comparison.
+    /// Rejects pre-releases and unparseable/non-version strings instead of blindly letting later entries overwrite valid ones.
     /// </summary>
     public static CrateIndexEntry? SelectLatestVersion(List<CrateIndexEntry> entries, string currentVersion)
     {
         if (entries == null || entries.Count == 0)
             return null;
 
-        // Try SemVer parse or fallback to index chronological position
         CrateIndexEntry? latest = null;
-        Version? latestParsed = null;
-
         foreach (var entry in entries)
         {
-            if (Version.TryParse(entry.Version, out var parsed))
+            if (entry == null || string.IsNullOrWhiteSpace(entry.Version))
+                continue;
+
+            var stripped = UpdateAdmission.StripVersionSuffix(entry.Version);
+            if (!UpdateAdmission.IsValidTargetVersion(stripped) || !stripped.Any(char.IsDigit))
+                continue;
+
+            if (latest == null || UpdateAdmission.CompareRpmVersions(entry.Version, latest.Version) > 0)
             {
-                if (latestParsed == null || parsed > latestParsed)
-                {
-                    latestParsed = parsed;
-                    latest = entry;
-                }
-            }
-            else
-            {
-                // Fallback to chronological last
                 latest = entry;
             }
         }
@@ -271,44 +377,68 @@ public class RustCrateVersionSource : IUpdateCandidateSource
             return null;
 
         if (string.Equals(latest.Version, currentVersion, StringComparison.Ordinal))
-            return null; // Already latest
+            return null;
 
-        if (Version.TryParse(currentVersion, out var curParsed) && latestParsed != null)
+        if (!string.IsNullOrWhiteSpace(currentVersion) &&
+            UpdateAdmission.CompareRpmVersions(latest.Version, currentVersion) <= 0)
         {
-            if (latestParsed <= curParsed)
-                return null; // Target is not newer
+            return null;
         }
 
         return latest;
     }
 
-    private static string ExtractCurrentVersion(string specContent)
+    private static string ExtractCurrentVersion(string specContent) =>
+        UpdateAdmission.TryExtractCurrentVersion(specContent, out var version)
+            ? version
+            : string.Empty;
+
+    internal static int FindWatermarkStartIndex(IReadOnlyList<string> sortedNames, string? lastWatermark)
     {
-        var fullVerMatch = FullVersionRegex.Match(specContent);
-        if (fullVerMatch.Success)
-            return fullVerMatch.Groups["ver"].Value.Trim();
+        if (sortedNames.Count == 0 || string.IsNullOrWhiteSpace(lastWatermark))
+        {
+            return 0;
+        }
 
-        var verMatch = VersionRegex.Match(specContent);
-        if (verMatch.Success)
-            return verMatch.Groups["ver"].Value.Trim();
+        for (int i = 0; i < sortedNames.Count; i++)
+        {
+            if (StringComparer.OrdinalIgnoreCase.Compare(sortedNames[i], lastWatermark) > 0)
+            {
+                return i;
+            }
+        }
 
-        return string.Empty;
+        return 0;
     }
 
-    private async Task<(IReadOnlyList<SpecContext> Specs, int TotalSpecs, int StartIndex, int NextCursorStart, bool AlreadySliced)>
-        LoadRustSpecsForSweepAsync(CancellationToken ct)
+    private async Task<IReadOnlyList<SpecContext>> LoadRustSpecsForSweepAsync(string? currentWatermark, CancellationToken ct)
     {
+        _allSortedNames = Array.Empty<string>();
         if (_specCatalogProvider != null)
         {
-            var providerSpecs = await _specCatalogProvider(ct);
+            var providerSpecs = (await _specCatalogProvider(ct))
+                .OrderBy(s => s.PackageName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (providerSpecs.Count == 0)
+            {
+                return Array.Empty<SpecContext>();
+            }
+
+            _allSortedNames = providerSpecs.Select(s => s.PackageName).ToList();
             var total = providerSpecs.Count;
-            var start = total > 0 ? Math.Abs(_crateCursor) % total : 0;
-            return (providerSpecs, total, start, 0, false);
+            var startIndex = FindWatermarkStartIndex(_allSortedNames, currentWatermark);
+            var limit = _options.MaxCratesPerSweep > 0 ? Math.Min(_options.MaxCratesPerSweep, total) : total;
+            var result = new List<SpecContext>(limit);
+            for (int i = 0; i < total && result.Count < limit; i++)
+            {
+                result.Add(providerSpecs[(startIndex + i) % total]);
+            }
+            return result;
         }
 
         if (_specCatalog != null)
         {
-            // Slice rust-* package names BEFORE calling GetSpecAsync to avoid O(N) fallback fetches.
+            // Slice sorted rust-* package names from durable watermark BEFORE calling GetSpecAsync.
             var allNames = await _specCatalog.GetAllPackageNamesAsync(ct);
             var rustNames = allNames
                 .Where(n => n.StartsWith("rust-", StringComparison.OrdinalIgnoreCase))
@@ -317,21 +447,20 @@ public class RustCrateVersionSource : IUpdateCandidateSource
 
             if (rustNames.Count == 0)
             {
-                return (Array.Empty<SpecContext>(), 0, 0, 0, true);
+                return Array.Empty<SpecContext>();
             }
 
+            _allSortedNames = rustNames;
             var total = rustNames.Count;
-            var startIndex = Math.Abs(_crateCursor) % total;
+            var startIndex = FindWatermarkStartIndex(rustNames, currentWatermark);
             var limit = _options.MaxCratesPerSweep > 0 ? Math.Min(_options.MaxCratesPerSweep, total) : total;
             var slicedSpecs = new List<SpecContext>(limit);
-            int inspected = 0;
 
             for (int i = 0; i < total && slicedSpecs.Count < limit; i++)
             {
                 if (ct.IsCancellationRequested)
                     break;
 
-                inspected++;
                 var name = rustNames[(startIndex + i) % total];
                 var spec = await _specCatalog.GetSpecAsync(name, ct);
                 if (spec != null)
@@ -340,14 +469,27 @@ public class RustCrateVersionSource : IUpdateCandidateSource
                 }
             }
 
-            var nextCursor = (startIndex + inspected) % total;
-            return (slicedSpecs, total, 0, nextCursor, true);
+            return slicedSpecs;
         }
 
-        var localSpecs = await LoadLocalRustSpecsAsync(ct);
+        var localSpecs = (await LoadLocalRustSpecsAsync(ct))
+            .OrderBy(s => s.PackageName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (localSpecs.Count == 0)
+        {
+            return Array.Empty<SpecContext>();
+        }
+
         var localTotal = localSpecs.Count;
-        var localStart = localTotal > 0 ? Math.Abs(_crateCursor) % localTotal : 0;
-        return (localSpecs, localTotal, localStart, 0, false);
+        _allSortedNames = localSpecs.Select(s => s.PackageName).ToList();
+        var localStart = FindWatermarkStartIndex(_allSortedNames, currentWatermark);
+        var localLimit = _options.MaxCratesPerSweep > 0 ? Math.Min(_options.MaxCratesPerSweep, localTotal) : localTotal;
+        var slicedLocal = new List<SpecContext>(localLimit);
+        for (int i = 0; i < localTotal && slicedLocal.Count < localLimit; i++)
+        {
+            slicedLocal.Add(localSpecs[(localStart + i) % localTotal]);
+        }
+        return slicedLocal;
     }
 
     private async Task<IReadOnlyList<SpecContext>> LoadLocalRustSpecsAsync(CancellationToken ct)

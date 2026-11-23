@@ -315,7 +315,7 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
         lock (_lock)
         {
             var repoState = GetOrCreateRepoState(repoKey);
-            repoState.PackageFailures[packageName.Trim()] = new PackageFailureEntry(consecutiveFailures, cooldownUntil);
+            repoState.PackageFailures[packageName.Trim()] = new PackageFailureEntry(consecutiveFailures, cooldownUntil, DateTimeOffset.UtcNow);
             SaveState();
         }
     }
@@ -444,6 +444,53 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
         }
     }
 
+    public string? GetCursorWatermark(string cursorKey)
+    {
+        if (string.IsNullOrWhiteSpace(cursorKey))
+        {
+            return null;
+        }
+
+        lock (_lock)
+        {
+            return _state.Cursors.TryGetValue(cursorKey.Trim(), out var watermark) &&
+                   !string.IsNullOrWhiteSpace(watermark)
+                ? watermark
+                : null;
+        }
+    }
+
+    public void SetCursorWatermark(string cursorKey, string? watermark)
+    {
+        if (string.IsNullOrWhiteSpace(cursorKey))
+        {
+            return;
+        }
+
+        var normalizedKey = cursorKey.Trim();
+        lock (_lock)
+        {
+            if (string.IsNullOrWhiteSpace(watermark))
+            {
+                if (_state.Cursors.Remove(normalizedKey))
+                {
+                    SaveState();
+                }
+                return;
+            }
+
+            var normalizedWatermark = watermark.Trim();
+            if (_state.Cursors.TryGetValue(normalizedKey, out var existing) &&
+                string.Equals(existing, normalizedWatermark, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _state.Cursors[normalizedKey] = normalizedWatermark;
+            SaveState();
+        }
+    }
+
     private RepoState GetOrCreateRepoState(string repoKey)
     {
         if (!_state.Repositories.TryGetValue(repoKey, out var repoState))
@@ -479,7 +526,10 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
                     loaded.UserLocales ?? new Dictionary<string, UserLocaleEntry>(),
                     StringComparer.OrdinalIgnoreCase),
                 Repositories = new Dictionary<string, RepoState>(StringComparer.OrdinalIgnoreCase),
-                PendingEphemeralComments = loaded.PendingEphemeralComments ?? new List<PendingEphemeralComment>()
+                PendingEphemeralComments = loaded.PendingEphemeralComments ?? new List<PendingEphemeralComment>(),
+                Cursors = new Dictionary<string, string>(
+                    loaded.Cursors ?? new Dictionary<string, string>(),
+                    StringComparer.OrdinalIgnoreCase)
             };
 
             if (loaded.Repositories != null)
@@ -529,6 +579,7 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
         public Dictionary<string, UserLocaleEntry> UserLocales { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, RepoState> Repositories { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         public List<PendingEphemeralComment> PendingEphemeralComments { get; set; } = new();
+        public Dictionary<string, string> Cursors { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
     private sealed record UserLocaleEntry(string Locale, DateTimeOffset UpdatedAt);

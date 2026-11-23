@@ -115,4 +115,55 @@ public class RemoteAssetBackfillerTests
         await gitHubMock.DidNotReceive().UpdateFileContentAsync(
             Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
+
+    [Theory]
+    [InlineData("SPECS/curl/curl.spec", true)]
+    [InlineData("SPECS/../etc/passwd", false)]
+    [InlineData("SPECS/curl/sub/curl.spec", false)]
+    [InlineData("README.md", false)]
+    [InlineData("SPECS/curl/patch.diff", false)]
+    public void IsSafeSpecPath_ValidatesStrictSpecLayout(string path, bool expected)
+    {
+        Assert.Equal(expected, RemoteAssetBackfiller.IsSafeSpecPath(path));
+    }
+
+    [Fact]
+    public void ReplaceFirstExactLine_ReplacesOnlyFirstWholeLineMatch_PreservingLineEndings()
+    {
+        var original = "Name: curl\r\n  #!RemoteAsset: sha256:old\r\n# changelog\r\n#!RemoteAsset: sha256:old\r\n";
+        var updated = RemoteAssetBackfiller.ReplaceFirstExactLine(original, "#!RemoteAsset: sha256:old", "#!RemoteAsset: sha256:new");
+
+        Assert.Equal("Name: curl\r\n  #!RemoteAsset: sha256:new\r\n# changelog\r\n#!RemoteAsset: sha256:old\r\n", updated);
+    }
+
+    [Fact]
+    public async Task TryBackfillAsync_RejectsPathTraversalInDiffHeader()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        var artifact = (Artifact)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Artifact));
+        typeof(Artifact).GetProperty(nameof(Artifact.Id))?.SetValue(artifact, 778L);
+        typeof(Artifact).GetProperty(nameof(Artifact.Name))?.SetValue(artifact, "remoteasset-diff");
+
+        gitHubMock.ListWorkflowArtifactsAsync("owner", "repo", 123L, Arg.Any<CancellationToken>())
+            .Returns(new[] { artifact });
+
+        var diffText = """
+            --- a/SPECS/../../evil.spec
+            +++ b/SPECS/../../evil.spec
+            @@ -1,1 +1,1 @@
+            -#!RemoteAsset: sha256:a
+            +#!RemoteAsset: sha256:b
+            """;
+
+        var ms = new MemoryStream(Encoding.UTF8.GetBytes(diffText));
+        gitHubMock.DownloadArtifactAsync("owner", "repo", 778L, Arg.Any<CancellationToken>())
+            .Returns(ms);
+
+        var backfiller = new RemoteAssetBackfiller(gitHubMock);
+        var result = await backfiller.TryBackfillAsync("owner", "repo", "autoupdate/curl", 42, 123L);
+
+        Assert.False(result);
+        await gitHubMock.DidNotReceive().GetFileContentAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
 }

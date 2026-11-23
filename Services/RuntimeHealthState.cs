@@ -12,7 +12,10 @@ public sealed record SourceHealthSnapshot(
     DateTimeOffset? LastSuccessAt,
     int LastCandidateCount,
     int ConsecutiveFailures,
-    string? LastError);
+    string? LastError,
+    int LastPublishedCount = 0,
+    int LastSkippedCount = 0,
+    DateTimeOffset? OldestCandidatePublishedAt = null);
 
 /// <summary>
 /// Tracks process startup time, per-source polling health, and the most recent sanitized
@@ -103,31 +106,84 @@ public sealed partial class RuntimeHealthState
                     LastSuccessAt: now,
                     LastCandidateCount: candidateCount,
                     ConsecutiveFailures: 0,
-                    LastError: null),
+                    LastError: null,
+                    LastPublishedCount: previous?.LastPublishedCount ?? 0,
+                    LastSkippedCount: previous?.LastSkippedCount ?? 0,
+                    OldestCandidatePublishedAt: previous?.OldestCandidatePublishedAt),
                 "degraded" => new SourceHealthSnapshot(
                     Status: "degraded",
                     LastAttemptAt: now,
                     LastSuccessAt: previous?.LastSuccessAt,
                     LastCandidateCount: candidateCount,
                     ConsecutiveFailures: (previous?.ConsecutiveFailures ?? 0) + 1,
-                    LastError: sanitizedError ?? previous?.LastError),
+                    LastError: sanitizedError ?? previous?.LastError,
+                    LastPublishedCount: previous?.LastPublishedCount ?? 0,
+                    LastSkippedCount: previous?.LastSkippedCount ?? 0,
+                    OldestCandidatePublishedAt: previous?.OldestCandidatePublishedAt),
                 "failed" => new SourceHealthSnapshot(
                     Status: "failed",
                     LastAttemptAt: now,
                     LastSuccessAt: previous?.LastSuccessAt,
                     LastCandidateCount: candidateCount,
                     ConsecutiveFailures: (previous?.ConsecutiveFailures ?? 0) + 1,
-                    LastError: sanitizedError ?? previous?.LastError),
+                    LastError: sanitizedError ?? previous?.LastError,
+                    LastPublishedCount: previous?.LastPublishedCount ?? 0,
+                    LastSkippedCount: previous?.LastSkippedCount ?? 0,
+                    OldestCandidatePublishedAt: previous?.OldestCandidatePublishedAt),
                 _ => new SourceHealthSnapshot(
                     Status: normalizedStatus,
                     LastAttemptAt: now,
                     LastSuccessAt: previous?.LastSuccessAt,
                     LastCandidateCount: 0,
                     ConsecutiveFailures: 0,
-                    LastError: null)
+                    LastError: null,
+                    LastPublishedCount: 0,
+                    LastSkippedCount: 0,
+                    OldestCandidatePublishedAt: null)
             };
 
             _sources[normalizedName] = updated;
+        }
+    }
+
+    public void RecordSourceSweepStats(
+        string sourceName,
+        int publishedCount,
+        int skippedCount,
+        DateTimeOffset? oldestCandidatePublishedAt)
+    {
+        if (string.IsNullOrWhiteSpace(sourceName))
+        {
+            return;
+        }
+
+        var normalizedName = sourceName.Trim();
+        var now = _timeProvider.GetUtcNow();
+
+        lock (_errorLock)
+        {
+            if (_sources.TryGetValue(normalizedName, out var existing))
+            {
+                _sources[normalizedName] = existing with
+                {
+                    LastPublishedCount = publishedCount,
+                    LastSkippedCount = skippedCount,
+                    OldestCandidatePublishedAt = oldestCandidatePublishedAt
+                };
+            }
+            else
+            {
+                _sources[normalizedName] = new SourceHealthSnapshot(
+                    Status: "healthy",
+                    LastAttemptAt: now,
+                    LastSuccessAt: now,
+                    LastCandidateCount: 0,
+                    ConsecutiveFailures: 0,
+                    LastError: null,
+                    LastPublishedCount: publishedCount,
+                    LastSkippedCount: skippedCount,
+                    OldestCandidatePublishedAt: oldestCandidatePublishedAt);
+            }
         }
     }
 

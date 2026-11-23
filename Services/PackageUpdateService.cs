@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Text.RegularExpressions;
 using abaci_bot.Options;
 using Microsoft.Extensions.Hosting;
@@ -22,8 +23,20 @@ public class PackageUpdateService : BackgroundService
     private readonly ISpecCatalog _specCatalog;
     private readonly IRemoteAssetBackfiller _remoteAssetBackfiller;
     private readonly IBotStateStore? _stateStore;
+    private readonly RuntimeHealthState? _healthState;
+    private readonly IOpenPullRequestInventoryGateway? _inventoryGateway;
+    private readonly IBotIdentityProvider? _botIdentity;
     private readonly PackageUpdateOptions _options;
     private readonly ILogger<PackageUpdateService>? _logger;
+    private readonly string _schedulerOffsetStateKey;
+    private int _schedulerOriginOffset;
+
+    internal const string SchedulerOffsetStateKey = "candidate-scheduler-origin";
+
+    internal static string GetSchedulerOffsetStateKey(string? targetRepository) =>
+        string.IsNullOrWhiteSpace(targetRepository)
+            ? SchedulerOffsetStateKey
+            : $"{SchedulerOffsetStateKey}:{targetRepository.Trim().ToLowerInvariant()}";
 
     // In-memory tracking of consecutive failures and cooldown timestamps
     private readonly ConcurrentDictionary<string, int> _failureCounts = new(StringComparer.OrdinalIgnoreCase);
@@ -33,7 +46,7 @@ public class PackageUpdateService : BackgroundService
     private readonly ConcurrentDictionary<string, int> _trackedBlockedIssues = new(StringComparer.OrdinalIgnoreCase);
 
     private static readonly Regex BlockedIssueTitleRegex = new(
-        @"^\[Auto-Update:\s*Blocked\]\s*Repeated CI failures on package\s+(?<pkg>\S+)",
+        @"^\[Auto-Update:\s*Blocked\]\s*(?:Repeated CI failures|Post-merge OBS build failure)\s+on\s+package\s+(?<pkg>\S+)",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public PackageUpdateService(
@@ -46,7 +59,10 @@ public class PackageUpdateService : BackgroundService
         IOptions<PackageUpdateOptions> options,
         IRemoteAssetBackfiller remoteAssetBackfiller,
         ILogger<PackageUpdateService>? logger = null,
-        IBotStateStore? stateStore = null)
+        IBotStateStore? stateStore = null,
+        RuntimeHealthState? healthState = null,
+        IOpenPullRequestInventoryGateway? inventoryGateway = null,
+        IBotIdentityProvider? botIdentity = null)
     {
         _gitHubService = gitHubService;
         _candidateSources = candidateSources;
@@ -58,6 +74,19 @@ public class PackageUpdateService : BackgroundService
         _remoteAssetBackfiller = remoteAssetBackfiller ?? throw new ArgumentNullException(nameof(remoteAssetBackfiller));
         _logger = logger;
         _stateStore = stateStore;
+        _healthState = healthState;
+        _inventoryGateway = inventoryGateway ?? gitHubService as IOpenPullRequestInventoryGateway;
+        _botIdentity = botIdentity ?? gitHubService as IBotIdentityProvider;
+        _schedulerOffsetStateKey = GetSchedulerOffsetStateKey(_options.TargetRepository);
+        _schedulerOriginOffset = LoadSchedulerOffset(stateStore, _schedulerOffsetStateKey);
+    }
+
+    private static int LoadSchedulerOffset(IBotStateStore? stateStore, string cursorKey)
+    {
+        var raw = stateStore?.GetCursorWatermark(cursorKey);
+        return int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) && value >= 0
+            ? value
+            : 0;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -108,11 +137,6 @@ public class PackageUpdateService : BackgroundService
 
         _logger?.LogInformation("Starting PackageUpdateService sweep for {TargetRepo} (DryRun={DryRun})", targetRepo, _options.DryRun);
 
-        if (!_options.DryRun)
-        {
-            await EnsureRequiredLabelsAsync(owner, repo, targetRepo, ct);
-        }
-
         // 1. Quota & Rate Limit Gate
         var rateLimit = await _gitHubService.GetRateLimitSnapshotAsync(ct);
         if (rateLimit.CoreRemaining == null || rateLimit.CoreRemaining < _options.MinRateLimitRemaining)
@@ -127,27 +151,42 @@ public class PackageUpdateService : BackgroundService
         var blockedLoaded = await LoadBlockedPackagesAsync(owner, repo, blockedPackages, ct);
         var activePrCount = await CleanUpStaleFailedPrsAsync(owner, repo, blockedPackages, ct);
 
-        if (!blockedLoaded || activePrCount is null)
+        try
         {
-            _logger?.LogWarning(
-                "Failed to load Auto-Update: Blocked gates or active PR inventory for {TargetRepo}; deferring candidate collection and publishing until next sweep",
-                targetRepo);
-            await RunPostSweepTasksAsync(targetRepo, ct);
-            return;
-        }
+            if (!_options.DryRun && !await EnsureRequiredLabelsAsync(owner, repo, targetRepo, ct))
+            {
+                _logger?.LogWarning(
+                    "Failed to ensure required Auto-Update labels in {TargetRepo}; failing closed and deferring candidate publishing until next sweep",
+                    targetRepo);
+                return;
+            }
 
-        // 3. Collect candidates from all registered sources
-        var candidates = await CollectCandidatesAsync(ct);
-        if (candidates.Count == 0)
+            if (!blockedLoaded || activePrCount is null)
+            {
+                _logger?.LogWarning(
+                    "Failed to load Auto-Update: Blocked gates or active PR inventory for {TargetRepo}; deferring candidate collection and publishing until next sweep",
+                    targetRepo);
+                return;
+            }
+
+            // 3. Collect candidates from all registered sources
+            var candidates = await CollectCandidatesAsync(ct);
+            if (candidates.Count == 0)
+            {
+                _logger?.LogWarning("PackageUpdate sweep discovered 0 candidates across all enabled update sources for {TargetRepo}", targetRepo);
+            }
+
+            // 4. Process candidates respecting gates and sweep limits
+            await ProcessCandidatesAsync(owner, repo, targetRepo, activePrCount.Value, candidates, blockedPackages, ct);
+        }
+        finally
         {
-            _logger?.LogWarning("PackageUpdate sweep discovered 0 candidates across all enabled update sources for {TargetRepo}", targetRepo);
+            // 5. Post-sweep tasks (OBS post-merge check) always run unless sweep is cancelled
+            if (!ct.IsCancellationRequested)
+            {
+                await RunPostSweepTasksAsync(targetRepo, ct);
+            }
         }
-
-        // 4. Process candidates respecting gates and sweep limits
-        await ProcessCandidatesAsync(owner, repo, targetRepo, activePrCount.Value, candidates, blockedPackages, ct);
-
-        // 5. Post-sweep tasks (OBS post-merge check)
-        await RunPostSweepTasksAsync(targetRepo, ct);
     }
 
     private async Task<bool> LoadBlockedPackagesAsync(
@@ -168,7 +207,8 @@ public class PackageUpdateService : BackgroundService
 
             if (blockedIssues == null)
             {
-                return true;
+                _logger?.LogWarning("Blocked issue search returned null for {Owner}/{Repo}; failing closed", owner, repo);
+                return false;
             }
 
             foreach (var issue in blockedIssues)
@@ -199,21 +239,30 @@ public class PackageUpdateService : BackgroundService
         }
     }
 
-    private async Task EnsureRequiredLabelsAsync(string owner, string repo, string targetRepo, CancellationToken ct)
+    private async Task<bool> EnsureRequiredLabelsAsync(string owner, string repo, string targetRepo, CancellationToken ct)
     {
+        var requiredLabels = new (string Name, string Color, string Description)[]
+        {
+            (GitHubLabels.AutoUpdate, "0366d6", "Pull requests automatically created for package updates"),
+            (GitHubLabels.AutoUpdateRust, "dea584", "Pull requests automatically created for Rust crate updates"),
+            (GitHubLabels.AutoUpdateBlocked, "d73a4a", "Package updates blocked due to repeated failures or missing dependencies"),
+            (GitHubLabels.StatusStaleExempt, "ffffff", "Exempt from automatic stale closure")
+        };
+
         try
         {
-            await _gitHubService.EnsureLabelsExistAsync(owner, repo, new[]
+            if (_inventoryGateway != null)
             {
-                (GitHubLabels.AutoUpdate, "0366d6", "Pull requests automatically created for package updates"),
-                (GitHubLabels.AutoUpdateRust, "dea584", "Pull requests automatically created for Rust crate updates"),
-                (GitHubLabels.AutoUpdateBlocked, "d73a4a", "Package updates blocked due to repeated failures or missing dependencies"),
-                (GitHubLabels.StatusStaleExempt, "ffffff", "Exempt from automatic stale closure")
-            }, ct);
+                return await _inventoryGateway.EnsureRequiredLabelsVerifiedAsync(owner, repo, requiredLabels, ct);
+            }
+
+            await _gitHubService.EnsureLabelsExistAsync(owner, repo, requiredLabels, ct);
+            return true;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger?.LogDebug(ex, "Failed to ensure labels in {TargetRepo}", targetRepo);
+            _logger?.LogWarning(ex, "Failed to verify/ensure required Auto-Update labels in {TargetRepo}", targetRepo);
+            return false;
         }
     }
 
@@ -237,7 +286,7 @@ public class PackageUpdateService : BackgroundService
         }
 
         _logger?.LogInformation("Discovered {Count} total candidates across all sources", allCandidates.Count);
-        return allCandidates.OrderByDescending(c => c.IsSecurityAdvisory).ToList();
+        return allCandidates;
     }
 
     private async Task ProcessCandidatesAsync(
@@ -245,49 +294,115 @@ public class PackageUpdateService : BackgroundService
         string repo,
         string targetRepo,
         int activePrCount,
-        IReadOnlyList<UpdateCandidate> prioritizedCandidates,
+        IReadOnlyList<UpdateCandidate> discoveredCandidates,
         IReadOnlySet<string> blockedPackages,
         CancellationToken ct)
     {
         const int SecurityAdvisoryConcurrencyAllowance = 5;
-        int publishedThisSweep = 0;
 
-        foreach (var candidate in prioritizedCandidates)
+        var scheduleResult = await CandidateScheduler.ScheduleAndExecuteAsync(
+            candidates: discoveredCandidates,
+            maxPublishes: _options.MaxCandidatesPerSweep,
+            startOriginOffset: _schedulerOriginOffset,
+            canAttempt: (candidate, publishedSoFar) =>
+            {
+                int maxAllowed = candidate.IsSecurityAdvisory
+                    ? _options.MaxConcurrentPullRequests + SecurityAdvisoryConcurrencyAllowance
+                    : _options.MaxConcurrentPullRequests;
+                if (activePrCount + publishedSoFar >= maxAllowed)
+                {
+                    _logger?.LogInformation(
+                        "Reached concurrency limit ({MaxAllowed}) with active={Active}, published={Published} for tier IsSecurity={IsSecurity}; stopping tier",
+                        maxAllowed, activePrCount, publishedSoFar, candidate.IsSecurityAdvisory);
+                    return false;
+                }
+                return true;
+            },
+            tryPublishAsync: (candidate, token) =>
+                ProcessSingleCandidateAsync(owner, repo, targetRepo, candidate, blockedPackages, token),
+            onPublishedAsync: _options.RequestThrottleMilliseconds > 0
+                ? (_, token) => Task.Delay(_options.RequestThrottleMilliseconds, token)
+                : null,
+            onCandidateError: (candidate, ex) =>
+                _logger?.LogError(ex, "Failed to process update candidate {Package} ({Origin}); continuing sweep",
+                    candidate.PackageName, candidate.Origin),
+            ct: ct);
+
+        if (scheduleResult.TotalPublished >= _options.MaxCandidatesPerSweep &&
+            discoveredCandidates.Count > scheduleResult.TotalPublished)
         {
-            if (ct.IsCancellationRequested)
-                break;
+            _logger?.LogInformation(
+                "Reached MaxCandidatesPerSweep limit ({Max}); remaining candidates deferred to next sweep",
+                _options.MaxCandidatesPerSweep);
+        }
 
-            if (publishedThisSweep >= _options.MaxCandidatesPerSweep)
+        if (_options.DryRun)
+        {
+            _logger?.LogInformation("[DryRun] Skipping persisted scheduler offset and candidate sweep cursor commits");
+        }
+        else
+        {
+            _schedulerOriginOffset = scheduleResult.NextOriginOffset;
+            _stateStore?.SetCursorWatermark(
+                _schedulerOffsetStateKey,
+                scheduleResult.NextOriginOffset.ToString(CultureInfo.InvariantCulture));
+
+            // Sources that scan a bounded slice (Rust crates) must not advance past candidates
+            // that the scheduler could not attempt because the sweep quota was exhausted.
+            foreach (var source in _candidateSources)
             {
-                _logger?.LogInformation("Reached MaxCandidatesPerSweep ({Max}) for this sweep", _options.MaxCandidatesPerSweep);
-                break;
-            }
-
-            int maxAllowed = candidate.IsSecurityAdvisory
-                ? _options.MaxConcurrentPullRequests + SecurityAdvisoryConcurrencyAllowance
-                : _options.MaxConcurrentPullRequests;
-
-            if (activePrCount + publishedThisSweep >= maxAllowed)
-            {
-                if (candidate.IsSecurityAdvisory)
+                if (source is ICandidateSweepCursor cursor)
                 {
-                    _logger?.LogInformation("Reached security advisory concurrency limit ({Max}); stopping sweep", maxAllowed);
-                    break;
+                    try
+                    {
+                        cursor.CompleteSweep(scheduleResult.ProcessedPackageNames);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _logger?.LogWarning(ex, "Failed to commit sweep cursor for source {Source}", source.SourceName);
+                    }
+                }
+            }
+        }
+
+        var reportedSourceNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (origin, stats) in scheduleResult.ByOrigin.OrderBy(kv => (int)kv.Key))
+        {
+            _logger?.LogInformation(
+                "PackageUpdate source summary [{Origin}]: discovered={Discovered}, attempted={Attempted}, published={Published}, skipped={Skipped}, failed={Failed}, oldestPublishedAt={OldestPublishedAt}",
+                origin,
+                stats.Discovered,
+                stats.Attempted,
+                stats.Published,
+                stats.Skipped,
+                stats.Failed,
+                stats.OldestPublishedAt?.ToString("O") ?? "n/a");
+
+            var sourceName = origin switch
+            {
+                CandidateOrigin.Lookout => "Lookout",
+                CandidateOrigin.RustCrate => "RustCrates",
+                _ => origin.ToString()
+            };
+            reportedSourceNames.Add(sourceName);
+            _healthState?.RecordSourceSweepStats(sourceName, stats.Published, stats.Skipped, stats.OldestPublishedAt);
+        }
+
+        if (_healthState != null)
+        {
+            var currentHealth = _healthState.GetSourceHealth();
+            foreach (var source in _candidateSources)
+            {
+                if (reportedSourceNames.Contains(source.SourceName))
+                    continue;
+
+                if (currentHealth.TryGetValue(source.SourceName, out var snap) &&
+                    string.Equals(snap.Status, "disabled", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
                 }
 
-                _logger?.LogDebug("Active PRs ({Active}) reached MaxConcurrentPullRequests ({Max}); skipping routine candidate {Package}",
-                    activePrCount + publishedThisSweep, _options.MaxConcurrentPullRequests, candidate.PackageName);
-                continue;
-            }
-
-            var published = await ProcessSingleCandidateAsync(owner, repo, targetRepo, candidate, blockedPackages, ct);
-            if (published)
-            {
-                publishedThisSweep++;
-                if (_options.RequestThrottleMilliseconds > 0)
-                {
-                    await Task.Delay(_options.RequestThrottleMilliseconds, ct);
-                }
+                _healthState.RecordSourceSweepStats(source.SourceName, 0, 0, null);
             }
         }
     }
@@ -345,77 +460,82 @@ public class PackageUpdateService : BackgroundService
             return false;
         }
 
+        // F4: prefer authoritative current version parsed from main branch SPEC over potentially stale source metadata
+        var effectiveCandidate = UpdateAdmission.TryExtractCurrentVersion(specContent, out var specCurrentVersion)
+            ? candidate with { CurrentVersion = specCurrentVersion }
+            : candidate;
+
         // Pre-gate: skip packages blocked by an open Auto-Update: Blocked tracking issue or PR
-        if (blockedPackages.Contains(candidate.PackageName))
+        if (blockedPackages.Contains(effectiveCandidate.PackageName))
         {
             _logger?.LogInformation("Skipping {Package} because an open issue or PR carries '{BlockedLabel}'",
-                candidate.PackageName, GitHubLabels.AutoUpdateBlocked);
+                effectiveCandidate.PackageName, GitHubLabels.AutoUpdateBlocked);
             return false;
         }
 
         // C. Check repeated CI failure cooldown and closed-loop issue reset
-        if (IsInCooldown(candidate.PackageName))
+        if (IsInCooldown(effectiveCandidate.PackageName))
         {
             bool issueWasClosed = false;
-            if (_trackedBlockedIssues.TryGetValue(candidate.PackageName, out var issueNum))
+            if (_trackedBlockedIssues.TryGetValue(effectiveCandidate.PackageName, out var issueNum))
             {
                 try
                 {
                     var issue = await _gitHubService.GetIssueAsync(owner, repo, issueNum, ct);
                     if (issue != null && issue.State.Value == Octokit.ItemState.Closed)
                     {
-                        _logger?.LogInformation("Tracking issue #{IssueNum} for package {Package} was closed; resetting cooldown", issueNum, candidate.PackageName);
-                        ResetCooldown(candidate.PackageName);
-                        _trackedBlockedIssues.TryRemove(candidate.PackageName, out _);
+                        _logger?.LogInformation("Tracking issue #{IssueNum} for package {Package} was closed; resetting cooldown", issueNum, effectiveCandidate.PackageName);
+                        ResetCooldown(effectiveCandidate.PackageName);
+                        _trackedBlockedIssues.TryRemove(effectiveCandidate.PackageName, out _);
                         issueWasClosed = true;
                     }
                     else
                     {
-                        _logger?.LogDebug("Package {Package} remains blocked by open issue #{IssueNum}; skipping", candidate.PackageName, issueNum);
+                        _logger?.LogDebug("Package {Package} remains blocked by open issue #{IssueNum}; skipping", effectiveCandidate.PackageName, issueNum);
                         return false;
                     }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    _logger?.LogDebug(ex, "Failed to query tracking issue #{IssueNum} for {Package}; maintaining cooldown", issueNum, candidate.PackageName);
+                    _logger?.LogDebug(ex, "Failed to query tracking issue #{IssueNum} for {Package}; maintaining cooldown", issueNum, effectiveCandidate.PackageName);
                     return false;
                 }
             }
 
-            if (!issueWasClosed && IsInCooldown(candidate.PackageName))
+            if (!issueWasClosed && IsInCooldown(effectiveCandidate.PackageName))
             {
-                _logger?.LogDebug("Package {Package} is in failure cooldown; skipping", candidate.PackageName);
+                _logger?.LogDebug("Package {Package} is in failure cooldown; skipping", effectiveCandidate.PackageName);
                 return false;
             }
         }
 
         // D. Check runtime @bot ignore and #!NoAutoUpdate directive
-        var runtimeIgnore = _stateStore?.GetIgnoredPackage(owner, repo, candidate.PackageName);
+        var runtimeIgnore = _stateStore?.GetIgnoredPackage(owner, repo, effectiveCandidate.PackageName);
         if (runtimeIgnore != null)
         {
             _logger?.LogInformation("Skipping {Package} because it is ignored at runtime by @{IgnoredBy}: {Reason}",
-                candidate.PackageName, runtimeIgnore.IgnoredBy, runtimeIgnore.Reason ?? "no reason specified");
+                effectiveCandidate.PackageName, runtimeIgnore.IgnoredBy, runtimeIgnore.Reason ?? "no reason specified");
             return false;
         }
 
         if (NoAutoUpdateMarker.HasNoAutoUpdate(specContent, out var optOutReason))
         {
-            _logger?.LogInformation("Skipping {Package} due to in-spec opt-out: {Reason}", candidate.PackageName, optOutReason);
+            _logger?.LogInformation("Skipping {Package} due to in-spec opt-out: {Reason}", effectiveCandidate.PackageName, optOutReason);
             return false;
         }
 
         // Check SkipPackagesWithPatches option
         if (_options.SkipPackagesWithPatches && Regex.IsMatch(specContent, @"^Patch\d*:", RegexOptions.Multiline | RegexOptions.IgnoreCase))
         {
-            _logger?.LogInformation("Skipping {Package} because it contains downstream Patch directives and SkipPackagesWithPatches=true", candidate.PackageName);
+            _logger?.LogInformation("Skipping {Package} because it contains downstream Patch directives and SkipPackagesWithPatches=true", effectiveCandidate.PackageName);
             return false;
         }
 
-        // Check AllowCrossMajorVersion option
-        if (!_options.AllowCrossMajorVersion && UpdateAdmission.IsCrossMajorVersion(candidate.CurrentVersion, candidate.TargetVersion))
+        // Check AllowCrossMajorVersion option using authoritative SPEC version
+        if (!_options.AllowCrossMajorVersion && UpdateAdmission.IsCrossMajorVersion(effectiveCandidate.CurrentVersion, effectiveCandidate.TargetVersion))
         {
             _logger?.LogInformation("Skipping {Package} because {Current} -> {Target} crosses major version boundary and AllowCrossMajorVersion=false",
-                candidate.PackageName, candidate.CurrentVersion, candidate.TargetVersion);
+                effectiveCandidate.PackageName, effectiveCandidate.CurrentVersion, effectiveCandidate.TargetVersion);
             return false;
         }
 
@@ -423,19 +543,19 @@ public class PackageUpdateService : BackgroundService
         var rewriter = _specRewriters.FirstOrDefault(r => r.CanHandle(specContext));
         if (rewriter == null)
         {
-            _logger?.LogDebug("No compatible rewriter found for {Package}", candidate.PackageName);
+            _logger?.LogDebug("No compatible rewriter found for {Package}", effectiveCandidate.PackageName);
             return false;
         }
 
-        var rewriteResult = rewriter.Rewrite(specContext, candidate.TargetVersion);
+        var rewriteResult = rewriter.Rewrite(specContext, effectiveCandidate.TargetVersion);
         if (!rewriteResult.Success || !rewriteResult.HasChanged)
         {
-            _logger?.LogDebug("Rewrite failed or produced no change for {Package}: {Error}", candidate.PackageName, rewriteResult.ErrorMessage);
+            _logger?.LogDebug("Rewrite failed or produced no change for {Package}: {Error}", effectiveCandidate.PackageName, rewriteResult.ErrorMessage);
             return false;
         }
 
-        // F. Publish PR with authoritative spec path from SpecContext
-        var publishResult = await _publisher.PublishUpdateAsync(candidate, rewriteResult, targetRepo, "main", specContext.RelativePath, ct);
+        // F. Publish PR with authoritative spec path and current version
+        var publishResult = await _publisher.PublishUpdateAsync(effectiveCandidate, rewriteResult, targetRepo, "main", specContext.RelativePath, ct);
         if (publishResult.Success && !publishResult.Skipped)
         {
             _logger?.LogInformation("Successfully published update for {Package} -> {Version} (PR #{PrNumber})",
@@ -457,28 +577,97 @@ public class PackageUpdateService : BackgroundService
         HashSet<string> blockedPackages,
         CancellationToken ct)
     {
-        // Counts active bot PRs and cleans up inactive failed PRs past TTL
-        int activeCount = 0;
+        // Counts active bot PRs (with bounded failed-PR slot cap) and cleans up inactive failed PRs past TTL
+        int healthyActiveCount = 0;
+        int failedActiveCount = 0;
         try
         {
-            // Search all open auto-update PRs by label instead of hardcoded author login to support GitHub App bots seamlessly
-            var openPrs = await _gitHubService.SearchStaleCandidatesAsync(
+            var branchPrefix = !string.IsNullOrEmpty(_options.BranchPrefix) ? _options.BranchPrefix : "autoupdate/";
+
+            // 1. Search open auto-update PRs by baseline label
+            var labelPrs = await _gitHubService.SearchStaleCandidatesAsync(
                 owner, repo, DateTimeOffset.UtcNow, isPr: true, labelFilter: $"label:\"{GitHubLabels.AutoUpdate}\" is:pr is:open", ct: ct);
 
-            if (openPrs == null)
+            if (labelPrs == null)
             {
-                return 0;
+                _logger?.LogWarning("Open bot PR search returned null for {Owner}/{Repo}; failing closed", owner, repo);
+                return null;
             }
 
-            foreach (var pr in openPrs)
+            // 2. Supplement inventory with REST branch-prefix enumeration so unlabeled bot PRs cannot leak slots
+            IReadOnlyList<Octokit.PullRequest> prefixPrs = Array.Empty<Octokit.PullRequest>();
+            if (_inventoryGateway != null)
+            {
+                try
+                {
+                    prefixPrs = await _inventoryGateway.ListOpenPullRequestsByHeadPrefixAsync(owner, repo, branchPrefix, ct)
+                                ?? Array.Empty<Octokit.PullRequest>();
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger?.LogWarning(ex, "Branch-prefix open PR inventory query failed for {Owner}/{Repo}; failing closed", owner, repo);
+                    return null;
+                }
+            }
+
+            var labelPrMap = new Dictionary<int, Octokit.Issue>();
+            var prefixPrMap = new Dictionary<int, Octokit.PullRequest>();
+            var orderedPrNumbers = new List<int>();
+            var seenPrNumbers = new HashSet<int>();
+
+            foreach (var issue in labelPrs)
+            {
+                if (issue != null && seenPrNumbers.Add(issue.Number))
+                {
+                    labelPrMap[issue.Number] = issue;
+                    orderedPrNumbers.Add(issue.Number);
+                }
+            }
+
+            foreach (var pr in prefixPrs)
+            {
+                if (pr != null)
+                {
+                    prefixPrMap[pr.Number] = pr;
+                    if (seenPrNumbers.Add(pr.Number))
+                    {
+                        orderedPrNumbers.Add(pr.Number);
+                    }
+                }
+            }
+
+            IReadOnlySet<string> ownBotLogins = orderedPrNumbers.Count > 0
+                ? await ResolveOwnBotLoginsAsync(ct)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var prNumber in orderedPrNumbers)
             {
                 if (ct.IsCancellationRequested)
                     break;
 
                 // Check PR branch workflow runs
-                var fullPr = await _gitHubService.GetPullRequestAsync(owner, repo, pr.Number, ct);
-                var branchName = fullPr?.Head?.Ref;
-                var headSha = fullPr?.Head?.Sha;
+                var fullPr = await _gitHubService.GetPullRequestAsync(owner, repo, prNumber, ct);
+                prefixPrMap.TryGetValue(prNumber, out var fallbackPr);
+                labelPrMap.TryGetValue(prNumber, out var labelIssue);
+
+                var branchName = fullPr?.Head?.Ref ?? fallbackPr?.Head?.Ref;
+                var prAuthor = fullPr?.User?.Login ?? fallbackPr?.User?.Login ?? labelIssue?.User?.Login;
+
+                // Do not self-heal labels, count slots, record failure cooldowns, or close human PRs that merely share the branch prefix.
+                if (labelIssue == null && !BotCommitOwnership.IsOwnBotLogin(prAuthor, ownBotLogins))
+                {
+                    _logger?.LogDebug(
+                        "Ignoring non-bot open PR #{PrNumber} on branch {Branch} (author={Author})",
+                        prNumber, branchName, prAuthor ?? "unknown");
+                    continue;
+                }
+
+                var headSha = fullPr?.Head?.Sha ?? fallbackPr?.Head?.Sha;
+                var prUpdatedAt = fullPr?.UpdatedAt ?? fallbackPr?.UpdatedAt ?? labelIssue?.UpdatedAt;
+                var knownLabels = (fullPr?.Labels is { Count: > 0 } ? fullPr.Labels : null)
+                                  ?? (fallbackPr?.Labels is { Count: > 0 } ? fallbackPr.Labels : null)
+                                  ?? labelIssue?.Labels;
+
                 var runs = !string.IsNullOrWhiteSpace(branchName)
                     ? await _gitHubService.ListWorkflowRunsAsync(owner, repo, branchName, ct)
                     : Array.Empty<Octokit.WorkflowRun>();
@@ -494,16 +683,23 @@ public class PackageUpdateService : BackgroundService
                 // Backfill updated #!RemoteAsset checksums when remoteasset workflow fails
                 if (isRemoteAssetFailed && !string.IsNullOrWhiteSpace(branchName) && remoteAssetRun != null && !_options.DryRun)
                 {
-                    await _remoteAssetBackfiller.TryBackfillAsync(owner, repo, branchName, pr.Number, remoteAssetRun.Id, ct);
+                    await _remoteAssetBackfiller.TryBackfillAsync(owner, repo, branchName, prNumber, remoteAssetRun.Id, ct);
                 }
 
                 // Wire failure detection into cooldown tracking
-                var branchPackageName = branchName != null && branchName.StartsWith(_options.BranchPrefix ?? "autoupdate/", StringComparison.OrdinalIgnoreCase)
-                    ? branchName.Substring((_options.BranchPrefix ?? "autoupdate/").Length)
+                var branchPackageName = branchName != null && branchName.StartsWith(branchPrefix, StringComparison.OrdinalIgnoreCase)
+                    ? branchName.Substring(branchPrefix.Length)
                     : null;
 
-                var hasBlockedLabel = (pr.Labels != null && pr.Labels.Any(l => string.Equals(l.Name, GitHubLabels.AutoUpdateBlocked, StringComparison.OrdinalIgnoreCase))) ||
-                                      (fullPr?.Labels != null && fullPr.Labels.Any(l => string.Equals(l.Name, GitHubLabels.AutoUpdateBlocked, StringComparison.OrdinalIgnoreCase)));
+                // Item B self-heal: restore missing Auto-Update / Status: stale-exempt labels on bot PRs found by prefix fallback or partial labeling
+                if (!_options.DryRun && (labelIssue == null && fallbackPr != null || (knownLabels != null && knownLabels.Count > 0)))
+                {
+                    await SelfHealMissingBotPrLabelsAsync(owner, repo, prNumber, branchPackageName, knownLabels, labelIssue == null, ct);
+                }
+
+                var hasBlockedLabel = (labelIssue?.Labels != null && labelIssue.Labels.Any(l => string.Equals(l.Name, GitHubLabels.AutoUpdateBlocked, StringComparison.OrdinalIgnoreCase))) ||
+                                      (fullPr?.Labels != null && fullPr.Labels.Any(l => string.Equals(l.Name, GitHubLabels.AutoUpdateBlocked, StringComparison.OrdinalIgnoreCase))) ||
+                                      (fallbackPr?.Labels != null && fallbackPr.Labels.Any(l => string.Equals(l.Name, GitHubLabels.AutoUpdateBlocked, StringComparison.OrdinalIgnoreCase)));
                 if (hasBlockedLabel && !string.IsNullOrEmpty(branchPackageName))
                 {
                     blockedPackages.Add(branchPackageName);
@@ -511,26 +707,34 @@ public class PackageUpdateService : BackgroundService
 
                 if (isFailed && !string.IsNullOrEmpty(branchPackageName))
                 {
-                    await CheckAndRecordFailureAsync(owner, repo, branchPackageName, pr.Number, ct);
+                    await CheckAndRecordFailureAsync(owner, repo, branchPackageName, prNumber, ct);
                 }
 
-                var isInactiveFailed = isFailed && pr.UpdatedAt.HasValue &&
-                                       pr.UpdatedAt.Value < DateTimeOffset.UtcNow.AddDays(-_options.FailedPrTtlDays);
+                var isInactiveFailed = isFailed && prUpdatedAt.HasValue &&
+                                       prUpdatedAt.Value < DateTimeOffset.UtcNow.AddDays(-_options.FailedPrTtlDays);
 
                 if (isInactiveFailed)
                 {
-                    _logger?.LogInformation("Closing inactive failed bot PR #{Number} (Branch: {Branch}) to free concurrency slot", pr.Number, branchName);
+                    var headRepoFullName = fullPr?.Head?.Repository?.FullName ?? fallbackPr?.Head?.Repository?.FullName;
+                    var isSameRepo = headRepoFullName != null && string.Equals(headRepoFullName, $"{owner}/{repo}", StringComparison.OrdinalIgnoreCase);
+                    var hasExpectedPrefix = !string.IsNullOrWhiteSpace(branchName) && branchName.StartsWith(branchPrefix, StringComparison.Ordinal);
+
                     if (!_options.DryRun)
                     {
-                        var closeMsg = $"Automated pull request has been failing CI and inactive for over {_options.FailedPrTtlDays} days. Closing to reclaim concurrency slot.";
-                        await _gitHubService.CreateCommentAsync(owner, repo, pr.Number, closeMsg, ct);
-                        await _gitHubService.CloseIssueAsync(owner, repo, pr.Number, ct);
+                        var canAutoClose = await CanAutoCloseFailedPrAsync(owner, repo, branchName, prAuthor, isSameRepo, ownBotLogins, ct);
+                        if (!canAutoClose)
+                        {
+                            _logger?.LogWarning(
+                                "Skipping TTL auto-close for failed PR #{Number} (Branch: {Branch}) because ownership verification failed or human commits were detected",
+                                prNumber, branchName);
+                            failedActiveCount++;
+                            continue;
+                        }
 
-                        // Delete remote branch if exists, belongs to target repository, and matches branch prefix
-                        var headRepoFullName = fullPr?.Head?.Repository?.FullName;
-                        var isSameRepo = headRepoFullName != null && string.Equals(headRepoFullName, $"{owner}/{repo}", StringComparison.OrdinalIgnoreCase);
-                        var prefix = !string.IsNullOrEmpty(_options.BranchPrefix) ? _options.BranchPrefix : "autoupdate/";
-                        var hasExpectedPrefix = !string.IsNullOrWhiteSpace(branchName) && branchName.StartsWith(prefix, StringComparison.Ordinal);
+                        _logger?.LogInformation("Closing inactive failed bot PR #{Number} (Branch: {Branch}) to free concurrency slot", prNumber, branchName);
+                        var closeMsg = $"Automated pull request has been failing CI and inactive for over {_options.FailedPrTtlDays} days. Closing to reclaim concurrency slot.";
+                        await _gitHubService.CreateCommentAsync(owner, repo, prNumber, closeMsg, ct);
+                        await _gitHubService.CloseIssueAsync(owner, repo, prNumber, ct);
 
                         if (isSameRepo && hasExpectedPrefix && !string.IsNullOrWhiteSpace(branchName))
                         {
@@ -544,10 +748,18 @@ public class PackageUpdateService : BackgroundService
                             }
                         }
                     }
+                    else
+                    {
+                        _logger?.LogInformation("Closing inactive failed bot PR #{Number} (Branch: {Branch}) to free concurrency slot", prNumber, branchName);
+                    }
+                }
+                else if (isFailed)
+                {
+                    failedActiveCount++;
                 }
                 else
                 {
-                    activeCount++;
+                    healthyActiveCount++;
                 }
             }
         }
@@ -557,7 +769,101 @@ public class PackageUpdateService : BackgroundService
             return null;
         }
 
-        return activeCount;
+        var maxConcurrent = Math.Max(1, _options.MaxConcurrentPullRequests);
+        var totalOpen = healthyActiveCount + failedActiveCount;
+        var hardCap = maxConcurrent * 2;
+        if (totalOpen >= hardCap)
+        {
+            return totalOpen;
+        }
+
+        var cappedFailedSlots = Math.Min(failedActiveCount, Math.Max(0, maxConcurrent - 1));
+        return healthyActiveCount + cappedFailedSlots;
+    }
+
+    private async Task<IReadOnlySet<string>> ResolveOwnBotLoginsAsync(CancellationToken ct)
+    {
+        string? liveBotLogin = null;
+        if (_botIdentity != null)
+        {
+            try
+            {
+                liveBotLogin = await _botIdentity.GetBotLoginAsync(ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger?.LogDebug(ex, "Could not resolve live bot login during open PR ownership check");
+            }
+        }
+
+        return BotCommitOwnership.BuildOwnBotLoginSet(liveBotLogin, _options.BotLogin);
+    }
+
+    private async Task<bool> CanAutoCloseFailedPrAsync(
+        string owner,
+        string repo,
+        string? branchName,
+        string? prAuthor,
+        bool isSameRepo,
+        IReadOnlySet<string> ownBotLogins,
+        CancellationToken ct)
+    {
+        if (isSameRepo && !string.IsNullOrWhiteSpace(branchName))
+        {
+            try
+            {
+                var latestCommit = await _gitHubService.GetBranchLatestCommitAsync(owner, repo, branchName, ct);
+                return BotCommitOwnership.IsOwnBotCommit(latestCommit, ownBotLogins);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger?.LogDebug(ex, "Failed to verify branch commit ownership for {Branch}; skipping TTL close fail-closed", branchName);
+                return false;
+            }
+        }
+
+        return BotCommitOwnership.IsOwnBotLogin(prAuthor, ownBotLogins);
+    }
+
+    private async Task SelfHealMissingBotPrLabelsAsync(
+        string owner,
+        string repo,
+        int prNumber,
+        string? branchPackageName,
+        IReadOnlyList<Octokit.Label>? currentLabels,
+        bool discoveredViaPrefixFallback,
+        CancellationToken ct)
+    {
+        var existing = new HashSet<string>(
+            (currentLabels ?? Array.Empty<Octokit.Label>()).Where(l => !string.IsNullOrWhiteSpace(l.Name)).Select(l => l.Name),
+            StringComparer.OrdinalIgnoreCase);
+
+        var expected = new List<string> { GitHubLabels.AutoUpdate, GitHubLabels.StatusStaleExempt };
+        if (!string.IsNullOrWhiteSpace(branchPackageName) &&
+            branchPackageName.StartsWith("rust-", StringComparison.OrdinalIgnoreCase))
+        {
+            expected.Add(GitHubLabels.AutoUpdateRust);
+        }
+
+        var missing = discoveredViaPrefixFallback && existing.Count == 0
+            ? expected.ToArray()
+            : expected.Where(l => !existing.Contains(l)).ToArray();
+
+        if (missing.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await _gitHubService.AddLabelsAsync(owner, repo, prNumber, missing, ct);
+            _logger?.LogInformation("Self-healed missing Auto-Update labels ({Labels}) on open PR #{PrNumber}",
+                string.Join(", ", missing), prNumber);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogWarning(ex, "Failed to self-heal missing Auto-Update labels on PR #{PrNumber}", prNumber);
+        }
     }
 
     private async Task RunPostSweepTasksAsync(string targetRepo, CancellationToken ct)
@@ -624,9 +930,28 @@ public class PackageUpdateService : BackgroundService
             return false;
 
         var (owner, repo) = ParseTargetRepository();
-        var initialCount = owner != null && repo != null
-            ? (_stateStore?.GetPackageFailure(owner, repo, packageName)?.ConsecutiveFailures ?? 0)
-            : 0;
+        var cooldownDays = _options.GiveUpIssueCooldownDays > 0 ? _options.GiveUpIssueCooldownDays : 30;
+        var decayWindow = TimeSpan.FromDays(cooldownDays);
+        var persisted = owner != null && repo != null
+            ? _stateStore?.GetPackageFailure(owner, repo, packageName)
+            : null;
+
+        int initialCount = 0;
+        if (persisted != null)
+        {
+            if (persisted.LastFailureAt.HasValue && DateTimeOffset.UtcNow - persisted.LastFailureAt.Value > decayWindow)
+            {
+                _failureCounts.TryRemove(packageName, out _);
+                _stateStore?.ClearPackageFailure(owner!, repo!, packageName);
+                _logger?.LogInformation("Decayed stale CI failure count for package {Package} (last failure was >{Days} days ago)",
+                    packageName, cooldownDays);
+            }
+            else
+            {
+                initialCount = persisted.ConsecutiveFailures;
+            }
+        }
+
         var count = _failureCounts.AddOrUpdate(
             packageName,
             _ => initialCount + 1,
@@ -635,7 +960,6 @@ public class PackageUpdateService : BackgroundService
 
         if (count >= _options.MaxConsecutiveFailures)
         {
-            var cooldownDays = _options.GiveUpIssueCooldownDays > 0 ? _options.GiveUpIssueCooldownDays : 30;
             var cooldownUntil = DateTimeOffset.UtcNow.AddHours(cooldownDays * 24);
             _cooldowns[packageName] = cooldownUntil;
             _failureCounts.TryRemove(packageName, out _);
@@ -667,6 +991,12 @@ public class PackageUpdateService : BackgroundService
 
     private async Task CheckAndRecordFailureAsync(string owner, string repo, string packageName, int prNumber, CancellationToken ct)
     {
+        if (_options.DryRun)
+        {
+            _logger?.LogInformation("[DryRun] Would record CI failure for package {Package} (PR #{PrNumber})", packageName, prNumber);
+            return;
+        }
+
         // Primary path persists deduplication in bot-state.json across restarts; in-memory set is only for unit tests with stateStore == null.
         var isNewFailure = _stateStore != null
             ? _stateStore.TryMarkFailedPrRecorded(owner, repo, prNumber)

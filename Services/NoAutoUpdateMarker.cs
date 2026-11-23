@@ -9,7 +9,7 @@ namespace abaci_bot.Services;
 public static class NoAutoUpdateMarker
 {
     private static readonly Regex MarkerRegex = new(
-        @"^#!\s*NoAutoUpdate[^\S\r\n]*:[^\S\r\n]*(?<reason>[^\r\n]*)",
+        @"^#![^\S\r\n]*NoAutoUpdate[^\S\r\n]*:[^\S\r\n]*(?<reason>[^\r\n]*)",
         RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Multiline);
 
     /// <summary>
