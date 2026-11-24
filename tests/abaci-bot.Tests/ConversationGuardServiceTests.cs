@@ -51,7 +51,10 @@ public class ConversationGuardServiceTests
             existingLabels: Array.Empty<string>());
     }
 
-    private ConversationGuardService CreateService(ConversationGuardOptions? opts = null, TimeProvider? timeProvider = null)
+    private ConversationGuardService CreateService(
+        ConversationGuardOptions? opts = null,
+        TimeProvider? timeProvider = null,
+        IEphemeralCommentGateway? commentGateway = null)
     {
         var options = Microsoft.Extensions.Options.Options.Create(opts ?? new ConversationGuardOptions { Enabled = true, DryRun = false });
         return new ConversationGuardService(
@@ -60,7 +63,8 @@ public class ConversationGuardServiceTests
             options,
             NullLogger<ConversationGuardService>.Instance,
             timeProvider,
-            botIdentity: _botIdentity);
+            botIdentity: _botIdentity,
+            commentGateway: commentGateway);
     }
 
     [Fact]
@@ -790,7 +794,147 @@ public class ConversationGuardServiceTests
             "owner",
             "repo",
             42,
-            Arg.Is<string>(s => s.Contains("lacks GitHub archive permission") && s.Contains("Administration: Read & write")),
+            Arg.Is<string>(s =>
+                s.Contains("lacks GitHub archive permission") &&
+                s.Contains("triage+ user PAT") &&
+                !s.Contains("Administration: Read & write")),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_OnLockedConversation_WhenReplyReturnsForbidden_DoesNotThrowAcrossCommands()
+    {
+        var service = CreateService(new ConversationGuardOptions { Enabled = true, DryRun = false, ArchiveEnabled = false });
+        var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Write);
+        var forbiddenEx = new ForbiddenException(Substitute.For<IResponse>());
+
+        _gitHub.GetIssueCommentsAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { CreateIssueComment(1L, "n1", "other-user") });
+        _gitHub.CreateCommentAsync("owner", "repo", 42, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw forbiddenEx);
+
+        Assert.Null(await Record.ExceptionAsync(() => service.HandleCommandAsync(context, "@abaci-bot hide @nobody", "maintainer-user")));
+        Assert.Null(await Record.ExceptionAsync(() => service.HandleCommandAsync(context, "@abaci-bot hide", "maintainer-user")));
+
+        _permissionService.GetUserPermissionAsync("owner", "repo", "other-maintainer", Arg.Any<CancellationToken>())
+            .Returns(RepositoryAccessLevel.Maintain);
+        Assert.Null(await Record.ExceptionAsync(() => service.HandleCommandAsync(context, "@abaci-bot hide @other-maintainer", "maintainer-user")));
+
+        _gitHub.IsIssueLockedAsync("owner", "repo", 42, Arg.Any<CancellationToken>()).Returns(false);
+        Assert.Null(await Record.ExceptionAsync(() => service.HandleCommandAsync(context, "@abaci-bot unlock", "maintainer-user")));
+
+        Assert.Null(await Record.ExceptionAsync(() => service.HandleCommandAsync(context, "@abaci-bot archive", "maintainer-user")));
+
+        var enabledArchiveService = CreateService(new ConversationGuardOptions { Enabled = true, DryRun = false, ArchiveEnabled = true });
+        Assert.Null(await Record.ExceptionAsync(() => enabledArchiveService.HandleCommandAsync(context, "@abaci-bot archive", "maintainer-user")));
+        await _gitHub.DidNotReceiveWithAnyArgs().ArchivePullRequestAsync(default!, default!, default, default, default);
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_Hide_BotSuffixFallback_IsOneWayExactFirstAndPreservesMaintainerGuard()
+    {
+        var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Write);
+
+        // 1. Bare app slug without '[bot]' falls back one-way to '<user>[bot]' when zero exact matches exist
+        var service1 = CreateService();
+        var botComment = CreateIssueComment(501L, "node_bot", "abaci-bot-test[bot]");
+        _gitHub.GetIssueCommentsAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { botComment });
+        _gitHub.MinimizeCommentAsync("owner", "repo", 501L, "node_bot", "SPAM", Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        await service1.HandleCommandAsync(context, "@abaci-bot hide @abaci-bot-test", "maintainer-user");
+
+        await _gitHub.Received(1).MinimizeCommentAsync("owner", "repo", 501L, "node_bot", "SPAM", Arg.Any<CancellationToken>());
+        await _gitHub.Received(1).CreateCommentAsync(
+            "owner", "repo", 42,
+            Arg.Is<string>(s => s.Contains("1 comment(s) authored by @abaci-bot-test[bot]")),
+            Arg.Any<CancellationToken>());
+
+        // 2. When BOTH human '@foo' and '@foo[bot]' exist, 'hide @foo' matches exact '@foo' ONLY
+        _gitHub.ClearReceivedCalls();
+        var humanComment = CreateIssueComment(601L, "node_human", "foo");
+        var fooBotComment = CreateIssueComment(602L, "node_foobot", "foo[bot]");
+        _gitHub.GetIssueCommentsAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { humanComment, fooBotComment });
+        _gitHub.MinimizeCommentAsync("owner", "repo", Arg.Any<long>(), Arg.Any<string>(), "SPAM", Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        await service1.HandleCommandAsync(context, "@abaci-bot hide @foo", "maintainer-user");
+
+        await _gitHub.Received(1).MinimizeCommentAsync("owner", "repo", 601L, "node_human", "SPAM", Arg.Any<CancellationToken>());
+        await _gitHub.DidNotReceive().MinimizeCommentAsync("owner", "repo", 602L, Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+
+        // 3. Explicit '[bot]' target never strips '[bot]' to match human maintainer '@alice'
+        _gitHub.ClearReceivedCalls();
+        var aliceComment = CreateIssueComment(701L, "node_alice", "alice");
+        _permissionService.GetUserPermissionAsync("owner", "repo", "alice", Arg.Any<CancellationToken>())
+            .Returns(RepositoryAccessLevel.Maintain);
+        _permissionService.GetUserPermissionAsync("owner", "repo", "alice[bot]", Arg.Any<CancellationToken>())
+            .Returns(RepositoryAccessLevel.None);
+        _gitHub.GetIssueCommentsAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { aliceComment });
+
+        await service1.HandleCommandAsync(context, "@abaci-bot hide @alice[bot]", "maintainer-user");
+
+        await _gitHub.DidNotReceiveWithAnyArgs().MinimizeCommentAsync(default!, default!, default, default, default!, default);
+        await _gitHub.Received(1).CreateCommentAsync(
+            "owner", "repo", 42,
+            Arg.Is<string>(s => s.Contains("No comments authored by @alice[bot] were found")),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_LockAndArchive_WithCommentGateway_UpdateAnnouncementInPlaceOnFailure()
+    {
+        var commentGateway = Substitute.For<IEphemeralCommentGateway>();
+        commentGateway.CreateCommentWithMetadataAsync("owner", "repo", 42, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(new CreatedCommentRef(9001L, "node_9001"));
+
+        var service = CreateService(
+            new ConversationGuardOptions { Enabled = true, DryRun = false, ArchiveEnabled = true },
+            commentGateway: commentGateway);
+        var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Write);
+
+        // 1. Archive fails -> updates comment 9001 in-place without posting a contradictory second comment
+        _gitHub.ArchivePullRequestAsync("owner", "repo", 42, "PR_kwDO42", Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new InvalidOperationException("FORBIDDEN"));
+
+        await service.HandleCommandAsync(context, "@abaci-bot archive", "maintainer-user");
+
+        await _gitHub.Received(1).UpdateCommentAsync(
+            "owner", "repo", 9001L,
+            Arg.Is<string>(s =>
+                s.Contains("Failed to archive") &&
+                s.Contains("triage+ user PAT") &&
+                !s.Contains("Administration: Read & write")),
+            Arg.Any<CancellationToken>());
+        await _gitHub.DidNotReceiveWithAnyArgs().CreateCommentAsync(default!, default!, default, default!, default);
+
+        // 2. Lock fails -> updates comment 9001 in-place
+        _gitHub.ClearReceivedCalls();
+        _gitHub.LockIssueAsync("owner", "repo", 42, LockReason.TooHeated, Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new InvalidOperationException("Lock API failure"));
+
+        await service.HandleCommandAsync(context, "@abaci-bot lock", "maintainer-user");
+
+        await _gitHub.Received(1).UpdateCommentAsync(
+            "owner", "repo", 9001L,
+            Arg.Is<string>(s => s.Contains("remains unlocked")),
+            Arg.Any<CancellationToken>());
+        await _gitHub.DidNotReceiveWithAnyArgs().CreateCommentAsync(default!, default!, default, default!, default);
+
+        // 3. UpdateCommentAsync also fails -> gracefully falls back to compensation comment without throwing
+        _gitHub.ClearReceivedCalls();
+        _gitHub.UpdateCommentAsync("owner", "repo", 9001L, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new InvalidOperationException("Edit failed"));
+
+        var ex = await Record.ExceptionAsync(() =>
+            service.HandleCommandAsync(context, "@abaci-bot lock", "maintainer-user"));
+        Assert.Null(ex);
+        await _gitHub.Received(1).CreateCommentAsync(
+            "owner", "repo", 42,
+            Arg.Is<string>(s => s.Contains("remains unlocked")),
             Arg.Any<CancellationToken>());
     }
 

@@ -18,6 +18,7 @@ public partial class ConversationGuardService : IConversationGuardService
     private readonly IBotIdentityProvider _botIdentity;
     private readonly ILocaleResolver? _localeResolver;
     private readonly IEphemeralReplyService? _ephemeralReplies;
+    private readonly IEphemeralCommentGateway? _commentGateway;
     private readonly ConversationGuardOptions _options;
     private readonly ILogger<ConversationGuardService>? _logger;
     private readonly PendingConfirmationStore _confirmationStore;
@@ -34,7 +35,8 @@ public partial class ConversationGuardService : IConversationGuardService
         PendingConfirmationStore? confirmationStore = null,
         IBotIdentityProvider? botIdentity = null,
         ILocaleResolver? localeResolver = null,
-        IEphemeralReplyService? ephemeralReplies = null)
+        IEphemeralReplyService? ephemeralReplies = null,
+        IEphemeralCommentGateway? commentGateway = null)
     {
         _gitHub = gitHub;
         _permissionService = permissionService;
@@ -42,6 +44,7 @@ public partial class ConversationGuardService : IConversationGuardService
             ?? throw new ArgumentNullException(nameof(botIdentity), "IBotIdentityProvider must be provided when IGitHubService does not implement it.");
         _localeResolver = localeResolver;
         _ephemeralReplies = ephemeralReplies;
+        _commentGateway = commentGateway ?? gitHub as IEphemeralCommentGateway;
         _options = options.Value;
         _logger = logger;
         _confirmationStore = confirmationStore ?? new PendingConfirmationStore(timeProvider);
@@ -128,10 +131,11 @@ public partial class ConversationGuardService : IConversationGuardService
         }
     }
 
-    private async Task PostCommentOrLogDryRunAsync(
+    private async Task TryPostReplyAsync(
         PullRequestContext context,
         string commentBody,
         string dryRunAction,
+        bool ephemeral,
         CancellationToken cancellationToken,
         TimeSpan? ephemeralTtl = null)
     {
@@ -143,15 +147,87 @@ public partial class ConversationGuardService : IConversationGuardService
             return;
         }
 
-        if (_ephemeralReplies != null)
+        try
         {
-            await _ephemeralReplies.PostEphemeralReplyAsync(
-                context.Owner, context.Repo, context.PrNumber, commentBody, ephemeralTtl, cancellationToken);
+            if (ephemeral && _ephemeralReplies != null)
+            {
+                await _ephemeralReplies.PostEphemeralReplyAsync(
+                    context.Owner, context.Repo, context.PrNumber, commentBody, ephemeralTtl, cancellationToken);
+            }
+            else
+            {
+                await _gitHub.CreateCommentAsync(context.Owner, context.Repo, context.PrNumber, commentBody, cancellationToken);
+            }
         }
-        else
+        catch (ForbiddenException ex)
         {
-            await _gitHub.CreateCommentAsync(context.Owner, context.Repo, context.PrNumber, commentBody, cancellationToken);
+            _logger?.LogWarning(
+                ex,
+                "Cannot post reply ({Action}) on {Owner}/{Repo}#{PrNumber}; conversation may be locked or archived.",
+                dryRunAction, context.Owner, context.Repo, context.PrNumber);
         }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogWarning(
+                ex,
+                "Failed to post reply ({Action}) on {Owner}/{Repo}#{PrNumber}.",
+                dryRunAction, context.Owner, context.Repo, context.PrNumber);
+        }
+    }
+
+    private async Task<(bool Posted, long CommentId)> TryCreateTrackedAnnouncementAsync(
+        PullRequestContext context,
+        string commentBody,
+        string actionDescription,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (_commentGateway != null)
+            {
+                var created = await _commentGateway.CreateCommentWithMetadataAsync(
+                    context.Owner, context.Repo, context.PrNumber, commentBody, cancellationToken);
+                return (true, created?.Id ?? 0);
+            }
+
+            await _gitHub.CreateCommentAsync(
+                context.Owner, context.Repo, context.PrNumber, commentBody, cancellationToken);
+            return (true, 0);
+        }
+        catch (ForbiddenException ex)
+        {
+            _logger?.LogWarning(
+                ex,
+                "Cannot post {Action} announcement on {Owner}/{Repo}#{PrNumber}; conversation may already be locked or archived.",
+                actionDescription, context.Owner, context.Repo, context.PrNumber);
+            return (false, 0);
+        }
+    }
+
+    private async Task TryUpdateOrPostCompensationCommentAsync(
+        PullRequestContext context,
+        long announcementCommentId,
+        string commentBody,
+        CancellationToken cancellationToken)
+    {
+        if (announcementCommentId > 0)
+        {
+            try
+            {
+                await _gitHub.UpdateCommentAsync(
+                    context.Owner, context.Repo, announcementCommentId, commentBody, cancellationToken);
+                return;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger?.LogWarning(
+                    ex,
+                    "Failed to update tracked announcement comment {CommentId} on {Owner}/{Repo}#{PrNumber}; falling back to compensation comment.",
+                    announcementCommentId, context.Owner, context.Repo, context.PrNumber);
+            }
+        }
+
+        await TryPostCompensationCommentAsync(context, commentBody, cancellationToken);
     }
 
     private async Task<bool> ValidateOrRequestAuthorConfirmationAsync(
@@ -179,10 +255,11 @@ public partial class ConversationGuardService : IConversationGuardService
                 ? $"@{senderLogin} 作为 PR 作者执行 `{commandName}`，请在 {_options.AuthorLockConfirmTimeoutMinutes} 分钟内回复 `@{botLogin} {commandName} confirm` 以确认。"
                 : $"@{senderLogin} To confirm `{commandName}` on this pull request as the author, please reply with `@{botLogin} {commandName} confirm` within {_options.AuthorLockConfirmTimeoutMinutes} minute(s).";
 
-            await PostCommentOrLogDryRunAsync(
+            await TryPostReplyAsync(
                 context,
                 promptMsg,
                 $"Would prompt author @{senderLogin} to confirm {commandName}",
+                ephemeral: true,
                 cancellationToken,
                 ephemeralTtl: timeout);
             return false;
@@ -201,10 +278,11 @@ public partial class ConversationGuardService : IConversationGuardService
             ? $"@{senderLogin} 未找到有效且未过期的 `{commandName}` 确认请求。请在 {_options.AuthorLockConfirmTimeoutMinutes} 分钟内回复 `@{botLogin} {commandName} confirm` 继续。"
             : $"@{senderLogin} No active `{commandName}` confirmation request was found or the previous request expired. Please reply with `@{botLogin} {commandName} confirm` within {_options.AuthorLockConfirmTimeoutMinutes} minute(s) to proceed.";
 
-        await PostCommentOrLogDryRunAsync(
+        await TryPostReplyAsync(
             context,
             rePromptMsg,
             $"Would prompt author @{senderLogin} to re-confirm {commandName}",
+            ephemeral: true,
             cancellationToken,
             ephemeralTtl: timeout);
         return false;
@@ -224,12 +302,13 @@ public partial class ConversationGuardService : IConversationGuardService
         {
             _logger?.LogWarning("Unauthorized lock attempt by {Sender} on {Owner}/{Repo}#{PrNumber}",
                 senderLogin, context.Owner, context.Repo, context.PrNumber);
-            await PostCommentOrLogDryRunAsync(
+            await TryPostReplyAsync(
                 context,
                 isZh
                     ? $"@{senderLogin} 仅 PR 作者或仓库维护者（triage 及以上权限）可锁定此对话。"
                     : $"@{senderLogin} Only the pull request author or repository maintainers (triage+) may lock this conversation.",
                 $"Would reject unauthorized lock attempt by @{senderLogin}",
+                ephemeral: true,
                 cancellationToken);
             return;
         }
@@ -261,25 +340,15 @@ public partial class ConversationGuardService : IConversationGuardService
             context.Owner, context.Repo, context.PrNumber, senderLogin, isMaintainer);
 
         // Post notice before locking, because GitHub rejects App comments on locked issues with 403.
-        try
+        var (posted, announcementCommentId) = await TryCreateTrackedAnnouncementAsync(
+            context,
+            isZh
+                ? $"此对话已由 @{senderLogin} 锁定。"
+                : $"This conversation has been locked by @{senderLogin}.",
+            "lock",
+            cancellationToken);
+        if (!posted)
         {
-            await _gitHub.CreateCommentAsync(
-                context.Owner,
-                context.Repo,
-                context.PrNumber,
-                isZh
-                    ? $"此对话已由 @{senderLogin} 锁定。"
-                    : $"This conversation has been locked by @{senderLogin}.",
-                cancellationToken);
-        }
-        catch (ForbiddenException ex)
-        {
-            _logger?.LogWarning(
-                ex,
-                "Cannot post lock announcement on {Owner}/{Repo}#{PrNumber}; conversation may have been locked concurrently.",
-                context.Owner,
-                context.Repo,
-                context.PrNumber);
             return;
         }
 
@@ -289,10 +358,11 @@ public partial class ConversationGuardService : IConversationGuardService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger?.LogWarning(ex, "Failed to lock conversation for {Owner}/{Repo}#{PrNumber}; posting compensation comment.",
+            _logger?.LogWarning(ex, "Failed to lock conversation for {Owner}/{Repo}#{PrNumber}; updating announcement or posting compensation comment.",
                 context.Owner, context.Repo, context.PrNumber);
-            await TryPostCompensationCommentAsync(
+            await TryUpdateOrPostCompensationCommentAsync(
                 context,
+                announcementCommentId,
                 isZh
                     ? $"@{senderLogin} 因 GitHub API 错误锁定失败，此对话仍保持未锁定状态。"
                     : $"@{senderLogin} Failed to lock this conversation due to a GitHub API error. The conversation remains unlocked.",
@@ -311,12 +381,13 @@ public partial class ConversationGuardService : IConversationGuardService
         {
             _logger?.LogWarning("Unauthorized unlock attempt by {Sender} on {Owner}/{Repo}#{PrNumber}",
                 senderLogin, context.Owner, context.Repo, context.PrNumber);
-            await PostCommentOrLogDryRunAsync(
+            await TryPostReplyAsync(
                 context,
                 isZh
                     ? $"@{senderLogin} 仅仓库维护者（triage 及以上权限）可解锁此对话。"
                     : $"@{senderLogin} Only repository maintainers (triage+) may unlock this conversation.",
                 $"Would reject unauthorized unlock attempt by @{senderLogin}",
+                ephemeral: true,
                 cancellationToken);
             return;
         }
@@ -333,13 +404,13 @@ public partial class ConversationGuardService : IConversationGuardService
         {
             _logger?.LogInformation("Conversation for {Owner}/{Repo}#{PrNumber} is not locked; skipping unlock.",
                 context.Owner, context.Repo, context.PrNumber);
-            await _gitHub.CreateCommentAsync(
-                context.Owner,
-                context.Repo,
-                context.PrNumber,
+            await TryPostReplyAsync(
+                context,
                 isZh
                     ? $"@{senderLogin} 此对话当前未处于锁定状态。"
                     : $"@{senderLogin} This conversation is not currently locked.",
+                "Report conversation is not locked",
+                ephemeral: false,
                 cancellationToken);
             return;
         }
@@ -370,23 +441,14 @@ public partial class ConversationGuardService : IConversationGuardService
         {
             _logger?.LogWarning(ex, "Failed to unlock conversation for {Owner}/{Repo}#{PrNumber}",
                 context.Owner, context.Repo, context.PrNumber);
-            try
-            {
-                await _gitHub.CreateCommentAsync(
-                    context.Owner,
-                    context.Repo,
-                    context.PrNumber,
-                    isZh
-                        ? $"@{senderLogin} 解锁此对话时发生 GitHub API/权限错误，请检查机器人权限后重试。"
-                        : $"@{senderLogin} Failed to unlock this conversation due to a GitHub API/permission error.",
-                    cancellationToken);
-            }
-            catch (Exception commentEx) when (commentEx is not OperationCanceledException)
-            {
-                _logger?.LogDebug(commentEx, "Failed to post unlock error notice on {Owner}/{Repo}#{PrNumber}",
-                    context.Owner, context.Repo, context.PrNumber);
-            }
-
+            await TryPostReplyAsync(
+                context,
+                isZh
+                    ? $"@{senderLogin} 解锁此对话时发生 GitHub API/权限错误，请检查机器人权限后重试。"
+                    : $"@{senderLogin} Failed to unlock this conversation due to a GitHub API/permission error.",
+                "Report unlock error",
+                ephemeral: false,
+                cancellationToken);
             return;
         }
 
@@ -398,20 +460,12 @@ public partial class ConversationGuardService : IConversationGuardService
                 ? $"此对话已由 @{senderLogin} 解锁。"
                 : $"This conversation has been unlocked by @{senderLogin}.");
 
-        try
-        {
-            await _gitHub.CreateCommentAsync(
-                context.Owner,
-                context.Repo,
-                context.PrNumber,
-                unlockMessage,
-                cancellationToken);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _logger?.LogWarning(ex, "Conversation unlocked on {Owner}/{Repo}#{PrNumber}, but posting unlock notice failed",
-                context.Owner, context.Repo, context.PrNumber);
-        }
+        await TryPostReplyAsync(
+            context,
+            unlockMessage,
+            "Post unlock notice",
+            ephemeral: false,
+            cancellationToken);
     }
 
     private async Task HandleHideCommandAsync(
@@ -427,36 +481,39 @@ public partial class ConversationGuardService : IConversationGuardService
         {
             _logger?.LogWarning("Unauthorized hide attempt by {Sender} on {Owner}/{Repo}#{PrNumber}",
                 senderLogin, context.Owner, context.Repo, context.PrNumber);
-            await PostCommentOrLogDryRunAsync(
+            await TryPostReplyAsync(
                 context,
                 isZh
                     ? $"@{senderLogin} 仅仓库维护者（triage 及以上权限）可折叠评论。"
                     : $"@{senderLogin} Only repository maintainers (triage+) may hide comments.",
                 $"Would reject unauthorized hide attempt by @{senderLogin}",
+                ephemeral: true,
                 cancellationToken);
             return;
         }
 
         if (string.IsNullOrWhiteSpace(targetUser))
         {
-            await PostCommentOrLogDryRunAsync(
+            await TryPostReplyAsync(
                 context,
                 isZh
                     ? $"@{senderLogin} 用法：`@{botLogin} hide @username` 以批量折叠指定用户的评论。"
                     : $"@{senderLogin} Usage: `@{botLogin} hide @username` to fold spam comments from a user.",
                 $"Would post hide usage hint for @{senderLogin}",
+                ephemeral: true,
                 cancellationToken);
             return;
         }
 
         if (await HasTriageOrHigherPermissionAsync(context.Owner, context.Repo, targetUser, cancellationToken))
         {
-            await PostCommentOrLogDryRunAsync(
+            await TryPostReplyAsync(
                 context,
                 isZh
                     ? $"@{senderLogin} 不能折叠仓库维护者的评论。"
                     : $"@{senderLogin} Comments authored by repository maintainers cannot be hidden.",
                 $"Would reject hide targeting maintainer @{targetUser} by @{senderLogin}",
+                ephemeral: true,
                 cancellationToken);
             return;
         }
@@ -477,41 +534,62 @@ public partial class ConversationGuardService : IConversationGuardService
         {
             _logger?.LogWarning(ex, "Failed to retrieve comments while handling hide command on {Owner}/{Repo}#{PrNumber}",
                 context.Owner, context.Repo, context.PrNumber);
-            try
-            {
-                await _gitHub.CreateCommentAsync(
-                    context.Owner,
-                    context.Repo,
-                    context.PrNumber,
-                    isZh
-                        ? $"@{senderLogin} 查询评论列表时发生 GitHub API 错误，请稍后重试。"
-                        : $"@{senderLogin} Failed to inspect comments due to a GitHub API error.",
-                    cancellationToken);
-            }
-            catch (Exception commentEx) when (commentEx is not OperationCanceledException)
-            {
-                _logger?.LogDebug(commentEx, "Failed to post hide error notice on {Owner}/{Repo}#{PrNumber}",
-                    context.Owner, context.Repo, context.PrNumber);
-            }
-
+            await TryPostReplyAsync(
+                context,
+                isZh
+                    ? $"@{senderLogin} 查询评论列表时发生 GitHub API 错误，请稍后重试。"
+                    : $"@{senderLogin} Failed to inspect comments due to a GitHub API error.",
+                "Report hide comment inspection error",
+                ephemeral: false,
+                cancellationToken);
             return;
         }
 
+        var effectiveTargetUser = targetUser;
         var targetComments = comments
             .Where(c => string.Equals(c.User?.Login, targetUser, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
+        // Safe one-way fallback: only when caller omitted "[bot]" and zero exact matches exist.
+        // Never strip "[bot]" to match a human user (prevents hiding humans or bypassing maintainer protection).
+        if (targetComments.Count == 0 && !targetUser.EndsWith("[bot]", StringComparison.OrdinalIgnoreCase))
+        {
+            var botLoginCandidate = $"{targetUser}[bot]";
+            var botComments = comments
+                .Where(c => string.Equals(c.User?.Login, botLoginCandidate, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (botComments.Count > 0)
+            {
+                if (await HasTriageOrHigherPermissionAsync(context.Owner, context.Repo, botLoginCandidate, cancellationToken))
+                {
+                    await TryPostReplyAsync(
+                        context,
+                        isZh
+                            ? $"@{senderLogin} 不能折叠仓库维护者的评论。"
+                            : $"@{senderLogin} Comments authored by repository maintainers cannot be hidden.",
+                        $"Would reject hide targeting maintainer @{botLoginCandidate} by @{senderLogin}",
+                        ephemeral: true,
+                        cancellationToken);
+                    return;
+                }
+
+                effectiveTargetUser = botLoginCandidate;
+                targetComments = botComments;
+            }
+        }
+
         if (targetComments.Count == 0)
         {
             _logger?.LogInformation("No comments authored by {TargetUser} found on {Owner}/{Repo}#{PrNumber}.",
-                targetUser, context.Owner, context.Repo, context.PrNumber);
-            await _gitHub.CreateCommentAsync(
-                context.Owner,
-                context.Repo,
-                context.PrNumber,
+                effectiveTargetUser, context.Owner, context.Repo, context.PrNumber);
+            await TryPostReplyAsync(
+                context,
                 isZh
-                    ? $"@{senderLogin} 本 PR 下未找到 @{targetUser} 发表的评论。"
-                    : $"@{senderLogin} No comments authored by @{targetUser} were found on this pull request.",
+                    ? $"@{senderLogin} 本 PR 下未找到 @{effectiveTargetUser} 发表的评论。"
+                    : $"@{senderLogin} No comments authored by @{effectiveTargetUser} were found on this pull request.",
+                $"Report no comments authored by @{effectiveTargetUser}",
+                ephemeral: false,
                 cancellationToken);
             return;
         }
@@ -534,37 +612,29 @@ public partial class ConversationGuardService : IConversationGuardService
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 failedCount++;
-                _logger?.LogWarning(ex, "Failed to hide comment {CommentId} by {TargetUser}", c.Id, targetUser);
+                _logger?.LogWarning(ex, "Failed to hide comment {CommentId} by {TargetUser}", c.Id, effectiveTargetUser);
             }
         }
 
         _logger?.LogInformation("Minimized {Count} comments ({FailedCount} failed) by {TargetUser} on {Owner}/{Repo}#{PrNumber}",
-            hiddenCount, failedCount, targetUser, context.Owner, context.Repo, context.PrNumber);
+            hiddenCount, failedCount, effectiveTargetUser, context.Owner, context.Repo, context.PrNumber);
 
         var summaryMessage = (hiddenCount, failedCount, isZh) switch
         {
-            (0, > 0, true) => $"@{senderLogin} 找到 {targetComments.Count} 条来自 @{targetUser} 的评论，但因 GitHub API/GraphQL 错误未能折叠任何评论。",
-            (0, > 0, false) => $"@{senderLogin} Found {targetComments.Count} comment(s) authored by @{targetUser}, but failed to minimize all of them due to GitHub API/GraphQL errors.",
-            (> 0, > 0, true) => $"@{senderLogin} 已折叠 @{targetUser} 的 {hiddenCount}/{targetComments.Count} 条评论（{failedCount} 条失败）。",
-            (> 0, > 0, false) => $"{hiddenCount} of {targetComments.Count} comment(s) authored by @{targetUser} have been minimized by @{senderLogin} ({failedCount} failed).",
-            (_, _, true) => $"@{senderLogin} 已折叠 @{targetUser} 的 {hiddenCount} 条评论。",
-            _ => $"{hiddenCount} comment(s) authored by @{targetUser} have been minimized by @{senderLogin}."
+            (0, > 0, true) => $"@{senderLogin} 找到 {targetComments.Count} 条来自 @{effectiveTargetUser} 的评论，但因 GitHub API/GraphQL 错误未能折叠任何评论。",
+            (0, > 0, false) => $"@{senderLogin} Found {targetComments.Count} comment(s) authored by @{effectiveTargetUser}, but failed to minimize all of them due to GitHub API/GraphQL errors.",
+            (> 0, > 0, true) => $"@{senderLogin} 已折叠 @{effectiveTargetUser} 的 {hiddenCount}/{targetComments.Count} 条评论（{failedCount} 条失败）。",
+            (> 0, > 0, false) => $"{hiddenCount} of {targetComments.Count} comment(s) authored by @{effectiveTargetUser} have been minimized by @{senderLogin} ({failedCount} failed).",
+            (_, _, true) => $"@{senderLogin} 已折叠 @{effectiveTargetUser} 的 {hiddenCount} 条评论。",
+            _ => $"{hiddenCount} comment(s) authored by @{effectiveTargetUser} have been minimized by @{senderLogin}."
         };
 
-        try
-        {
-            await _gitHub.CreateCommentAsync(
-                context.Owner,
-                context.Repo,
-                context.PrNumber,
-                summaryMessage,
-                cancellationToken);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _logger?.LogWarning(ex, "Failed to post hide summary notice on {Owner}/{Repo}#{PrNumber}",
-                context.Owner, context.Repo, context.PrNumber);
-        }
+        await TryPostReplyAsync(
+            context,
+            summaryMessage,
+            $"Post hide summary for @{effectiveTargetUser}",
+            ephemeral: false,
+            cancellationToken);
     }
 
     private async Task HandleArchiveCommandAsync(
@@ -581,12 +651,13 @@ public partial class ConversationGuardService : IConversationGuardService
         {
             _logger?.LogWarning("Unauthorized archive attempt by {Sender} on {Owner}/{Repo}#{PrNumber}",
                 senderLogin, context.Owner, context.Repo, context.PrNumber);
-            await PostCommentOrLogDryRunAsync(
+            await TryPostReplyAsync(
                 context,
                 isZh
                     ? $"@{senderLogin} 仅 PR 作者或仓库维护者（triage 及以上权限）可归档 Pull Request。"
                     : $"@{senderLogin} Only the pull request author or repository maintainers (triage+) may archive pull requests.",
                 $"Would reject unauthorized archive attempt by @{senderLogin}",
+                ephemeral: true,
                 cancellationToken);
             return;
         }
@@ -594,12 +665,13 @@ public partial class ConversationGuardService : IConversationGuardService
         if (!_options.ArchiveEnabled)
         {
             _logger?.LogInformation("Archive attempted by {Sender} but ArchiveEnabled is false.", senderLogin);
-            await PostCommentOrLogDryRunAsync(
+            await TryPostReplyAsync(
                 context,
                 isZh
                     ? $"@{senderLogin} 当前机器人配置未启用 Pull Request 归档功能。"
                     : $"@{senderLogin} Pull request archiving is currently disabled in the bot configuration.",
                 $"Would report archive disabled to @{senderLogin}",
+                ephemeral: true,
                 cancellationToken);
             return;
         }
@@ -626,14 +698,17 @@ public partial class ConversationGuardService : IConversationGuardService
         var pr = await context.PullRequest.Value;
 
         // Post exit comment before calling archivePullRequest, since post-archive comment API returns 403.
-        await _gitHub.CreateCommentAsync(
-            context.Owner,
-            context.Repo,
-            context.PrNumber,
+        var (posted, announcementCommentId) = await TryCreateTrackedAnnouncementAsync(
+            context,
             isZh
                 ? $"此 Pull Request 已由 @{senderLogin} 归档，对话现已永久关闭。"
                 : $"This pull request has been archived by @{senderLogin}. Conversation is now permanently closed.",
+            "archive",
             cancellationToken);
+        if (!posted)
+        {
+            return;
+        }
 
         try
         {
@@ -647,19 +722,20 @@ public partial class ConversationGuardService : IConversationGuardService
             var failureKind = isPermissionDenied
                 ? "permission denied (FORBIDDEN)"
                 : (ex is InvalidOperationException ? "GraphQL error" : "GitHub API/network error");
-            _logger?.LogWarning(ex, "Failed to archive pull request {Owner}/{Repo}#{PrNumber} ({FailureKind}); posting compensation comment.",
+            _logger?.LogWarning(ex, "Failed to archive pull request {Owner}/{Repo}#{PrNumber} ({FailureKind}); updating announcement or posting compensation comment.",
                 context.Owner, context.Repo, context.PrNumber, failureKind);
 
             var compensationComment = (isPermissionDenied, isZh) switch
             {
-                (true, true) => $"@{senderLogin} 归档失败：机器人缺少 GitHub 归档权限（需 GitHub App 开启 'Administration: Read & write' 或配置具备 triage+ 权限的 PAT）。请通过 GitHub 网页端手动归档。",
-                (true, false) => $"@{senderLogin} Failed to archive this pull request because the bot lacks GitHub archive permission (requires GitHub App 'Administration: Read & write' or a triage+ PAT). Please archive it via the GitHub Web UI.",
+                (true, true) => $"@{senderLogin} 归档失败：机器人缺少 GitHub 归档权限（GitHub `archivePullRequest` 需要具备 triage+ 权限的用户 PAT，GitHub App 安装令牌无法执行归档）。请通过 GitHub 网页端手动归档。",
+                (true, false) => $"@{senderLogin} Failed to archive this pull request because the bot lacks GitHub archive permission (GitHub's archivePullRequest requires a triage+ user PAT; GitHub App installation tokens cannot archive pull requests). Please archive it via the GitHub Web UI.",
                 (false, true) => $"@{senderLogin} 因 GitHub API 错误归档失败，此对话仍保持未归档状态。",
                 (false, false) => $"@{senderLogin} Failed to archive this pull request due to a GitHub API error. The conversation remains unarchived."
             };
 
-            await TryPostCompensationCommentAsync(
+            await TryUpdateOrPostCompensationCommentAsync(
                 context,
+                announcementCommentId,
                 compensationComment,
                 cancellationToken);
         }

@@ -1769,12 +1769,12 @@ public class GitHubServiceTests
     }
 
     [Fact]
-    public async Task VerifyArchivePermissionProbeAsync_ValidatesAppAdministrationWriteAndBotPatTriage()
+    public async Task VerifyArchivePermissionProbeAsync_RejectsAppOnlyModeAndValidatesBotPatTriage()
     {
         var (pem, rsa) = GenerateRsaKeyPair();
         using (rsa)
         {
-            // 1. GitHub App mode: Administration == Write succeeds
+            // 1. GitHub App-only mode (even with Administration == Write) always fails fast
             var (appService, appClient) = CreateTestService(pem);
             var appsClient = Substitute.For<IGitHubAppsClient>();
             appClient.GitHubApps.Returns(appsClient);
@@ -1786,21 +1786,13 @@ public class GitHubServiceTests
             typeof(Installation).GetProperty(nameof(Installation.Permissions))?.SetValue(writeInst, writePerms);
             appsClient.GetInstallationForCurrent(789012).Returns(Task.FromResult(writeInst));
 
-            await appService.VerifyArchivePermissionProbeAsync("owner", "repo");
-
-            // 2. GitHub App mode: Administration == Read throws InvalidOperationException
-            var readPerms = (InstallationPermissions)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(InstallationPermissions));
-            typeof(InstallationPermissions).GetProperty(nameof(InstallationPermissions.Administration))?.SetValue(
-                readPerms, (StringEnum<InstallationReadWritePermissionLevel>?)new StringEnum<InstallationReadWritePermissionLevel>(InstallationReadWritePermissionLevel.Read));
-            var readInst = (Installation)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Installation));
-            typeof(Installation).GetProperty(nameof(Installation.Permissions))?.SetValue(readInst, readPerms);
-            appsClient.GetInstallationForCurrent(789012).Returns(Task.FromResult(readInst));
-
             var exApp = await Assert.ThrowsAsync<InvalidOperationException>(() =>
                 appService.VerifyArchivePermissionProbeAsync("owner", "repo"));
-            Assert.Contains("Administration: Read & write", exApp.Message);
+            Assert.Contains("App-only", exApp.Message);
+            Assert.Contains("PackageUpdate:BotPat", exApp.Message);
+            await appsClient.DidNotReceiveWithAnyArgs().GetInstallationForCurrent(default);
 
-            // 3. BotPat mode: Triage+ succeeds; Read-only fails
+            // 2. BotPat mode: Triage+ succeeds; Read-only fails
             var patClient = Substitute.For<IGitHubClient>();
             patClient.Connection.Returns(Substitute.For<IConnection>());
             var reposClient = Substitute.For<IRepositoriesClient>();
@@ -2064,7 +2056,6 @@ public class GitHubServiceTests
             var releaseApp = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var sawNonBearerOnPr = false;
             string? prAuthHeader = null;
-            string? probeAuthHeader = null;
 
             var handler = new ControllableHttpMessageHandler(async (req, ct) =>
             {
@@ -2091,18 +2082,6 @@ public class GitHubServiceTests
                     return new HttpResponseMessage(HttpStatusCode.OK)
                     {
                         Content = new StringContent(JsonSerializer.Serialize(new { id = 1, slug = "abaci-bot" }), Encoding.UTF8, "application/json")
-                    };
-                }
-
-                if (path.Contains("/app/installations/67890", StringComparison.Ordinal))
-                {
-                    probeAuthHeader = authHeader;
-                    return new HttpResponseMessage(HttpStatusCode.OK)
-                    {
-                        Content = new StringContent(
-                            JsonSerializer.Serialize(new { id = 67890, permissions = new { administration = "write" } }),
-                            Encoding.UTF8,
-                            "application/json")
                     };
                 }
 
@@ -2142,10 +2121,10 @@ public class GitHubServiceTests
             Assert.True(sawNonBearerOnPr);
             Assert.Contains("ghs_install_tok", prAuthHeader, StringComparison.Ordinal);
 
-            await service.VerifyArchivePermissionProbeAsync("owner", "repo");
-            Assert.StartsWith("Bearer ", probeAuthHeader ?? string.Empty, StringComparison.Ordinal);
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                service.VerifyArchivePermissionProbeAsync("owner", "repo"));
 
-            // Shared client still retains installation credentials after archive JWT probe
+            // Shared client still retains installation credentials after archive fail-fast probe
             prAuthHeader = null;
             await service.GetPullRequestAsync("owner", "repo", 1);
             Assert.Contains("ghs_install_tok", prAuthHeader, StringComparison.Ordinal);

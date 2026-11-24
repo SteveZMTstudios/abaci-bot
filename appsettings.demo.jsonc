@@ -571,8 +571,8 @@
     // Default: [].
     "RepositoryAllowList": [],
     // Default: false.
-    // false: archive commands are rejected to prevent unintended 404 access restrictions.
-    // true: pull request level archiving via GraphQL is enabled.
+    // false: archive commands are rejected (recommended for GitHub App-only deployments).
+    // true: pull request archiving/unarchiving via GraphQL is enabled; requires a triage+ user PAT via PackageUpdate:BotPat (GitHub App-only mode fails fast on startup).
     "ArchiveEnabled": false,
     // Unit: days. Range: 7..365. Default: 60.
     // Threshold based on closed_at after which closed PRs are automatically locked to prevent post-closure harassment.

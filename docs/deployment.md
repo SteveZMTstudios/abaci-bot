@@ -234,16 +234,17 @@ governance (`ConversationGuard`) remains disabled.
 > is set to `true`, authorizing `@<bot> lock`, `@<bot> unlock`, and `@<bot> hide` against
 > authoritative repository collaborator roles (`triage`/`write`+) requires granting the
 > GitHub App **Repository -> Administration: Read-only** (or **Contents: Read & write**).
-> Additionally enabling `ConversationGuard:ArchiveEnabled=true` (`@<bot> archive`) requires
-> **Repository -> Administration: Read & write** on the GitHub App (or a `triage`+
-> `PackageUpdate:BotPat`), because standard minimal App tokens receive `FORBIDDEN` from
-> GitHub's `archivePullRequest` GraphQL mutation.
-> On startup (including when `DryRun` is `true`), `ConversationGuardPermissionProbe`
-> verifies collaborator endpoint access (and archive permission when `ArchiveEnabled=true`)
-> on every repository in `ConversationGuard:RepositoryAllowList` and aborts startup if any
-> required permission is missing, ensuring dry-run simulation and archive readiness match
-> production credentials. Keep `ConversationGuard:Enabled` set to `false` to preserve the
-> baseline minimal permission set.
+> Additionally enabling `ConversationGuard:ArchiveEnabled=true` (`@<bot> archive`) requires a
+> **`triage`+ user PAT** configured via `PackageUpdate:BotPat` (note: configuring `BotPat` shifts
+> all bot GitHub API writes to that user account), because GitHub's `archivePullRequest` and
+> `unarchivePullRequest` GraphQL mutations require a user role and always return `FORBIDDEN` for
+> GitHub App installation tokens even when **Administration: Read & write** is granted.
+> On startup (including when `DryRun` is `true`, and before webhooks or background sweeps run),
+> `ConversationGuardOptionsValidator` and `ConversationGuardPermissionProbe` verify collaborator
+> endpoint access (and require a `triage`+ `BotPat` when `ArchiveEnabled=true`) across
+> `ConversationGuard:RepositoryAllowList`, aborting startup if requirements are missing. Keep
+> `ConversationGuard:ArchiveEnabled` set to `false` for App-only deployments, and keep
+> `ConversationGuard:Enabled` set to `false` to preserve the baseline minimal permission set.
 
 ### 5.3 Event subscriptions
 

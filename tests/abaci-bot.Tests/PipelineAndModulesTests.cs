@@ -258,6 +258,30 @@ public class PipelineAndModulesTests
         Assert.Empty(diff2.LabelsToAdd);
         Assert.Empty(diff2.LabelsToRemove);
     }
+
+    [Fact]
+    public void LabelMutexEngine_AttentionFreshnessGroup_EvictsNewAndStaleMutuallyWithoutTouchingStaleExempt()
+    {
+        var engine = new LabelMutexEngine();
+
+        var staleDiff = engine.ComputeDiff(
+            new[] { GitHubLabels.StatusNew, GitHubLabels.StatusStaleExempt },
+            new[] { GitHubLabels.StatusStale },
+            Array.Empty<string>());
+
+        Assert.Equal(new[] { GitHubLabels.StatusStale }, staleDiff.LabelsToAdd);
+        Assert.Equal(new[] { GitHubLabels.StatusNew }, staleDiff.LabelsToRemove);
+        Assert.DoesNotContain(GitHubLabels.StatusStaleExempt, staleDiff.LabelsToRemove);
+
+        var newDiff = engine.ComputeDiff(
+            new[] { GitHubLabels.StatusStale, GitHubLabels.StatusStaleExempt },
+            new[] { GitHubLabels.StatusNew },
+            Array.Empty<string>());
+
+        Assert.Equal(new[] { GitHubLabels.StatusNew }, newDiff.LabelsToAdd);
+        Assert.Equal(new[] { GitHubLabels.StatusStale }, newDiff.LabelsToRemove);
+        Assert.DoesNotContain(GitHubLabels.StatusStaleExempt, newDiff.LabelsToRemove);
+    }
     #endregion
 
     #region PullRequestLockManager Tests

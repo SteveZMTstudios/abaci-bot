@@ -65,6 +65,12 @@ public class LabelMutexEngine
             GitHubLabels.Rebuild1001To2500,
             GitHubLabels.Rebuild2501To5000,
             GitHubLabels.Rebuild5001Plus
+        },
+        // 7. Attention freshness state (single-choice; Status: stale-exempt is orthogonal and intentionally excluded)
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            GitHubLabels.StatusNew,
+            GitHubLabels.StatusStale
         }
     };
 

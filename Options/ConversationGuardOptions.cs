@@ -25,8 +25,9 @@ public class ConversationGuardOptions
     public List<string> RepositoryAllowList { get; set; } = new();
 
     /// <summary>
-    /// Independent safety switch for pull request level archiving (/archive).
-    /// When false, /archive commands are rejected to prevent unintended 404 access restrictions.
+    /// Independent safety switch for pull request level archiving/unarchiving (<c>@&lt;bot&gt; archive</c>).
+    /// GitHub's <c>archivePullRequest</c> GraphQL mutation requires a <c>triage</c>+ user PAT (<c>PackageUpdate:BotPat</c>) and
+    /// always returns FORBIDDEN for GitHub App installation tokens, so enabling this in App-only mode fails fast on startup.
     /// Default: false.
     /// </summary>
     public bool ArchiveEnabled { get; set; }

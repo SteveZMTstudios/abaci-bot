@@ -1291,6 +1291,39 @@ public class StaleLifecycleServiceTests
         await _gitHub.Received().GetIssueAsync("openRuyi-Project", "openRuyi", 102, Arg.Any<CancellationToken>());
     }
 
+    [Fact]
+    public async Task RunLifecycleSweepAsync_WhenStaleCandidateCarriesStatusNew_EvictsStatusNewViaMutexEngine()
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
+        {
+            MonitoredRepositories = new List<string> { "openRuyi-Project/openRuyi" },
+            MinRateLimitRemaining = 100,
+            RequestThrottleMilliseconds = 0,
+            StaleDays = 30,
+            CloseDays = 7,
+            DryRun = false
+        });
+
+        var prWithNew = CreateMockPullRequestFromIssuesApi(301, "Old Untriaged PR", DateTimeOffset.UtcNow.AddDays(-35), GitHubLabels.StatusNew);
+        var issueWithoutNew = CreateMockIssue(302, "Old Plain Issue", DateTimeOffset.UtcNow.AddDays(-35));
+
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue> { issueWithoutNew });
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: true, Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue> { prWithNew });
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Is<string?>(s => s != null && s.StartsWith("label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+
+        var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
+        await service.RunLifecycleSweepAsync();
+
+        await _gitHub.Received(1).AddLabelsAsync("openRuyi-Project", "openRuyi", 301, Arg.Is<string[]>(a => a.SequenceEqual(new[] { GitHubLabels.StatusStale })), Arg.Any<CancellationToken>());
+        await _gitHub.Received(1).RemoveLabelAsync("openRuyi-Project", "openRuyi", 301, GitHubLabels.StatusNew, Arg.Any<CancellationToken>());
+
+        await _gitHub.Received(1).AddLabelsAsync("openRuyi-Project", "openRuyi", 302, Arg.Is<string[]>(a => a.SequenceEqual(new[] { GitHubLabels.StatusStale })), Arg.Any<CancellationToken>());
+        await _gitHub.DidNotReceive().RemoveLabelAsync("openRuyi-Project", "openRuyi", 302, Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
     private class TestableStaleLifecycleService : StaleLifecycleService
     {
         public TestableStaleLifecycleService(

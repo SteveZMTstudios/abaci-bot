@@ -39,8 +39,8 @@ public interface IRepositoryPermissionService
         CancellationToken ct = default);
 
     /// <summary>
-    /// Probes whether the active credential holds sufficient permissions to execute <c>archivePullRequest</c>
-    /// (GitHub App <c>Administration: Read &amp; write</c> or a <c>triage</c>+ PAT) on <paramref name="owner"/>/<paramref name="repo"/>.
+    /// Probes whether the active credential holds sufficient permissions to execute <c>archivePullRequest</c>/<c>unarchivePullRequest</c>
+    /// (requires a <c>triage</c>+ user PAT via <c>PackageUpdate:BotPat</c>; fails fast in GitHub App-only mode) on <paramref name="owner"/>/<paramref name="repo"/>.
     /// </summary>
     Task VerifyArchivePermissionProbeAsync(
         string owner,

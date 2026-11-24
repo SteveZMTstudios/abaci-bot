@@ -8,9 +8,28 @@ namespace abaci_bot.Options;
 /// </summary>
 public class ConversationGuardOptionsValidator : IValidateOptions<ConversationGuardOptions>
 {
+    private readonly IConfiguration? _configuration;
+
+    public ConversationGuardOptionsValidator(IConfiguration? configuration = null)
+    {
+        _configuration = configuration;
+    }
+
     public ValidateOptionsResult Validate(string? name, ConversationGuardOptions options)
     {
         var failures = new List<string>();
+
+        if (options.Enabled &&
+            options.ArchiveEnabled &&
+            _configuration != null &&
+            string.IsNullOrWhiteSpace(_configuration["PackageUpdate:BotPat"]))
+        {
+            failures.Add(
+                $"{nameof(options.ArchiveEnabled)} cannot be enabled in GitHub App-only mode because GitHub's " +
+                "archivePullRequest/unarchivePullRequest GraphQL mutations require a user role (triage or higher) " +
+                "and always return FORBIDDEN for GitHub App installation tokens. Set ConversationGuard:ArchiveEnabled=false " +
+                "(recommended) or configure a triage+ user PAT via PackageUpdate:BotPat.");
+        }
 
         if (options.InactiveCloseDays is < 7 or > 365)
         {

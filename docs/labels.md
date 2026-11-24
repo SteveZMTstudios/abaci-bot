@@ -71,7 +71,7 @@ The table below lists all labels defined in [`Services/GitHubLabels.cs`](../Serv
 
 ## 2. Mutex Groups (Single-Choice Constraints)
 
-`LabelMutexEngine` enforces mutual exclusivity across 6 distinct single-choice label groups. Scheduling any label in a group automatically schedules removals for all other labels in the same group:
+`LabelMutexEngine` enforces mutual exclusivity across 7 distinct single-choice label groups. Scheduling any label in a group automatically schedules removals for all other labels in the same group (`Status: stale-exempt` is orthogonal to Group 7 and is intentionally excluded):
 
 ```mermaid
 flowchart TD
@@ -116,6 +116,11 @@ flowchart TD
         R5["Rebuild: 1001-2500"]
         R6["Rebuild: 2501-5000"]
         R7["Rebuild: 5001+"]
+    end
+
+    subgraph G7["7. Attention Freshness State"]
+        A1["Status: New"]
+        A2["Status: Stale"]
     end
 ```
 

@@ -117,7 +117,8 @@ public class ConversationGuardPermissionProbeTests
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => probe.StartAsync(CancellationToken.None));
 
         Assert.Equal("failed", ConversationGuardPermissionProbe.ProbeStatus);
-        Assert.Contains("Administration: Read & write", ex.Message);
+        Assert.Contains("PackageUpdate:BotPat", ex.Message);
+        Assert.Contains("cannot execute archivePullRequest", ex.Message);
         Assert.Contains("ArchiveEnabled=false", ex.Message);
     }
 

@@ -21,6 +21,7 @@ public class StaleLifecycleService : BackgroundService
     private readonly IConfiguration _config;
     private readonly PullRequestLockManager _lockManager;
     private readonly ILogger<StaleLifecycleService> _logger;
+    private readonly LabelMutexEngine _mutexEngine;
     private const int MinSearchWatermarkPerSweep = 4;
     private static readonly TimeSpan MaxResetWaitThreshold = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan ClockSkewBuffer = TimeSpan.FromSeconds(1);
@@ -30,13 +31,15 @@ public class StaleLifecycleService : BackgroundService
         IOptions<StaleLifecycleOptions> options,
         IConfiguration config,
         PullRequestLockManager lockManager,
-        ILogger<StaleLifecycleService> logger)
+        ILogger<StaleLifecycleService> logger,
+        LabelMutexEngine? mutexEngine = null)
     {
         _gitHub = gitHub;
         _options = options;
         _config = config;
         _lockManager = lockManager;
         _logger = logger;
+        _mutexEngine = mutexEngine ?? new LabelMutexEngine();
     }
 
     // Internal delay for application startup, overridable in tests
@@ -243,7 +246,21 @@ public class StaleLifecycleService : BackgroundService
                     var staleComment = options.FormatStaleComment();
                     await _gitHub.CreateCommentAsync(owner, repo, item.Number, staleComment, cancellationToken);
 
-                    await _gitHub.AddLabelsAsync(owner, repo, item.Number, new[] { GitHubLabels.StatusStale }, cancellationToken);
+                    var existingLabels = latest.Labels?.Select(l => l.Name) ?? Array.Empty<string>();
+                    var labelDiff = _mutexEngine.ComputeDiff(
+                        existingLabels,
+                        new[] { GitHubLabels.StatusStale },
+                        Array.Empty<string>());
+
+                    if (labelDiff.LabelsToAdd.Count > 0)
+                    {
+                        await _gitHub.AddLabelsAsync(owner, repo, item.Number, labelDiff.LabelsToAdd.ToArray(), cancellationToken);
+                    }
+
+                    foreach (var labelToRemove in labelDiff.LabelsToRemove)
+                    {
+                        await _gitHub.RemoveLabelAsync(owner, repo, item.Number, labelToRemove, cancellationToken);
+                    }
                 }
             }
             catch (Exception ex) when (IsRateLimitOrAbuse(ex, out var retryAfter, out var rateLimitType))

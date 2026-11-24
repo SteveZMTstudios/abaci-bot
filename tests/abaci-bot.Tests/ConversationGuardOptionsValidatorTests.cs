@@ -1,4 +1,5 @@
 using abaci_bot.Options;
+using Microsoft.Extensions.Configuration;
 using Xunit;
 
 namespace abaci_bot.Tests;
@@ -81,6 +82,37 @@ public class ConversationGuardOptionsValidatorTests
         if (!expectedSuccess)
         {
             Assert.Contains(result.Failures!, f => f.Contains(nameof(options.MaxLocksPerSweep)));
+        }
+    }
+
+    [Theory]
+    [InlineData(true, true, null, false)]
+    [InlineData(true, true, "", false)]
+    [InlineData(true, true, "ghp_triage_pat", true)]
+    [InlineData(false, true, null, true)]
+    public void Validate_ArchiveEnabled_FailsFastInAppOnlyModeBeforeStartup(
+        bool enabled, bool archiveEnabled, string? botPat, bool expectedSuccess)
+    {
+        var config = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["PackageUpdate:BotPat"] = botPat
+            })
+            .Build();
+
+        var validator = new ConversationGuardOptionsValidator(config);
+        var options = new ConversationGuardOptions
+        {
+            Enabled = enabled,
+            ArchiveEnabled = archiveEnabled
+        };
+
+        var result = validator.Validate(null, options);
+
+        Assert.Equal(expectedSuccess, result.Succeeded);
+        if (!expectedSuccess)
+        {
+            Assert.Contains(result.Failures!, f => f.Contains("PackageUpdate:BotPat") && f.Contains("App-only"));
         }
     }
 }

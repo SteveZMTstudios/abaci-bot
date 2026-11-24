@@ -35,8 +35,8 @@ flowchart TD
 
 ## 3. Managed Labels and Mutex Group
 
-- `Status: Stale`: Applied to inactive items after `StaleDays`.
-- `Status: stale-exempt`: Protection label. Any item carrying this label (or other labels in `ExemptLabels`) is skipped during evaluation sweeps.
+- `Status: Stale`: Applied to inactive items after `StaleDays`. When applied via `LabelMutexEngine` (Group 7: Attention Freshness State), any mutually exclusive `Status: New` label on the item is automatically scheduled for removal while leaving `Status: stale-exempt` untouched.
+- `Status: stale-exempt`: Protection label (orthogonal to Group 7). Any item carrying this label (or other labels in `ExemptLabels`) is skipped during evaluation sweeps.
 
 ---
 

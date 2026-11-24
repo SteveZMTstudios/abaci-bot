@@ -999,6 +999,72 @@ public class BotControlPlaneAndLocaleTests
         }
     }
 
+    [Fact]
+    public async Task BotControlPlaneService_OnLockedConversation_WhenReplyReturnsForbidden_DoesNotThrowAndPreservesState()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"cp-locked-{Guid.NewGuid():N}");
+        try
+        {
+            var stateOpts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions
+            {
+                StateDirectory = tempDir,
+                DefaultLocale = "en"
+            });
+            using var store = new JsonBotStateStore(stateOpts);
+            var localeResolver = new LocaleResolver(stateOpts, store);
+            var pkgOpts = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions());
+
+            var gitHub = Substitute.For<IGitHubService>();
+            var forbiddenEx = new ForbiddenException(Substitute.For<IResponse>());
+            gitHub.CreateCommentAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns<Task>(_ => throw forbiddenEx);
+
+            var perm = Substitute.For<IRepositoryPermissionService>();
+            perm.GetUserPermissionAsync("org", "repo", "maintainer", Arg.Any<CancellationToken>())
+                .Returns(RepositoryAccessLevel.Maintain);
+            perm.GetUserPermissionAsync("org", "repo", "outsider", Arg.Any<CancellationToken>())
+                .Returns(RepositoryAccessLevel.Read);
+
+            var service = new BotControlPlaneService(gitHub, perm, store, localeResolver, pkgOpts);
+            var context = new PullRequestContext(
+                gitHubService: gitHub,
+                teamName: "captains",
+                headers: null,
+                eventType: PullRequestEventType.IssueComment,
+                owner: "org",
+                repo: "repo",
+                prNumber: 99,
+                headSha: "sha",
+                baseBranch: "main",
+                isDraft: false,
+                isMerged: false,
+                title: "locked PR",
+                body: "@abaci-bot status",
+                senderLogin: "maintainer",
+                authorLogin: "maintainer",
+                action: "created",
+                existingLabels: Array.Empty<string>(),
+                commentAction: IssueCommentAction.Created);
+
+            Assert.Null(await Record.ExceptionAsync(() => service.HandleCommandAsync(context, "abaci-bot", new ParsedBotCommand("status", "curl"), "outsider")));
+            Assert.Null(await Record.ExceptionAsync(() => service.HandleCommandAsync(context, "abaci-bot", new ParsedBotCommand("ignore", "curl regression"), "maintainer")));
+            Assert.Equal("regression", store.GetIgnoredPackage("org", "repo", "curl")?.Reason);
+
+            Assert.Null(await Record.ExceptionAsync(() => service.HandleCommandAsync(context, "abaci-bot", new ParsedBotCommand("lang", "zh"), "outsider")));
+            Assert.Equal("zh", store.GetUserLocale("outsider"));
+
+            Assert.Null(await Record.ExceptionAsync(() => service.HandleCommandAsync(context, "abaci-bot", new ParsedBotCommand("unignore", "curl"), "maintainer")));
+            Assert.Null(store.GetIgnoredPackage("org", "repo", "curl"));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
     private sealed class MutableTimeProvider : TimeProvider
     {
         private DateTimeOffset _utcNow;

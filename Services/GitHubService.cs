@@ -1478,47 +1478,11 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
             return;
         }
 
-        if (_jwtClientFactory != null)
-        {
-            var jwtClient = _jwtClientFactory(new Credentials(GenerateJwt(), AuthenticationType.Bearer));
-            var installation = await jwtClient.GitHubApps.GetInstallationForCurrent(_installationId);
-            var adminPermission = installation?.Permissions?.Administration;
-            if (adminPermission != InstallationReadWritePermissionLevel.Write)
-            {
-                throw new InvalidOperationException(
-                    $"GitHub App installation {_installationId} has Administration='{adminPermission?.StringValue ?? "none"}' " +
-                    $"for '{owner}/{repo}'; ConversationGuard:ArchiveEnabled=true requires 'Administration: Read & write' (or a triage+ BotPat).");
-            }
-
-            return;
-        }
-
-        await _authLock.WaitAsync(ct);
-        try
-        {
-            var jwt = GenerateJwt();
-            var priorCredentials = _client.Connection.Credentials;
-            _client.Connection.Credentials = new Credentials(jwt, AuthenticationType.Bearer);
-            try
-            {
-                var installation = await _client.GitHubApps.GetInstallationForCurrent(_installationId);
-                var adminPermission = installation?.Permissions?.Administration;
-                if (adminPermission != InstallationReadWritePermissionLevel.Write)
-                {
-                    throw new InvalidOperationException(
-                        $"GitHub App installation {_installationId} has Administration='{adminPermission?.StringValue ?? "none"}' " +
-                        $"for '{owner}/{repo}'; ConversationGuard:ArchiveEnabled=true requires 'Administration: Read & write' (or a triage+ BotPat).");
-                }
-            }
-            finally
-            {
-                _client.Connection.Credentials = priorCredentials;
-            }
-        }
-        finally
-        {
-            _authLock.Release();
-        }
+        throw new InvalidOperationException(
+            $"ConversationGuard:ArchiveEnabled=true is not supported in GitHub App-only mode for '{owner}/{repo}'. " +
+            "GitHub's archivePullRequest/unarchivePullRequest GraphQL mutations require a user role (triage or higher) " +
+            "and always return FORBIDDEN for GitHub App installation tokens even when Administration: Read & write is granted. " +
+            "Set ConversationGuard:ArchiveEnabled=false (recommended) or configure a triage+ user PAT via PackageUpdate:BotPat.");
     }
 
     public async Task<string> GetBotLoginAsync(CancellationToken cancellationToken = default)

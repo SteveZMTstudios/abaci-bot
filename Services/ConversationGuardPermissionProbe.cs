@@ -68,9 +68,10 @@ public class ConversationGuardPermissionProbe : IHostedService
                 ProbeStatus = "failed";
                 var fatalMessage = _options.ArchiveEnabled
                     ? $"ConversationGuard startup permission probe failed on '{owner}/{repo}' ({ex.Message}). " +
-                      "When ConversationGuard:Enabled=true and ArchiveEnabled=true, archiving pull requests requires elevated GitHub App " +
-                      "permissions ('Administration: Read & write') or a triage+ PackageUpdate:BotPat, in addition to collaborator query access. " +
-                      "Grant the required permission, set ConversationGuard:ArchiveEnabled=false (recommended for minimal permissions), " +
+                      "When ConversationGuard:Enabled=true and ArchiveEnabled=true, archiving/unarchiving pull requests via GraphQL " +
+                      "requires a triage+ user PAT (PackageUpdate:BotPat) in addition to collaborator query access; GitHub App installation " +
+                      "tokens cannot execute archivePullRequest even with Administration: Read & write. " +
+                      "Configure a triage+ PackageUpdate:BotPat, set ConversationGuard:ArchiveEnabled=false (recommended for App-only deployments), " +
                       "or set ConversationGuard:Enabled=false."
                     : $"ConversationGuard startup permission probe failed on '{owner}/{repo}' ({ex.Message}). " +
                       "When ConversationGuard:Enabled=true (including DryRun=true so authorization simulation matches production), " +
