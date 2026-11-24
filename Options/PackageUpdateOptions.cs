@@ -38,7 +38,9 @@ public class PackageUpdateOptions
     public int MaxConcurrentPullRequests { get; set; } = 5;
 
     /// <summary>
-    /// Number of days an open PR whose CI failed can remain inactive before being automatically closed to free capacity.
+    /// Number of days an open PR whose CI failed can remain inactive before being automatically closed to free capacity,
+    /// and maximum age of merged PRs before unverified branches are reclaimed. Bound to 1..363 so the derived OBS
+    /// merged-PR lookback window (<c>Math.Clamp(FailedPrTtlDays + 2, 7, 365)</c>) always stays within 7..365 days.
     /// </summary>
     public int FailedPrTtlDays { get; set; } = 7;
 
@@ -48,6 +50,10 @@ public class PackageUpdateOptions
 
     public bool IssueOnGivingUp { get; set; } = true;
 
+    /// <summary>
+    /// Shared recovery horizon in days controlling CI give-up cooldown duration, consecutive CI failure count
+    /// decay window (<c>LastFailureAt</c>), and fallback OBS block cooldown when issue creation fails. Default: 30.
+    /// </summary>
     public int GiveUpIssueCooldownDays { get; set; } = 30;
 
     public string GiveUpIssueLabel { get; set; } = Services.GitHubLabels.StatusStaleExempt;
@@ -73,7 +79,8 @@ public class LookoutUpdateOptions
 
     /// <summary>
     /// Optional path to the JSON file used to persist first-observed timestamps for Lookout candidates across restarts.
-    /// When empty, defaults to <c>lookout-first-seen.json</c> under the local application data directory.
+    /// When empty, defaults to <c>lookout-first-seen.json</c> under <c>IBotStateStore.StateDirectory</c>
+    /// (<c>BotState:StateDirectory</c>, or the local application data directory when unset).
     /// </summary>
     public string FirstSeenStatePath { get; set; } = string.Empty;
 }

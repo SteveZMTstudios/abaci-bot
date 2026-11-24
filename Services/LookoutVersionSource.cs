@@ -59,9 +59,13 @@ public class LookoutVersionSource : IUpdateCandidateSource
         var candidates = new List<UpdateCandidate>();
         var seenOutdatedPackages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var stateChanged = false;
+        var totalItemsSeen = 0;
         var completedFullSweep = false;
         var hadApiError = false;
+        var hitMaxPagesTruncation = false;
         string? lastError = null;
+        int? reportedTotal = null;
+        int? reportedPages = null;
         var baseUrl = _options.BaseUrl.TrimEnd('/');
         int page = 1;
         const int perPage = 200;
@@ -71,7 +75,8 @@ public class LookoutVersionSource : IUpdateCandidateSource
         {
             if (page > maxPages)
             {
-                _logger?.LogInformation("Reached max page limit ({Max}) for Lookout queries", maxPages);
+                hitMaxPagesTruncation = true;
+                _logger?.LogWarning("Reached max page limit ({Max}) for Lookout queries after {Count} items; results may be truncated", maxPages, totalItemsSeen);
                 break;
             }
 
@@ -110,12 +115,32 @@ public class LookoutVersionSource : IUpdateCandidateSource
                 break;
             }
 
+            if (pageResult?.Total.HasValue == true)
+            {
+                reportedTotal = pageResult.Total.Value;
+            }
+
+            if (pageResult?.Pages.HasValue == true)
+            {
+                reportedPages = pageResult.Pages.Value;
+            }
+
             var items = pageResult?.Packages ?? pageResult?.Data ?? pageResult?.Items;
             if (items == null || items.Count == 0)
             {
-                completedFullSweep = true;
+                (_, completedFullSweep) = EvaluatePaginationState(
+                    page,
+                    maxPages,
+                    pageItemCount: 0,
+                    perPage,
+                    totalItemsSeen,
+                    reportedPages,
+                    reportedTotal,
+                    hadApiError);
                 break;
             }
+
+            totalItemsSeen += items.Count;
 
             foreach (var pkg in items)
             {
@@ -202,9 +227,18 @@ public class LookoutVersionSource : IUpdateCandidateSource
                     PublishedAt: effectivePublishedAt));
             }
 
-            if (items.Count < perPage)
+            bool shouldStop;
+            (shouldStop, completedFullSweep) = EvaluatePaginationState(
+                page,
+                maxPages,
+                items.Count,
+                perPage,
+                totalItemsSeen,
+                reportedPages,
+                reportedTotal,
+                hadApiError);
+            if (shouldStop)
             {
-                completedFullSweep = true;
                 break;
             }
 
@@ -212,7 +246,7 @@ public class LookoutVersionSource : IUpdateCandidateSource
             page++;
         }
 
-        if (completedFullSweep)
+        if (completedFullSweep && totalItemsSeen > 0)
         {
             foreach (var key in _firstSeenVersions.Keys)
             {
@@ -233,10 +267,13 @@ public class LookoutVersionSource : IUpdateCandidateSource
             _logger?.LogError("Lookout version source failed with API/parse errors and returned 0 candidates. Last error: {Error}", lastError);
             _healthState?.RecordSourceOutcome(SourceName, "failed", 0, lastError);
         }
-        else if (hadApiError)
+        else if (hadApiError || hitMaxPagesTruncation)
         {
-            _logger?.LogWarning("Lookout version source returned partial results ({Count} candidates) due to page fetch errors. Last error: {Error}", candidates.Count, lastError);
-            _healthState?.RecordSourceOutcome(SourceName, "degraded", candidates.Count, lastError);
+            var degradedReason = hadApiError
+                ? lastError
+                : $"Lookout pagination truncated at max page limit ({maxPages}) after {totalItemsSeen} items.";
+            _logger?.LogWarning("Lookout version source returned partial results ({Count} candidates): {Reason}", candidates.Count, degradedReason);
+            _healthState?.RecordSourceOutcome(SourceName, "degraded", candidates.Count, degradedReason);
         }
         else
         {
@@ -245,6 +282,43 @@ public class LookoutVersionSource : IUpdateCandidateSource
 
         _logger?.LogInformation("Lookout version source discovered {Count} outdated candidates", candidates.Count);
         return candidates;
+    }
+
+    internal static (bool ShouldStop, bool CompletedFullSweep) EvaluatePaginationState(
+        int page,
+        int maxPages,
+        int pageItemCount,
+        int perPage,
+        int totalItemsSeen,
+        int? reportedPages,
+        int? reportedTotal,
+        bool hadApiError)
+    {
+        var hasExplicitPages = reportedPages is > 0;
+        var hasExplicitTotal = reportedTotal is > 0;
+        var inconsistentZeroTotal = reportedTotal == 0 && (pageItemCount > 0 || totalItemsSeen > 0);
+
+        if (pageItemCount == 0)
+        {
+            var serverFinished = !inconsistentZeroTotal
+                && (!hasExplicitPages || page > reportedPages!.Value)
+                && (!hasExplicitTotal || totalItemsSeen >= reportedTotal!.Value);
+            return (true, !hadApiError && serverFinished && page <= maxPages);
+        }
+
+        var serverDone = (hasExplicitPages && page >= reportedPages!.Value)
+            || (!hasExplicitPages && hasExplicitTotal && totalItemsSeen >= reportedTotal!.Value);
+        var serverHasMore = (hasExplicitPages && page < reportedPages!.Value)
+            || (hasExplicitTotal && totalItemsSeen < reportedTotal!.Value);
+
+        if (serverDone || (!serverHasMore && pageItemCount < perPage))
+        {
+            var totalConsistent = !inconsistentZeroTotal
+                && (!hasExplicitTotal || totalItemsSeen >= reportedTotal!.Value);
+            return (true, !hadApiError && totalConsistent && page <= maxPages);
+        }
+
+        return (false, false);
     }
 
     private void LoadFirstSeenState()
@@ -265,7 +339,7 @@ public class LookoutVersionSource : IUpdateCandidateSource
 
             foreach (var (pkgName, entry) in persisted)
             {
-                if (!string.IsNullOrWhiteSpace(pkgName) && !string.IsNullOrWhiteSpace(entry.Version))
+                if (!string.IsNullOrWhiteSpace(pkgName) && entry is not null && !string.IsNullOrWhiteSpace(entry.Version))
                 {
                     _firstSeenVersions[pkgName] = (entry.Version, entry.FirstSeen);
                 }
@@ -319,6 +393,12 @@ public class LookoutVersionSource : IUpdateCandidateSource
 
         [JsonPropertyName("items")]
         public List<LookoutPackageItem>? Items { get; set; }
+
+        [JsonPropertyName("total")]
+        public int? Total { get; set; }
+
+        [JsonPropertyName("pages")]
+        public int? Pages { get; set; }
     }
 
     public class LookoutPackageItem

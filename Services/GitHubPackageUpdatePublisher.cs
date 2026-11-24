@@ -13,10 +13,15 @@ namespace abaci_bot.Services;
 /// </summary>
 public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
 {
+    private static readonly Regex PatchDirectiveRegex = new(
+        @"^Patch\d*:",
+        RegexOptions.Compiled | RegexOptions.Multiline | RegexOptions.IgnoreCase);
+
     private readonly IGitHubService _gitHubService;
     private readonly PackageUpdateOptions _options;
     private readonly IBotIdentityProvider? _botIdentity;
     private readonly ILocaleResolver? _localeResolver;
+    private readonly IReadOnlyList<ISpecVersionRewriter>? _specRewriters;
     private readonly ILogger<GitHubPackageUpdatePublisher>? _logger;
 
     public GitHubPackageUpdatePublisher(
@@ -24,13 +29,15 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         IOptions<PackageUpdateOptions> options,
         ILogger<GitHubPackageUpdatePublisher>? logger = null,
         IBotIdentityProvider? botIdentity = null,
-        ILocaleResolver? localeResolver = null)
+        ILocaleResolver? localeResolver = null,
+        IEnumerable<ISpecVersionRewriter>? specRewriters = null)
     {
         _gitHubService = gitHubService;
         _options = options.Value;
         _logger = logger;
         _botIdentity = botIdentity ?? gitHubService as IBotIdentityProvider;
         _localeResolver = localeResolver;
+        _specRewriters = specRewriters?.ToList();
     }
 
     public async Task<PublishResult> PublishUpdateAsync(
@@ -77,6 +84,10 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
             }
         }
 
+        var effectiveContent = rewriteResult.UpdatedContent;
+        var effectiveCandidate = candidate;
+        var needsBranchCommit = true;
+
         var existingBranchSha = await _gitHubService.GetRefShaAsync(owner, repo, branchName, ct);
         var existingPr = await _gitHubService.FindOpenPullRequestByHeadAsync(owner, repo, branchName, ct);
 
@@ -98,6 +109,12 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
             {
                 _logger?.LogWarning("Could not retrieve latest commit info for branch {Branch}; failing closed", branchName);
                 return new PublishResult(false, false, $"Branch commit details unavailable for '{branchName}' (fail-closed)");
+            }
+
+            if (_botIdentity != null && string.IsNullOrWhiteSpace(botLogin))
+            {
+                _logger?.LogWarning("Could not resolve live bot identity for branch {Branch}; failing closed", branchName);
+                return new PublishResult(false, false, $"Live bot identity unavailable for '{branchName}' (fail-closed)");
             }
 
             if (!IsOwnBotCommit(latestCommit, botLogin))
@@ -143,21 +160,47 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
             }
 
             // 2. Branch SPEC version reading (strong idempotency: skip if already at target version, ignoring +suffix)
+            string? branchSpecContent;
+            var branchAlreadyAtTarget = false;
             try
             {
-                var branchSpecContent = await _gitHubService.GetFileContentAsync(owner, repo, finalSpecPath, branchName, ct);
+                branchSpecContent = await _gitHubService.GetFileContentAsync(owner, repo, finalSpecPath, branchName, ct);
                 if (UpdateAdmission.IsVersionAtTarget(branchSpecContent, candidate.TargetVersion))
                 {
-                    _logger?.LogInformation("Branch {Branch} is already at target version {Version}; skipping push",
+                    if (existingPr != null)
+                    {
+                        _logger?.LogInformation("Branch {Branch} and PR #{PrNumber} are already at target version {Version}; skipping push",
+                            branchName, existingPr.Number, candidate.TargetVersion);
+                        return new PublishResult(true, true, $"Branch already at target version {candidate.TargetVersion}",
+                            existingPr.Number, existingPr.HtmlUrl);
+                    }
+
+                    _logger?.LogInformation("Branch {Branch} is already at target version {Version} without an open PR; verifying against live base before creating PR",
                         branchName, candidate.TargetVersion);
-                    return new PublishResult(true, true, $"Branch already at target version {candidate.TargetVersion}",
-                        existingPr?.Number, existingPr?.HtmlUrl);
+                    branchAlreadyAtTarget = true;
                 }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger?.LogWarning(ex, "Could not read existing SPEC from branch {Branch}; failing closed", branchName);
                 return new PublishResult(false, false, $"Failed to read spec on branch '{branchName}' (fail-closed)");
+            }
+
+            // 3. Re-verify and re-rewrite against live baseBranch SPEC so #!NoAutoUpdate, admission blocks,
+            // and non-version edits merged into main after the PR opened are preserved (including orphan branches).
+            var baseCheck = await VerifyLiveBaseSpecAsync(
+                owner, repo, finalSpecPath, baseBranch, candidate, rewriteResult, allowReRewrite: true, ct);
+            if (baseCheck.AbortResult != null)
+            {
+                return baseCheck.AbortResult;
+            }
+            effectiveContent = baseCheck.EffectiveContent;
+            effectiveCandidate = baseCheck.EffectiveCandidate;
+
+            if (branchAlreadyAtTarget &&
+                string.Equals(NormalizeLineEndings(branchSpecContent), NormalizeLineEndings(effectiveContent), StringComparison.Ordinal))
+            {
+                needsBranchCommit = false;
             }
         }
         else
@@ -169,16 +212,26 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
                 return new PublishResult(false, false, $"Base branch '{baseBranch}' ref not found");
             }
 
+            // Re-verify and re-rewrite against live base SPEC at baseSha so stale catalog caches never overwrite main commits or bypass #!NoAutoUpdate.
+            var baseCheck = await VerifyLiveBaseSpecAsync(
+                owner, repo, finalSpecPath, baseSha, candidate, rewriteResult, allowReRewrite: true, ct);
+            if (baseCheck.AbortResult != null)
+            {
+                return baseCheck.AbortResult;
+            }
+            effectiveContent = baseCheck.EffectiveContent;
+            effectiveCandidate = baseCheck.EffectiveCandidate;
+
             if (!_options.DryRun)
             {
                 await _gitHubService.CreateOrUpdateRefAsync(owner, repo, branchName, baseSha, force: false, ct);
             }
         }
 
-        var commitMessage = $"SPECS: bump {candidate.PackageName} {candidate.CurrentVersion} -> {candidate.TargetVersion}";
+        var commitMessage = $"SPECS: bump {effectiveCandidate.PackageName} {effectiveCandidate.CurrentVersion} -> {effectiveCandidate.TargetVersion}";
         var prTitle = commitMessage;
         var locale = _localeResolver?.ResolveForBotPullRequest(owner, repo);
-        var prBody = GeneratePullRequestBody(candidate, locale, botLogin);
+        var prBody = GeneratePullRequestBody(effectiveCandidate, locale, botLogin);
 
         if (_options.DryRun)
         {
@@ -186,11 +239,14 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
             return new PublishResult(true, false, "[DryRun] Simulated publish", existingPr?.Number, existingPr?.HtmlUrl);
         }
 
-        // Commit updated SPEC to branch
-        await _gitHubService.UpdateFileContentAsync(
-            owner, repo, finalSpecPath, commitMessage, rewriteResult.UpdatedContent, branchName, ct);
+        if (needsBranchCommit)
+        {
+            // Commit updated SPEC to branch
+            await _gitHubService.UpdateFileContentAsync(
+                owner, repo, finalSpecPath, commitMessage, effectiveContent, branchName, ct);
+        }
 
-        var requiredLabels = GetRequiredLabels(candidate);
+        var requiredLabels = GetRequiredLabels(effectiveCandidate);
         PullRequest pr;
         if (existingPr != null)
         {
@@ -220,6 +276,104 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         }
 
         return new PublishResult(true, false, null, pr.Number, pr.HtmlUrl);
+    }
+
+    private async Task<(PublishResult? AbortResult, string EffectiveContent, UpdateCandidate EffectiveCandidate)> VerifyLiveBaseSpecAsync(
+        string owner,
+        string repo,
+        string finalSpecPath,
+        string baseRefOrSha,
+        UpdateCandidate candidate,
+        SpecRewriteResult rewriteResult,
+        bool allowReRewrite,
+        CancellationToken ct)
+    {
+        string? liveBaseSpec;
+        try
+        {
+            liveBaseSpec = await _gitHubService.GetFileContentAsync(owner, repo, finalSpecPath, baseRefOrSha, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogWarning(ex, "Could not read live base SPEC {SpecPath} at {BaseRef}; failing closed", finalSpecPath, baseRefOrSha);
+            return (new PublishResult(false, false, $"Failed to read live base spec at '{baseRefOrSha}' (fail-closed)"),
+                rewriteResult.UpdatedContent, candidate);
+        }
+
+        if (string.IsNullOrWhiteSpace(liveBaseSpec))
+        {
+            _logger?.LogWarning("Live base SPEC {SpecPath} at {BaseRef} is empty or missing; failing closed", finalSpecPath, baseRefOrSha);
+            return (new PublishResult(false, false, $"Live base SPEC '{finalSpecPath}' at '{baseRefOrSha}' is empty or missing (fail-closed)"),
+                rewriteResult.UpdatedContent, candidate);
+        }
+
+        if (NoAutoUpdateMarker.HasNoAutoUpdate(liveBaseSpec, out var liveNoAutoReason))
+        {
+            _logger?.LogInformation(
+                "Live base SPEC {SpecPath} at {BaseRef} contains #!NoAutoUpdate ({Reason}); skipping update for {Package}",
+                finalSpecPath, baseRefOrSha, liveNoAutoReason ?? "no reason", candidate.PackageName);
+            return (new PublishResult(true, true, "Live base SPEC has #!NoAutoUpdate"),
+                rewriteResult.UpdatedContent, candidate);
+        }
+
+        if (UpdateAdmission.IsVersionAtOrPastTarget(liveBaseSpec, candidate.TargetVersion))
+        {
+            _logger?.LogInformation(
+                "Live base SPEC {SpecPath} at {BaseRef} is already at or past target version {Version}; skipping update for {Package}",
+                finalSpecPath, baseRefOrSha, candidate.TargetVersion, candidate.PackageName);
+            return (new PublishResult(true, true, $"Live base SPEC already at or past target version {candidate.TargetVersion}"),
+                rewriteResult.UpdatedContent, candidate);
+        }
+
+        if (_options.SkipPackagesWithPatches && PatchDirectiveRegex.IsMatch(liveBaseSpec))
+        {
+            _logger?.LogInformation(
+                "Live base SPEC {SpecPath} at {BaseRef} contains downstream Patch directives and SkipPackagesWithPatches=true; skipping {Package}",
+                finalSpecPath, baseRefOrSha, candidate.PackageName);
+            return (new PublishResult(true, true, "Live base SPEC contains Patch directives and SkipPackagesWithPatches=true"),
+                rewriteResult.UpdatedContent, candidate);
+        }
+
+        var effectiveCandidate = UpdateAdmission.TryExtractCurrentVersion(liveBaseSpec, out var liveVersion)
+            ? candidate with { CurrentVersion = liveVersion }
+            : candidate;
+
+        if (!_options.AllowCrossMajorVersion &&
+            UpdateAdmission.IsCrossMajorVersion(effectiveCandidate.CurrentVersion, effectiveCandidate.TargetVersion))
+        {
+            _logger?.LogInformation(
+                "Live base SPEC {SpecPath} at {BaseRef} would cross major version boundary ({Current} -> {Target}); skipping {Package}",
+                finalSpecPath, baseRefOrSha, effectiveCandidate.CurrentVersion, effectiveCandidate.TargetVersion, effectiveCandidate.PackageName);
+            return (new PublishResult(true, true, "Live base SPEC crosses major version boundary and AllowCrossMajorVersion=false"),
+                rewriteResult.UpdatedContent, effectiveCandidate);
+        }
+
+        if (allowReRewrite && _specRewriters is { Count: > 0 })
+        {
+            var normalizedDir = Path.GetDirectoryName(finalSpecPath.Replace('\\', '/'))?.Replace('\\', '/');
+            var dirName = !string.IsNullOrEmpty(normalizedDir)
+                ? Path.GetFileName(normalizedDir)
+                : effectiveCandidate.PackageName;
+            var liveContext = new SpecContext(effectiveCandidate.PackageName, dirName, liveBaseSpec, finalSpecPath);
+            var rewriter = _specRewriters.FirstOrDefault(r => r.CanHandle(liveContext));
+            if (rewriter == null)
+            {
+                return (new PublishResult(true, true, "Live base SPEC has no compatible automated rewriter"),
+                    rewriteResult.UpdatedContent, effectiveCandidate);
+            }
+
+            var liveRewrite = rewriter.Rewrite(liveContext, effectiveCandidate.TargetVersion);
+            if (!liveRewrite.Success || !liveRewrite.HasChanged)
+            {
+                return (new PublishResult(true, true,
+                        $"Live base SPEC rewrite produced no change or failed: {liveRewrite.ErrorMessage ?? "no-op"}"),
+                    rewriteResult.UpdatedContent, effectiveCandidate);
+            }
+
+            return (null, liveRewrite.UpdatedContent, effectiveCandidate);
+        }
+
+        return (null, rewriteResult.UpdatedContent, effectiveCandidate);
     }
 
     internal static string[] GetRequiredLabels(UpdateCandidate candidate)
@@ -271,9 +425,15 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
 
     internal bool IsOwnBotCommit(BranchCommitInfo commit, string? liveBotLogin = null)
     {
-        var ownLogins = BotCommitOwnership.BuildOwnBotLoginSet(liveBotLogin, _options.BotLogin);
+        var ownLogins = BotCommitOwnership.BuildOwnBotLoginSet(
+            liveBotLogin,
+            _options.BotLogin,
+            requireLive: _botIdentity != null);
         return BotCommitOwnership.IsOwnBotCommit(commit, ownLogins);
     }
+
+    private static string? NormalizeLineEndings(string? value)
+        => value?.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
 
     public static string GeneratePullRequestBody(UpdateCandidate candidate, string? locale = null, string? botLogin = null)
     {

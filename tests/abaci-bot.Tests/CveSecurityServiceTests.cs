@@ -365,4 +365,200 @@ public class CveSecurityServiceTests
         Assert.Equal(GitHubLabels.Severity1, report.SeverityLabel);
         Assert.Equal("NVD", report.Source);
     }
+
+    [Fact]
+    public async Task QueryCveWithStatusAsync_ReportsNvdAttemptedAccuratelyAcrossOsvHitCacheHitAndNvd429()
+    {
+        var service = CreateService(req =>
+        {
+            if (req.RequestUri!.AbsolutePath.EndsWith("CVE-2026-1001", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""{"id":"CVE-2026-1001","database_specific":{"severity":6.5}}""")
+                };
+            }
+
+            if (req.RequestUri.Host.Contains("osv.dev"))
+            {
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+        });
+
+        // 1. OSV hit -> NvdAttempted = false; second call -> cache hit -> NvdAttempted = false
+        var (_, osvAttempted) = await service.QueryCveWithStatusAsync("CVE-2026-1001");
+        var (_, cachedAttempted) = await service.QueryCveWithStatusAsync("CVE-2026-1001");
+        Assert.False(osvAttempted);
+        Assert.False(cachedAttempted);
+
+        // 2. OSV misses -> dispatches NVD and hits 429 -> NvdAttempted = true
+        var (failedReport, nvd429Attempted) = await service.QueryCveWithStatusAsync("CVE-2026-4290");
+        Assert.True(nvd429Attempted);
+        Assert.Equal(CveReport.SourcePartiallyFailed, failedReport.Source);
+    }
+
+    [Fact]
+    public async Task QueryCveWithStatusAsync_SkipOsvTrue_BypassesOsvHttp_AndCacheRemainsBounded()
+    {
+        var requestedUrls = new List<string>();
+        var stub = new DelegatingHandlerStub(req =>
+        {
+            var url = req.RequestUri!.ToString();
+            lock (requestedUrls)
+            {
+                requestedUrls.Add(url);
+            }
+
+            if (req.RequestUri.Host.Contains("osv.dev"))
+            {
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("""
+                    {
+                      "vulnerabilities": [{
+                        "cve": {
+                          "descriptions": [{"value": "NVD description"}],
+                          "metrics": {"cvssMetricV31": [{"cvssData": {"baseScore": 8.1}}]}
+                        }
+                      }]
+                    }
+                    """)
+            };
+        });
+        var client = new HttpClient(stub);
+        _httpClientFactory.CreateClient("OsvClient").Returns(client);
+        _httpClientFactory.CreateClient("NvdClient").Returns(client);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new CveSecurityOptions
+        {
+            OsvApiBaseUrl = "https://api.osv.dev/v1/vulns",
+            NvdApiBaseUrl = "https://services.nvd.nist.gov/rest/json/cves/2.0",
+            CacheExpirationHours = 12,
+            UnknownCacheExpirationHours = 1,
+            RequestTimeoutSeconds = 5
+        });
+
+        var boundedService = new CveSecurityService(_httpClientFactory, options, logger: null, maxCacheEntries: 4);
+
+        var (skipOsvReport, skipOsvNvdAttempted) = await boundedService.QueryCveWithStatusAsync("CVE-2026-5555", skipOsv: true);
+        Assert.True(skipOsvNvdAttempted);
+        Assert.Equal("NVD", skipOsvReport.Source);
+        Assert.Equal(8.1, skipOsvReport.CvssScore);
+        Assert.DoesNotContain(requestedUrls, u => u.Contains("osv.dev", StringComparison.OrdinalIgnoreCase));
+
+        for (int i = 0; i < 6; i++)
+        {
+            await boundedService.QueryCveWithStatusAsync($"CVE-2026-56{i:D2}", skipOsv: true);
+        }
+
+        Assert.InRange(boundedService.Cache.Count, 1, 4);
+    }
+
+    [Fact]
+    public async Task QueryCveAsync_UnratedOsvEntryWithoutCvss_UsesUnknownShortCacheTtl()
+    {
+        var stub = new DelegatingHandlerStub(req =>
+        {
+            if (req.RequestUri!.AbsoluteUri.Contains("osv.dev", StringComparison.OrdinalIgnoreCase))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""{"id":"GHSA-unrated-0001","summary":"Awaiting CVSS scoring"}""")
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+
+        var client = new HttpClient(stub);
+        _httpClientFactory.CreateClient("OsvClient").Returns(client);
+        _httpClientFactory.CreateClient("NvdClient").Returns(client);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new CveSecurityOptions
+        {
+            OsvApiBaseUrl = "https://api.osv.dev/v1/vulns",
+            NvdApiBaseUrl = "https://services.nvd.nist.gov/rest/json/cves/2.0",
+            CacheExpirationHours = 12,
+            UnknownCacheExpirationHours = 1,
+            RequestTimeoutSeconds = 5
+        });
+
+        var svc = new CveSecurityService(_httpClientFactory, options);
+        var before = DateTime.UtcNow;
+        var report = await svc.QueryCveAsync("GHSA-unrated-0001");
+        Assert.Equal("OSV.dev", report.Source);
+        Assert.Null(report.CvssScore);
+
+        var cached = svc.Cache["GHSA-UNRATED-0001"];
+        var ttl = cached.Expiry - before;
+        Assert.True(ttl <= TimeSpan.FromHours(1).Add(TimeSpan.FromMinutes(1)), $"Expected short UnknownCacheExpirationHours (~1h), got {ttl}");
+    }
+
+    [Fact]
+    public async Task QueryCveWithStatusAsync_SkipOsvTrue_BypassesCachedUnratedOsvEntry_AndQueriesNvd()
+    {
+        var nvdAvailable = false;
+        var stub = new DelegatingHandlerStub(req =>
+        {
+            if (req.RequestUri!.AbsoluteUri.Contains("osv.dev", StringComparison.OrdinalIgnoreCase))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""{"id":"CVE-2026-7777","summary":"Unscored OSV advisory"}""")
+                };
+            }
+
+            if (!nvdAvailable)
+            {
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("""
+                    {
+                      "vulnerabilities": [{
+                        "cve": {
+                          "descriptions": [{"value": "Enriched NVD description"}],
+                          "metrics": {"cvssMetricV31": [{"cvssData": {"baseScore": 7.8}}]}
+                        }
+                      }]
+                    }
+                    """)
+            };
+        });
+
+        var client = new HttpClient(stub);
+        _httpClientFactory.CreateClient("OsvClient").Returns(client);
+        _httpClientFactory.CreateClient("NvdClient").Returns(client);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new CveSecurityOptions
+        {
+            OsvApiBaseUrl = "https://api.osv.dev/v1/vulns",
+            NvdApiBaseUrl = "https://services.nvd.nist.gov/rest/json/cves/2.0",
+            CacheExpirationHours = 12,
+            UnknownCacheExpirationHours = 1,
+            RequestTimeoutSeconds = 5
+        });
+
+        var svc = new CveSecurityService(_httpClientFactory, options);
+
+        // First call populates the cache with an unscored OSV report.
+        var (initialReport, initialNvdAttempted) = await svc.QueryCveWithStatusAsync("CVE-2026-7777", skipOsv: false);
+        Assert.True(initialNvdAttempted);
+        Assert.Equal("OSV.dev", initialReport.Source);
+        Assert.Null(initialReport.CvssScore);
+
+        // Second call with skipOsv: true bypasses the unrated OSV cache entry so NVD enriches the score.
+        nvdAvailable = true;
+        var (enrichedReport, secondNvdAttempted) = await svc.QueryCveWithStatusAsync("CVE-2026-7777", skipOsv: true);
+        Assert.True(secondNvdAttempted);
+        Assert.Equal("NVD", enrichedReport.Source);
+        Assert.Equal(7.8, enrichedReport.CvssScore);
+    }
 }

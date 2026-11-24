@@ -218,15 +218,10 @@ public class PackageUpdateService : BackgroundService
                     continue;
                 }
 
-                var match = BlockedIssueTitleRegex.Match(issue.Title ?? string.Empty);
-                if (match.Success)
+                if (TryExtractBlockedPackage(issue, out var pkg))
                 {
-                    var pkg = match.Groups["pkg"].Value.Trim();
-                    if (!string.IsNullOrEmpty(pkg))
-                    {
-                        blockedPackages.Add(pkg);
-                        _trackedBlockedIssues.TryAdd(pkg, issue.Number);
-                    }
+                    blockedPackages.Add(pkg);
+                    _trackedBlockedIssues.TryAdd(pkg, issue.Number);
                 }
             }
 
@@ -343,9 +338,16 @@ public class PackageUpdateService : BackgroundService
         else
         {
             _schedulerOriginOffset = scheduleResult.NextOriginOffset;
-            _stateStore?.SetCursorWatermark(
-                _schedulerOffsetStateKey,
-                scheduleResult.NextOriginOffset.ToString(CultureInfo.InvariantCulture));
+            try
+            {
+                _stateStore?.SetCursorWatermark(
+                    _schedulerOffsetStateKey,
+                    scheduleResult.NextOriginOffset.ToString(CultureInfo.InvariantCulture));
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Failed to persist candidate scheduler origin offset watermark");
+            }
 
             // Sources that scan a bounded slice (Rust crates) must not advance past candidates
             // that the scheduler could not attempt because the sweep quota was exhausted.
@@ -355,7 +357,7 @@ public class PackageUpdateService : BackgroundService
                 {
                     try
                     {
-                        cursor.CompleteSweep(scheduleResult.ProcessedPackageNames);
+                        cursor.CompleteSweep(scheduleResult.ProcessedPackageNames, scheduleResult.FailedPackageNames);
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
@@ -566,9 +568,16 @@ public class PackageUpdateService : BackgroundService
         if (publishResult.Skipped)
         {
             _logger?.LogDebug("Publish skipped for {Package}: {Reason}", candidate.PackageName, publishResult.SkipReason);
+            return false;
         }
 
-        return false;
+        var failureReason = string.IsNullOrWhiteSpace(publishResult.SkipReason)
+            ? "unknown publish failure"
+            : publishResult.SkipReason;
+        _logger?.LogError("Publish failed for {Package} -> {Version}: {Reason}",
+            effectiveCandidate.PackageName, effectiveCandidate.TargetVersion, failureReason);
+        throw new InvalidOperationException(
+            $"Publish failed for {effectiveCandidate.PackageName} -> {effectiveCandidate.TargetVersion}: {failureReason}");
     }
 
     private async Task<int?> CleanUpStaleFailedPrsAsync(
@@ -680,10 +689,13 @@ public class PackageUpdateService : BackgroundService
                 var runsOnHead = runs.Where(r => headSha == null || string.Equals(r.HeadSha, headSha, StringComparison.OrdinalIgnoreCase)).ToList();
                 bool isFailed = runsOnHead.Any(r => r.Conclusion == Octokit.WorkflowRunConclusion.Failure);
 
-                // Backfill updated #!RemoteAsset checksums when remoteasset workflow fails
+                // Backfill updated #!RemoteAsset checksums when remoteasset workflow fails on a pure-bot branch
                 if (isRemoteAssetFailed && !string.IsNullOrWhiteSpace(branchName) && remoteAssetRun != null && !_options.DryRun)
                 {
-                    await _remoteAssetBackfiller.TryBackfillAsync(owner, repo, branchName, prNumber, remoteAssetRun.Id, ct);
+                    if (await CanBackfillBotBranchAsync(owner, repo, branchName, ownBotLogins, ct))
+                    {
+                        await _remoteAssetBackfiller.TryBackfillAsync(owner, repo, branchName, prNumber, remoteAssetRun.Id, ct);
+                    }
                 }
 
                 // Wire failure detection into cooldown tracking
@@ -783,20 +795,44 @@ public class PackageUpdateService : BackgroundService
 
     private async Task<IReadOnlySet<string>> ResolveOwnBotLoginsAsync(CancellationToken ct)
     {
-        string? liveBotLogin = null;
-        if (_botIdentity != null)
+        var ownLogins = await BotCommitOwnership.ResolveOwnBotLoginsAsync(
+            _botIdentity,
+            _options.BotLogin,
+            requireLiveWhenProviderPresent: true,
+            ct);
+        if (_botIdentity != null && ownLogins.Count == 0)
         {
-            try
-            {
-                liveBotLogin = await _botIdentity.GetBotLoginAsync(ct);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger?.LogDebug(ex, "Could not resolve live bot login during open PR ownership check");
-            }
+            _logger?.LogWarning("Could not resolve live bot identity; failing closed on branch/PR ownership checks");
         }
 
-        return BotCommitOwnership.BuildOwnBotLoginSet(liveBotLogin, _options.BotLogin);
+        return ownLogins;
+    }
+
+    private async Task<bool> CanBackfillBotBranchAsync(
+        string owner,
+        string repo,
+        string branchName,
+        IReadOnlySet<string> ownBotLogins,
+        CancellationToken ct)
+    {
+        try
+        {
+            var latestCommit = await _gitHubService.GetBranchLatestCommitAsync(owner, repo, branchName, ct);
+            var isBotCommit = BotCommitOwnership.IsOwnBotCommit(latestCommit, ownBotLogins);
+            if (!isBotCommit)
+            {
+                _logger?.LogWarning(
+                    "Skipping #!RemoteAsset backfill on branch {Branch} because latest commit is missing or authored by a human ({Author})",
+                    branchName, latestCommit?.AuthorLogin ?? "unknown");
+            }
+
+            return isBotCommit;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogWarning(ex, "Failed to verify branch commit ownership before #!RemoteAsset backfill on {Branch}; skipping fail-closed", branchName);
+            return false;
+        }
     }
 
     private async Task<bool> CanAutoCloseFailedPrAsync(
@@ -878,14 +914,43 @@ public class PackageUpdateService : BackgroundService
         }
     }
 
+    internal static bool TryExtractBlockedPackage(Octokit.Issue issue, out string packageName)
+    {
+        if (ObsPostMergeVerifier.TryExtractObsBlockedPackage(issue, out packageName))
+        {
+            return true;
+        }
+
+        var match = BlockedIssueTitleRegex.Match(issue.Title ?? string.Empty);
+        if (match.Success)
+        {
+            var pkg = match.Groups["pkg"].Value.Trim();
+            if (!string.IsNullOrEmpty(pkg))
+            {
+                packageName = pkg;
+                return true;
+            }
+        }
+
+        packageName = string.Empty;
+        return false;
+    }
+
     public bool IsInCooldown(string packageName)
     {
         if (string.IsNullOrWhiteSpace(packageName))
             return false;
 
+        return IsInCiCooldown(packageName) || IsInObsBlockCooldown(packageName);
+    }
+
+    private bool IsInCiCooldown(string packageName)
+    {
+        var now = DateTimeOffset.UtcNow;
+
         if (_cooldowns.TryGetValue(packageName, out var cooldownUntil))
         {
-            if (DateTimeOffset.UtcNow < cooldownUntil)
+            if (now < cooldownUntil)
                 return true;
 
             _cooldowns.TryRemove(packageName, out _);
@@ -895,15 +960,35 @@ public class PackageUpdateService : BackgroundService
         var persisted = owner != null && repo != null
             ? _stateStore?.GetPackageFailure(owner, repo, packageName)
             : null;
-        if (persisted?.CooldownUntil != null)
+        if (persisted?.CooldownUntil.HasValue == true)
         {
-            if (DateTimeOffset.UtcNow < persisted.CooldownUntil.Value)
-            {
-                _cooldowns[packageName] = persisted.CooldownUntil.Value;
+            if (now < persisted.CooldownUntil.Value)
                 return true;
-            }
 
-            _stateStore?.ClearPackageFailure(owner!, repo!, packageName);
+            if (!_options.DryRun)
+            {
+                TryPersistClearPackageFailure(owner!, repo!, packageName);
+            }
+        }
+
+        return false;
+    }
+
+    private bool IsInObsBlockCooldown(string packageName)
+    {
+        var (owner, repo) = ParseTargetRepository();
+        var persisted = owner != null && repo != null
+            ? _stateStore?.GetPackageFailure(owner, repo, packageName)
+            : null;
+        if (persisted?.ObsBlockedUntil.HasValue == true)
+        {
+            if (DateTimeOffset.UtcNow < persisted.ObsBlockedUntil.Value)
+                return true;
+
+            if (!_options.DryRun)
+            {
+                TryPersistClearObsBlockCooldown(owner!, repo!, packageName);
+            }
         }
 
         return false;
@@ -917,16 +1002,17 @@ public class PackageUpdateService : BackgroundService
         _cooldowns.TryRemove(packageName, out _);
         _failureCounts.TryRemove(packageName, out _);
         var (owner, repo) = ParseTargetRepository();
-        if (owner != null && repo != null)
+        if (owner != null && repo != null && !_options.DryRun)
         {
-            _stateStore?.ClearPackageFailure(owner, repo, packageName);
+            TryPersistClearPackageFailure(owner, repo, packageName);
+            TryPersistClearObsBlockCooldown(owner, repo, packageName);
         }
         _logger?.LogInformation("Reset cooldown and failure count for package {Package}", packageName);
     }
 
     public bool RecordFailure(string packageName)
     {
-        if (string.IsNullOrWhiteSpace(packageName) || IsInCooldown(packageName))
+        if (string.IsNullOrWhiteSpace(packageName) || IsInCiCooldown(packageName))
             return false;
 
         var (owner, repo) = ParseTargetRepository();
@@ -942,7 +1028,7 @@ public class PackageUpdateService : BackgroundService
             if (persisted.LastFailureAt.HasValue && DateTimeOffset.UtcNow - persisted.LastFailureAt.Value > decayWindow)
             {
                 _failureCounts.TryRemove(packageName, out _);
-                _stateStore?.ClearPackageFailure(owner!, repo!, packageName);
+                TryPersistClearPackageFailure(owner!, repo!, packageName);
                 _logger?.LogInformation("Decayed stale CI failure count for package {Package} (last failure was >{Days} days ago)",
                     packageName, cooldownDays);
             }
@@ -961,11 +1047,13 @@ public class PackageUpdateService : BackgroundService
         if (count >= _options.MaxConsecutiveFailures)
         {
             var cooldownUntil = DateTimeOffset.UtcNow.AddHours(cooldownDays * 24);
-            _cooldowns[packageName] = cooldownUntil;
             _failureCounts.TryRemove(packageName, out _);
-            if (owner != null && repo != null)
+            var persistedOk = owner != null && repo != null &&
+                              TryPersistSetPackageFailure(owner, repo, packageName, count, cooldownUntil);
+            if (!persistedOk)
             {
-                _stateStore?.SetPackageFailure(owner, repo, packageName, count, cooldownUntil);
+                // Retain in-memory cooldown only as fallback when persistence is absent or failed.
+                _cooldowns[packageName] = cooldownUntil;
             }
             _logger?.LogWarning("Package {Package} reached {Max} consecutive CI failures; entering {Days}-day cooldown",
                 packageName, _options.MaxConsecutiveFailures, cooldownDays);
@@ -974,10 +1062,53 @@ public class PackageUpdateService : BackgroundService
 
         if (owner != null && repo != null)
         {
-            _stateStore?.SetPackageFailure(owner, repo, packageName, count, null);
+            TryPersistSetPackageFailure(owner, repo, packageName, count, null);
         }
 
         return false;
+    }
+
+    private void TryPersistClearPackageFailure(string owner, string repo, string packageName)
+    {
+        try
+        {
+            _stateStore?.ClearPackageFailure(owner, repo, packageName);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Failed to clear persisted failure state for package {Package} in {Owner}/{Repo}", packageName, owner, repo);
+        }
+    }
+
+    private void TryPersistClearObsBlockCooldown(string owner, string repo, string packageName)
+    {
+        try
+        {
+            _stateStore?.ClearObsBlockCooldown(owner, repo, packageName);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Failed to clear persisted OBS block cooldown for package {Package} in {Owner}/{Repo}", packageName, owner, repo);
+        }
+    }
+
+    private bool TryPersistSetPackageFailure(string owner, string repo, string packageName, int count, DateTimeOffset? cooldownUntil)
+    {
+        if (_stateStore == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            _stateStore.SetPackageFailure(owner, repo, packageName, count, cooldownUntil);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Failed to persist failure state for package {Package} in {Owner}/{Repo}", packageName, owner, repo);
+            return false;
+        }
     }
 
     private (string? Owner, string? Repo) ParseTargetRepository()
@@ -998,9 +1129,23 @@ public class PackageUpdateService : BackgroundService
         }
 
         // Primary path persists deduplication in bot-state.json across restarts; in-memory set is only for unit tests with stateStore == null.
-        var isNewFailure = _stateStore != null
-            ? _stateStore.TryMarkFailedPrRecorded(owner, repo, prNumber)
-            : _recordedFailedPrs.TryAdd(prNumber, true);
+        bool isNewFailure;
+        if (_stateStore != null)
+        {
+            try
+            {
+                isNewFailure = _stateStore.TryMarkFailedPrRecorded(owner, repo, prNumber);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Failed to persist recorded failed PR #{PrNumber} for {Package} in {Owner}/{Repo}", prNumber, packageName, owner, repo);
+                isNewFailure = _recordedFailedPrs.TryAdd(prNumber, true);
+            }
+        }
+        else
+        {
+            isNewFailure = _recordedFailedPrs.TryAdd(prNumber, true);
+        }
         if (!isNewFailure)
             return;
 

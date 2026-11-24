@@ -149,8 +149,8 @@ public class ObsBuildServiceTests
     [InlineData("unresolvable", ObsStatusCode.Unresolvable)]
     [InlineData("disabled", ObsStatusCode.Disabled)]
     [InlineData("excluded", ObsStatusCode.Excluded)]
-    [InlineData("blocked", ObsStatusCode.Unknown)]
-    [InlineData("broken", ObsStatusCode.Unknown)]
+    [InlineData("blocked", ObsStatusCode.Blocked)]
+    [InlineData("broken", ObsStatusCode.Broken)]
     [InlineData("custom_unknown_code", ObsStatusCode.Unknown)]
     public async Task GetPackageBuildResultAsync_ParsesAllStatusCodes(string rawCode, ObsStatusCode expectedCode)
     {

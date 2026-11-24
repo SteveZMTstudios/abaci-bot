@@ -221,4 +221,46 @@ public class StaleUnstaleModuleTests
 
         Assert.DoesNotContain(GitHubLabels.StatusStale, context.LabelsToRemove);
     }
+
+    [Fact]
+    public async Task ProcessAsync_WhenOwnBotPatLoginCommentsOnStalePr_DoesNotRemoveStatusStale()
+    {
+        var botIdentity = Substitute.For<IBotIdentityProvider>();
+        botIdentity.GetBotLoginAsync(Arg.Any<CancellationToken>()).Returns("custom-pat-account");
+        var module = new StaleUnstaleModule(_botOptions, botIdentity);
+
+        var context = CreateContext(
+            PullRequestEventType.IssueComment,
+            senderLogin: "custom-pat-account",
+            authorLogin: "human-author",
+            senderType: "User",
+            commentAction: IssueCommentAction.Created,
+            existingLabels: new[] { GitHubLabels.StatusStale });
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.DoesNotContain(GitHubLabels.StatusStale, context.LabelsToRemove);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_WhenGetBotLoginThrows_FallsBackToConfiguredBotLogin()
+    {
+        var botIdentity = Substitute.For<IBotIdentityProvider>();
+        botIdentity.GetBotLoginAsync(Arg.Any<CancellationToken>())
+            .Returns<Task<string>>(_ => throw new HttpRequestException("API timeout"));
+        var pkgOpts = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions { BotLogin = "aqua-rium" });
+        var module = new StaleUnstaleModule(_botOptions, botIdentity, pkgOpts);
+
+        var context = CreateContext(
+            PullRequestEventType.IssueComment,
+            senderLogin: "aqua-rium",
+            authorLogin: "human-author",
+            senderType: "User",
+            commentAction: IssueCommentAction.Created,
+            existingLabels: new[] { GitHubLabels.StatusStale });
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.DoesNotContain(GitHubLabels.StatusStale, context.LabelsToRemove);
+    }
 }

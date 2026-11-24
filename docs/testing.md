@@ -68,12 +68,12 @@ All pull requests and deployment builds must satisfy the following criteria:
 
 | Metric | Required Threshold | Verification Command |
 |---|---|---|
-| **Test Pass Rate** | **100%** (0 failures, 0 skipped) | `dotnet test` |
-| **Line Coverage** | **>= 80.0%** | `dotnet test --collect:"XPlat Code Coverage" --settings coverlet.runsettings` |
-| **Branch Coverage** | **>= 80.0%** | `dotnet test --collect:"XPlat Code Coverage" --settings coverlet.runsettings` |
 | **Compiler Warnings** | **0 warnings** (`-warnaserror`) | `dotnet build -c Release -warnaserror` |
+| **Test Pass Rate** | **100%** (0 failures, 0 skipped; requires prior Release build) | `dotnet build -c Release -warnaserror && dotnet test -c Release --no-build` |
+| **Line Coverage** | **>= 80.0%** | `dotnet test -c Release --collect:"XPlat Code Coverage" --settings coverlet.runsettings` |
+| **Branch Coverage** | **>= 80.0%** | `dotnet test -c Release --collect:"XPlat Code Coverage" --settings coverlet.runsettings` |
 | **Obsolete Labels** | **0 occurrences in source code** (excluding docs/migration references) | `git grep` check on `Services/`, `Modules/`, `Pipelines/` |
-| **Policy Compliance** | **0 emojis, 0 internal task codes** | Codebase audit |
+| **Source & Comment Hygiene** | **0 emojis in source code identifiers/comments and PR governance review outputs (`GovernanceCommentFormatterTests`), 0 internal task codes** | Automated test + codebase audit |
 
 ---
 

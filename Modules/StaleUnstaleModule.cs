@@ -18,14 +18,21 @@ namespace abaci_bot.Modules;
 public class StaleUnstaleModule : IPullRequestModule
 {
     private readonly BotDetectionOptions _botOptions;
+    private readonly PackageUpdateOptions _packageUpdateOptions;
+    private readonly IBotIdentityProvider? _botIdentity;
 
     public string ModuleName => "StaleUnstaleModule";
 
     public int Priority => 12;
 
-    public StaleUnstaleModule(IOptions<BotDetectionOptions>? botOptions = null)
+    public StaleUnstaleModule(
+        IOptions<BotDetectionOptions>? botOptions = null,
+        IBotIdentityProvider? botIdentity = null,
+        IOptions<PackageUpdateOptions>? packageUpdateOptions = null)
     {
         _botOptions = botOptions?.Value ?? new BotDetectionOptions();
+        _botIdentity = botIdentity;
+        _packageUpdateOptions = packageUpdateOptions?.Value ?? new PackageUpdateOptions();
     }
 
     public bool ShouldProcess(PullRequestContext context)
@@ -49,17 +56,17 @@ public class StaleUnstaleModule : IPullRequestModule
         };
     }
 
-    public Task ProcessAsync(PullRequestContext context, CancellationToken cancellationToken)
+    public async Task ProcessAsync(PullRequestContext context, CancellationToken cancellationToken)
     {
         if (!context.ExistingLabels.Contains(GitHubLabels.StatusStale))
-            return Task.CompletedTask;
+            return;
 
-        // Check if sender is a bot; automated bot actions should not un-stale objects
-        if (BotDetectionHelper.IsBot(context.SenderLogin, context.SenderType, _botOptions.Whitelist))
-            return Task.CompletedTask;
+        // Check if sender is a bot or our own configured PAT identity; automated actions should not un-stale objects.
+        if (BotDetectionHelper.IsBot(context.SenderLogin, context.SenderType, _botOptions.Whitelist) ||
+            await BotCommitOwnership.IsOwnBotLoginAsync(_botIdentity, context.SenderLogin, _packageUpdateOptions.BotLogin, cancellationToken))
+            return;
 
         // Human author or reviewer activity restores the PR from stale
         context.LabelsToRemove.Add(GitHubLabels.StatusStale);
-        return Task.CompletedTask;
     }
 }

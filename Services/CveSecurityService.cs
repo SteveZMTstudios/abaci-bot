@@ -11,11 +11,15 @@ namespace abaci_bot.Services;
 /// Deep module implementing dual-source CVE querying (OSV.dev + NVD fallback)
 /// with in-memory caching and graceful network degradation.
 /// </summary>
-public class CveSecurityService : ICveSecurityService
+public class CveSecurityService : ICveSecurityService, ICveNvdAttemptGateway
 {
+    internal const int MaxCacheEntries = 8192;
+
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly CveSecurityOptions _options;
     private readonly ILogger<CveSecurityService>? _logger;
+    private readonly int _maxCacheEntries;
+    private readonly object _cacheWriteLock = new();
 
     private readonly ConcurrentDictionary<string, (CveReport Report, DateTime Expiry)> _cache =
         new(StringComparer.OrdinalIgnoreCase);
@@ -28,40 +32,69 @@ public class CveSecurityService : ICveSecurityService
         IHttpClientFactory httpClientFactory,
         IOptions<CveSecurityOptions> options,
         ILogger<CveSecurityService>? logger = null)
+        : this(httpClientFactory, options, logger, MaxCacheEntries)
+    {
+    }
+
+    internal CveSecurityService(
+        IHttpClientFactory httpClientFactory,
+        IOptions<CveSecurityOptions> options,
+        ILogger<CveSecurityService>? logger,
+        int maxCacheEntries)
     {
         _httpClientFactory = httpClientFactory;
         _options = options.Value;
         _logger = logger;
+        _maxCacheEntries = Math.Max(1, maxCacheEntries);
     }
 
     public async Task<CveReport> QueryCveAsync(string cveId, CancellationToken ct = default)
     {
+        var (report, _) = await QueryCveCoreAsync(cveId, skipOsv: false, ct);
+        return report;
+    }
+
+    public Task<(CveReport Report, bool NvdAttempted)> QueryCveWithStatusAsync(
+        string cveId,
+        bool skipOsv = false,
+        CancellationToken ct = default)
+        => QueryCveCoreAsync(cveId, skipOsv, ct);
+
+    private async Task<(CveReport Report, bool NvdAttempted)> QueryCveCoreAsync(string cveId, bool skipOsv, CancellationToken ct)
+    {
         if (string.IsNullOrWhiteSpace(cveId))
-            return new CveReport(cveId, null, null, CveReport.SourceUnknown);
+            return (new CveReport(cveId, null, null, CveReport.SourceUnknown), false);
 
         var normalizedCve = cveId.Trim().ToUpperInvariant();
 
-        if (_cache.TryGetValue(normalizedCve, out var cached) && cached.Expiry > DateTime.UtcNow)
+        if (_cache.TryGetValue(normalizedCve, out var cached) &&
+            cached.Expiry > DateTime.UtcNow &&
+            !(skipOsv &&
+              !cached.Report.CvssScore.HasValue &&
+              string.Equals(cached.Report.Source, "OSV.dev", StringComparison.OrdinalIgnoreCase)))
         {
-            return cached.Report;
+            return (cached.Report, false);
         }
 
-        // 1. Try OSV.dev first
-        var osvConfigured = !string.IsNullOrWhiteSpace(_options.OsvApiBaseUrl);
+        // 1. Try OSV.dev first (unless caller already retrieved OSV detail in the same resolution flow)
+        var osvConfigured = !skipOsv && !string.IsNullOrWhiteSpace(_options.OsvApiBaseUrl);
         var osvAttempted = osvConfigured;
         bool osvFailed = false;
         CveReport? report = null;
-        try
+        if (!skipOsv)
         {
-            report = await TryQueryOsvAsync(normalizedCve, ct);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch
-        {
-            osvFailed = true;
+            try
+            {
+                report = await TryQueryOsvAsync(normalizedCve, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                osvFailed = true;
+            }
         }
 
         // 2. If OSV didn't provide a score, try NVD
@@ -97,27 +130,65 @@ public class CveSecurityService : ICveSecurityService
             // Every source that was actually queried failed: this is a transient lookup failure.
             if (attemptedSources > 0 && failedSources == attemptedSources)
             {
-                return new CveReport(normalizedCve, null, null, CveReport.SourceQueryFailed, "Query timed out or failed to reach vulnerability databases.");
+                return (new CveReport(normalizedCve, null, null, CveReport.SourceQueryFailed, "Query timed out or failed to reach vulnerability databases."), nvdAttempted);
             }
 
             // One source failed while another answered (possibly with "no record"): the result is
             // incomplete, but it is not a total lookup failure and must not be cached as resolved.
             if (failedSources > 0)
             {
-                return new CveReport(normalizedCve, null, null, CveReport.SourcePartiallyFailed, "One vulnerability source was unavailable; details may be incomplete.");
+                return (new CveReport(normalizedCve, null, null, CveReport.SourcePartiallyFailed, "One vulnerability source was unavailable; details may be incomplete."), nvdAttempted);
             }
         }
 
         report ??= new CveReport(normalizedCve, null, null, CveReport.SourceUnknown, "Vulnerability details unavailable.");
 
-        // SourceUnknown (embargoed or unindexed) uses a shorter TTL so disclosure is detected promptly;
-        // confirmed CVE details are cached for full CacheExpirationHours.
-        var cacheDuration = string.Equals(report.Source, CveReport.SourceUnknown, StringComparison.OrdinalIgnoreCase)
+        // Unknown or unscored entries use a shorter TTL so embargoed disclosures or pending CVSS ratings
+        // are re-checked promptly; confirmed CVE details with CVSS scores use full CacheExpirationHours.
+        var nowUtc = DateTime.UtcNow;
+        var useShortTtl = string.Equals(report.Source, CveReport.SourceUnknown, StringComparison.OrdinalIgnoreCase)
+            || !report.CvssScore.HasValue;
+        var cacheDuration = useShortTtl
             ? TimeSpan.FromHours(_options.UnknownCacheExpirationHours)
             : TimeSpan.FromHours(_options.CacheExpirationHours);
 
-        _cache[normalizedCve] = (report, DateTime.UtcNow.Add(cacheDuration));
-        return report;
+        lock (_cacheWriteLock)
+        {
+            PruneCacheIfNeeded(nowUtc);
+            _cache[normalizedCve] = (report, nowUtc.Add(cacheDuration));
+        }
+
+        return (report, nvdAttempted);
+    }
+
+    private void PruneCacheIfNeeded(DateTime nowUtc)
+    {
+        if (_cache.Count < _maxCacheEntries)
+        {
+            return;
+        }
+
+        foreach (var kv in _cache)
+        {
+            if (kv.Value.Expiry <= nowUtc)
+            {
+                _cache.TryRemove(kv.Key, out _);
+            }
+        }
+
+        if (_cache.Count >= _maxCacheEntries)
+        {
+            var excess = _cache.Count - _maxCacheEntries + 1;
+            var evictCount = Math.Max(excess, _maxCacheEntries / 4);
+            foreach (var key in _cache
+                         .OrderBy(kv => kv.Value.Expiry)
+                         .Take(evictCount)
+                         .Select(kv => kv.Key)
+                         .ToList())
+            {
+                _cache.TryRemove(key, out _);
+            }
+        }
     }
 
     public async Task<IReadOnlyList<CveReport>> QueryMultipleCvesAsync(IEnumerable<string> cveIds, CancellationToken ct = default)

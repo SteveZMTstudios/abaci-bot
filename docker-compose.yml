@@ -6,12 +6,11 @@ services:
     container_name: abaci-bot
     restart: unless-stopped
     ports:
-      - "3456:3456"
+      - "127.0.0.1:3456:3456"
     volumes:
       # Mount your configuration file
       - ./appsettings.json:/app/appsettings.json:ro
-      # Optional: Mount custom labels file
-      # - ./labels.json:/app/labels.json:ro
+      - ./state:/state
     environment:
       # You can also use environment variables instead of appsettings.json
       # These will override appsettings.json values
@@ -20,10 +19,17 @@ services:
       # - GitHubApp__PrivateKey="-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
       # Note: For private keys, mounting via appsettings.json is recommended.
       - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_HTTP_PORTS=3456
+      - BotState__StateDirectory=/state
+      - ABACI_IMAGE_DIGEST=${ABACI_IMAGE_DIGEST:-unknown}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3456/health"]
       interval: 30s
-      timeout: 3s
+      timeout: 5s
       retries: 3
       start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    user: "1654:1654"
 

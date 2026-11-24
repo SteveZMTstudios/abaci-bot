@@ -321,7 +321,27 @@ public class LookoutVersionSourceTests
                         }
                     }
                 }
-                : Array.Empty<object>();
+                : new object[]
+                {
+                    new
+                    {
+                        name = "other-pkg",
+                        monitors = new
+                        {
+                            version = new
+                            {
+                                data = new
+                                {
+                                    current = "1.0.0",
+                                    latest = "1.1.0",
+                                    last_known_relation = "outdated",
+                                    stale = false,
+                                    updated_at = currentPoll
+                                }
+                            }
+                        }
+                    }
+                };
 
             return new HttpResponseMessage(HttpStatusCode.OK)
             {
@@ -362,9 +382,10 @@ public class LookoutVersionSourceTests
             Assert.Single(c3);
             Assert.Equal(laterPoll, c3[0].PublishedAt);
 
-            // 4. Full sweep without dnf5 -> prunes dnf5 from persisted state
+            // 4. Healthy non-empty full sweep without dnf5 -> prunes dnf5 from persisted state
             includePkg = false;
-            Assert.Empty(await source2.GetCandidatesAsync());
+            var cPrune = await source2.GetCandidatesAsync();
+            Assert.DoesNotContain(cPrune, c => c.PackageName == "dnf5");
 
             var newerPoll = laterPoll.AddHours(2);
             timeProvider.SetUtcNow(newerPoll);
@@ -564,6 +585,379 @@ public class LookoutVersionSourceTests
             Assert.Equal(1, s4.ConsecutiveFailures);
             Assert.Equal(s3.LastSuccessAt, s4.LastSuccessAt);
             Assert.True(s4.LastAttemptAt >= s3.LastAttemptAt);
+        }
+        finally
+        {
+            if (File.Exists(statePath))
+            {
+                File.Delete(statePath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GetCandidatesAsync_EmptyHttp200Sweep_PreservesPersistedFirstSeenTimestamps()
+    {
+        var statePath = Path.Combine(Path.GetTempPath(), $"lookout-empty-preserve-{Guid.NewGuid():N}.json");
+        var firstObserved = new DateTimeOffset(2026, 11, 17, 10, 0, 0, TimeSpan.Zero);
+        var secondPoll = firstObserved.AddHours(12);
+        var thirdPoll = firstObserved.AddHours(24);
+        var timeProvider = new MutableTimeProvider(firstObserved);
+        var returnEmpty = false;
+
+        var handler = new FakeHttpMessageHandler(_ =>
+        {
+            object[] items = returnEmpty
+                ? Array.Empty<object>()
+                : new object[]
+                {
+                    new
+                    {
+                        name = "dnf5",
+                        monitors = new
+                        {
+                            version = new
+                            {
+                                data = new
+                                {
+                                    current = "1.0.0",
+                                    latest = "2.0.0",
+                                    last_known_relation = "outdated",
+                                    stale = false,
+                                    updated_at = timeProvider.GetUtcNow()
+                                }
+                            }
+                        }
+                    }
+                };
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(JsonSerializer.Serialize(new { items }), System.Text.Encoding.UTF8, "application/json")
+            };
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            Lookout = new LookoutUpdateOptions
+            {
+                Enabled = true,
+                BaseUrl = "https://lookout.openruyi.cn",
+                FirstSeenStatePath = statePath
+            }
+        });
+
+        try
+        {
+            // 1. Initial sweep records firstObserved
+            var source1 = new LookoutVersionSource(new HttpClient(handler), options, timeProvider: timeProvider);
+            var c1 = await source1.GetCandidatesAsync();
+            Assert.Single(c1);
+            Assert.Equal(firstObserved, c1[0].PublishedAt);
+
+            // 2. Transient empty HTTP 200 sweep must NOT clear persisted first-seen timestamps
+            timeProvider.SetUtcNow(secondPoll);
+            returnEmpty = true;
+            Assert.Empty(await source1.GetCandidatesAsync());
+
+            // 3. Recovery sweep on fresh instance still retains original firstObserved
+            timeProvider.SetUtcNow(thirdPoll);
+            returnEmpty = false;
+            var source2 = new LookoutVersionSource(new HttpClient(handler), options, timeProvider: timeProvider);
+            var c3 = await source2.GetCandidatesAsync();
+            Assert.Single(c3);
+            Assert.Equal(firstObserved, c3[0].PublishedAt);
+        }
+        finally
+        {
+            if (File.Exists(statePath))
+            {
+                File.Delete(statePath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GetCandidatesAsync_WhenLookoutReturnsUpToDateItemsOnly_PrunesStaleFirstSeenTimestamps()
+    {
+        var statePath = Path.Combine(Path.GetTempPath(), $"lookout-uptodate-prune-{Guid.NewGuid():N}.json");
+        var firstObserved = new DateTimeOffset(2026, 11, 17, 10, 0, 0, TimeSpan.Zero);
+        var secondPoll = firstObserved.AddHours(12);
+        var thirdPoll = firstObserved.AddHours(24);
+        var timeProvider = new MutableTimeProvider(firstObserved);
+        var relation = "outdated";
+
+        var handler = new FakeHttpMessageHandler(_ =>
+        {
+            var items = new object[]
+            {
+                new
+                {
+                    name = "dnf5",
+                    monitors = new
+                    {
+                        version = new
+                        {
+                            data = new
+                            {
+                                current = "1.0.0",
+                                latest = "2.0.0",
+                                last_known_relation = relation,
+                                stale = false,
+                                updated_at = timeProvider.GetUtcNow()
+                            }
+                        }
+                    }
+                }
+            };
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(JsonSerializer.Serialize(new { items }), System.Text.Encoding.UTF8, "application/json")
+            };
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            Lookout = new LookoutUpdateOptions
+            {
+                Enabled = true,
+                BaseUrl = "https://lookout.openruyi.cn",
+                FirstSeenStatePath = statePath
+            }
+        });
+
+        try
+        {
+            var source1 = new LookoutVersionSource(new HttpClient(handler), options, timeProvider: timeProvider);
+            var c1 = await source1.GetCandidatesAsync();
+            Assert.Single(c1);
+            Assert.Equal(firstObserved, c1[0].PublishedAt);
+
+            // Second sweep: Lookout returns non-empty items, all up_to_date -> safe to prune dnf5 firstSeen
+            timeProvider.SetUtcNow(secondPoll);
+            relation = "up_to_date";
+            Assert.Empty(await source1.GetCandidatesAsync());
+
+            // Third sweep: dnf5 becomes outdated again -> receives fresh observation timestamp (thirdPoll)
+            timeProvider.SetUtcNow(thirdPoll);
+            relation = "outdated";
+            var source2 = new LookoutVersionSource(new HttpClient(handler), options, timeProvider: timeProvider);
+            var c3 = await source2.GetCandidatesAsync();
+            Assert.Single(c3);
+            Assert.Equal(thirdPoll, c3[0].PublishedAt);
+        }
+        finally
+        {
+            if (File.Exists(statePath))
+            {
+                File.Delete(statePath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GetCandidatesAsync_ClampedPerPageWithTotalAndPages_PaginatesAllPagesAndPrunesStaleFirstSeen()
+    {
+        var statePath = Path.Combine(Path.GetTempPath(), $"lookout-clamped-pages-{Guid.NewGuid():N}.json");
+        var timeProvider = new MutableTimeProvider(new DateTimeOffset(2026, 11, 20, 12, 0, 0, TimeSpan.Zero));
+        File.WriteAllText(statePath, """
+            {
+              "obsolete-pkg": { "Version": "1.0.0", "FirstSeen": "2026-11-01T00:00:00Z" },
+              "null-entry": null
+            }
+            """);
+
+        var requestedPages = new List<string>();
+        var handler = new FakeHttpMessageHandler(req =>
+        {
+            requestedPages.Add(req.RequestUri!.Query);
+            var isPage1 = req.RequestUri!.Query.Contains("page=1", StringComparison.Ordinal);
+            var payload = isPage1
+                ? new
+                {
+                    total = 2,
+                    pages = 2,
+                    packages = new[]
+                    {
+                        new { name = "pkg-one", monitors = new { version = new { data = new { current = "1.0.0", latest = "1.1.0", last_known_relation = "outdated", stale = false } } } }
+                    }
+                }
+                : new
+                {
+                    total = 2,
+                    pages = 2,
+                    packages = new[]
+                    {
+                        new { name = "pkg-two", monitors = new { version = new { data = new { current = "2.0.0", latest = "2.1.0", last_known_relation = "outdated", stale = false } } } }
+                    }
+                };
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(JsonSerializer.Serialize(payload), System.Text.Encoding.UTF8, "application/json")
+            };
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            Lookout = new LookoutUpdateOptions
+            {
+                Enabled = true,
+                BaseUrl = "https://lookout.openruyi.cn",
+                FirstSeenStatePath = statePath
+            }
+        });
+
+        try
+        {
+            var health = new RuntimeHealthState();
+            var source = new LookoutVersionSource(new HttpClient(handler), options, healthState: health, timeProvider: timeProvider);
+            var candidates = await source.GetCandidatesAsync();
+
+            Assert.Equal(2, requestedPages.Count);
+            Assert.Equal(2, candidates.Count);
+            Assert.Contains(candidates, c => c.PackageName == "pkg-one");
+            Assert.Contains(candidates, c => c.PackageName == "pkg-two");
+            Assert.Equal("healthy", health.GetSourceHealth()["Lookout"].Status);
+
+            var persisted = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(File.ReadAllText(statePath));
+            Assert.NotNull(persisted);
+            Assert.False(persisted!.ContainsKey("obsolete-pkg"));
+            Assert.False(persisted.ContainsKey("null-entry"));
+        }
+        finally
+        {
+            if (File.Exists(statePath))
+            {
+                File.Delete(statePath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GetCandidatesAsync_ExceedingMaxPages_MarksDegradedAndDoesNotPruneFirstSeen()
+    {
+        var statePath = Path.Combine(Path.GetTempPath(), $"lookout-maxpages-{Guid.NewGuid():N}.json");
+        var timeProvider = new MutableTimeProvider(new DateTimeOffset(2026, 11, 20, 12, 0, 0, TimeSpan.Zero));
+        File.WriteAllText(statePath, """
+            {
+              "keep-pkg": { "Version": "1.0.0", "FirstSeen": "2026-11-01T00:00:00Z" }
+            }
+            """);
+
+        int pageCalls = 0;
+        var handler = new FakeHttpMessageHandler(_ =>
+        {
+            pageCalls++;
+            var pkgName = $"pkg-{pageCalls}";
+            var payload = new
+            {
+                total = 5000,
+                pages = 60,
+                packages = new[]
+                {
+                    new { name = pkgName, monitors = new { version = new { data = new { current = "1.0.0", latest = "1.1.0", last_known_relation = "outdated", stale = false } } } }
+                }
+            };
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(JsonSerializer.Serialize(payload), System.Text.Encoding.UTF8, "application/json")
+            };
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            Lookout = new LookoutUpdateOptions
+            {
+                Enabled = true,
+                BaseUrl = "https://lookout.openruyi.cn",
+                FirstSeenStatePath = statePath
+            }
+        });
+
+        try
+        {
+            var health = new RuntimeHealthState();
+            var source = new LookoutVersionSource(new HttpClient(handler), options, healthState: health, timeProvider: timeProvider);
+            var candidates = await source.GetCandidatesAsync();
+
+            Assert.Equal(50, pageCalls);
+            Assert.Equal(50, candidates.Count);
+            var lookoutHealth = health.GetSourceHealth()["Lookout"];
+            Assert.Equal("degraded", lookoutHealth.Status);
+            Assert.Contains("truncated at max page limit", lookoutHealth.LastError, StringComparison.OrdinalIgnoreCase);
+
+            var persisted = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(File.ReadAllText(statePath));
+            Assert.NotNull(persisted);
+            Assert.True(persisted!.ContainsKey("keep-pkg"));
+        }
+        finally
+        {
+            if (File.Exists(statePath))
+            {
+                File.Delete(statePath);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GetCandidatesAsync_WhenServerReturnsZeroTotalWithItems_DoesNotPruneFirstSeen()
+    {
+        var statePath = Path.Combine(Path.GetTempPath(), $"lookout-zero-total-{Guid.NewGuid():N}.json");
+        var timeProvider = new MutableTimeProvider(new DateTimeOffset(2026, 11, 20, 12, 0, 0, TimeSpan.Zero));
+        File.WriteAllText(statePath, """
+            {
+              "keep-me": { "Version": "1.0.0", "FirstSeen": "2026-11-01T00:00:00Z" }
+            }
+            """);
+
+        var handler = new FakeHttpMessageHandler(req =>
+        {
+            var isPage1 = req.RequestUri!.Query.Contains("page=1", StringComparison.Ordinal);
+            var payload = isPage1
+                ? new
+                {
+                    total = 0,
+                    packages = new object[]
+                    {
+                        new { name = "pkg-one", monitors = new { version = new { data = new { current = "1.0.0", latest = "1.1.0", last_known_relation = "outdated", stale = false } } } }
+                    }
+                }
+                : new
+                {
+                    total = 0,
+                    packages = Array.Empty<object>()
+                };
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(JsonSerializer.Serialize(payload), System.Text.Encoding.UTF8, "application/json")
+            };
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            Lookout = new LookoutUpdateOptions
+            {
+                Enabled = true,
+                BaseUrl = "https://lookout.openruyi.cn",
+                FirstSeenStatePath = statePath
+            }
+        });
+
+        try
+        {
+            var source = new LookoutVersionSource(new HttpClient(handler), options, timeProvider: timeProvider);
+            var candidates = await source.GetCandidatesAsync();
+
+            Assert.Single(candidates);
+            var persisted = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(File.ReadAllText(statePath));
+            Assert.NotNull(persisted);
+            Assert.True(persisted!.ContainsKey("keep-me"));
+
+            Assert.Equal((false, false), LookoutVersionSource.EvaluatePaginationState(1, 50, 200, 200, 200, null, 0, false));
+            Assert.Equal((true, false), LookoutVersionSource.EvaluatePaginationState(2, 50, 0, 200, 200, null, 0, false));
         }
         finally
         {

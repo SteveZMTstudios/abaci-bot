@@ -209,7 +209,7 @@ public class ConversationGuardServiceTests
     }
 
     [Fact]
-    public async Task HandleCommandAsync_Unlock_WhenUnarchiveThrows_StillUnlocks()
+    public async Task HandleCommandAsync_Unlock_WhenArchiveEnabled_UnlocksWithoutCallingUnarchive()
     {
         var service = CreateService(new ConversationGuardOptions
         {
@@ -221,18 +221,16 @@ public class ConversationGuardServiceTests
 
         _gitHub.IsIssueLockedAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
             .Returns(true);
-        _gitHub.UnarchivePullRequestAsync("owner", "repo", 42, null, Arg.Any<CancellationToken>())
-            .Returns<Task>(_ => throw new InvalidOperationException("GraphQL error"));
 
         await service.HandleCommandAsync(context, "@abaci-bot unlock", "maintainer-user", CancellationToken.None);
 
-        await _gitHub.Received(1).UnarchivePullRequestAsync("owner", "repo", 42, null, Arg.Any<CancellationToken>());
+        await _gitHub.DidNotReceiveWithAnyArgs().UnarchivePullRequestAsync(default!, default!, default, default);
         await _gitHub.Received(1).UnlockIssueAsync("owner", "repo", 42, Arg.Any<CancellationToken>());
         await _gitHub.Received(1).CreateCommentAsync(
             "owner",
             "repo",
             42,
-            Arg.Is<string>(s => s.Contains("unlocked") && s.Contains("automatic unarchiving failed", StringComparison.OrdinalIgnoreCase)),
+            Arg.Is<string>(s => s.Contains("unlocked", StringComparison.OrdinalIgnoreCase) && !s.Contains("unarchiving", StringComparison.OrdinalIgnoreCase)),
             Arg.Any<CancellationToken>());
     }
 
@@ -966,5 +964,104 @@ public class ConversationGuardServiceTests
         public override DateTimeOffset GetUtcNow() => _utcNow;
 
         public void Advance(TimeSpan delta) => _utcNow = _utcNow.Add(delta);
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_Hide_WhenTargetPermissionLookupThrows_FailsClosedAndProtectsTarget()
+    {
+        var service = CreateService();
+        var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Maintain);
+        _permissionService.GetUserPermissionAsync("owner", "repo", "maybe-maintainer", Arg.Any<CancellationToken>())
+            .Returns<Task<RepositoryAccessLevel>>(_ => throw new HttpRequestException("429 Too Many Requests"));
+        _gitHub.GetIssueCommentsAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(new[] { CreateIssueComment(11L, "IC_11", "maybe-maintainer") });
+
+        await service.HandleCommandAsync(context, "@abaci-bot hide @maybe-maintainer", "maintainer-user", CancellationToken.None);
+
+        await _gitHub.DidNotReceiveWithAnyArgs().MinimizeCommentAsync(default!, default!, default, default!, default!, default);
+        await _gitHub.Received(1).CreateCommentAsync(
+            "owner", "repo", 42,
+            Arg.Is<string>(s => s.Contains("maintainers cannot be hidden", StringComparison.OrdinalIgnoreCase)),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_Unlock_WhenNotLockedAndArchiveEnabled_DoesNotAttemptUnarchive_AndUnarchiveCommandIsNoOp()
+    {
+        var service = CreateService(new ConversationGuardOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            ArchiveEnabled = true
+        });
+        var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Maintain);
+        _gitHub.IsIssueLockedAsync("owner", "repo", 42, Arg.Any<CancellationToken>()).Returns(false);
+
+        // 1. @bot unlock on unlocked PR does NOT call UnarchivePullRequestAsync
+        await service.HandleCommandAsync(context, "@abaci-bot unlock", "maintainer-user", CancellationToken.None);
+        await _gitHub.DidNotReceiveWithAnyArgs().UnarchivePullRequestAsync(default!, default!, default, default);
+        await _gitHub.DidNotReceiveWithAnyArgs().UnlockIssueAsync(default!, default!, default);
+        await _gitHub.Received(1).CreateCommentAsync(
+            "owner", "repo", 42,
+            Arg.Is<string>(s => s.Contains("not currently locked", StringComparison.OrdinalIgnoreCase)),
+            Arg.Any<CancellationToken>());
+
+        // 2. Unreachable @bot unarchive command is ignored cleanly without API writes
+        _gitHub.ClearReceivedCalls();
+        await service.HandleCommandAsync(context, "@abaci-bot unarchive", "maintainer-user", CancellationToken.None);
+        await _gitHub.DidNotReceiveWithAnyArgs().UnarchivePullRequestAsync(default!, default!, default, default);
+        await _gitHub.DidNotReceiveWithAnyArgs().CreateCommentAsync(default!, default!, default, default!, default);
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_LockAndArchive_WhenAnnouncementThrowsTransientError_ReturnsCleanlyWithoutCrashing()
+    {
+        var gateway = Substitute.For<IEphemeralCommentGateway>();
+        gateway.CreateCommentWithMetadataAsync("owner", "repo", 42, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns<Task<CreatedCommentRef>>(_ => throw new HttpRequestException("502 Bad Gateway"));
+
+        var service = CreateService(
+            new ConversationGuardOptions { Enabled = true, DryRun = false, ArchiveEnabled = true },
+            commentGateway: gateway);
+        var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Maintain);
+
+        Assert.Null(await Record.ExceptionAsync(() => service.HandleCommandAsync(context, "@abaci-bot lock", "maintainer-user")));
+        Assert.Null(await Record.ExceptionAsync(() => service.HandleCommandAsync(context, "@abaci-bot archive", "maintainer-user")));
+
+        await _gitHub.DidNotReceiveWithAnyArgs().LockIssueAsync(default!, default!, default, default, default);
+        await _gitHub.DidNotReceiveWithAnyArgs().ArchivePullRequestAsync(default!, default!, default, default!, default);
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_Hide_AllowsTrailingPunctuationOnTargetHandle()
+    {
+        var service = CreateService();
+        var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Maintain);
+        _permissionService.GetUserPermissionAsync("owner", "repo", "spammer", Arg.Any<CancellationToken>())
+            .Returns(RepositoryAccessLevel.None);
+        _gitHub.GetIssueCommentsAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(new[] { CreateIssueComment(77L, "IC_77", "spammer") });
+        _gitHub.MinimizeCommentAsync("owner", "repo", 77L, "IC_77", "SPAM", Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        await service.HandleCommandAsync(context, "@abaci-bot hide @spammer,", "maintainer-user", CancellationToken.None);
+
+        await _gitHub.Received(1).MinimizeCommentAsync("owner", "repo", 77L, "IC_77", "SPAM", Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_HideParenthesisDelimiter_WorksCorrectly()
+    {
+        var service = CreateService(new ConversationGuardOptions { Enabled = true, DryRun = false, ArchiveEnabled = true });
+        var maintainerCtx = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Maintain);
+        _permissionService.GetUserPermissionAsync("owner", "repo", "spammer", Arg.Any<CancellationToken>())
+            .Returns(RepositoryAccessLevel.None);
+        _gitHub.GetIssueCommentsAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(new[] { CreateIssueComment(777L, "IC_777", "spammer") });
+        _gitHub.MinimizeCommentAsync("owner", "repo", 777L, "IC_777", "SPAM", Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        await service.HandleCommandAsync(maintainerCtx, "@abaci-bot hide @spammer)", "maintainer-user");
+        await _gitHub.Received(1).MinimizeCommentAsync("owner", "repo", 777L, "IC_777", "SPAM", Arg.Any<CancellationToken>());
     }
 }

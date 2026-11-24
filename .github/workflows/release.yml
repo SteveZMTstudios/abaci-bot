@@ -21,10 +21,13 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Restore dependencies
-        run: dotnet restore
+        run: dotnet restore abaci-bot.sln
+
+      - name: Build (Release, warnings as errors)
+        run: dotnet build abaci-bot.sln --no-restore -c Release -warnaserror
 
       - name: Run unit tests
-        run: dotnet test --no-restore -c Release --verbosity normal --collect:"XPlat Code Coverage" --settings coverlet.runsettings
+        run: dotnet test abaci-bot.sln --no-restore --no-build -c Release --verbosity normal --collect:"XPlat Code Coverage" --settings coverlet.runsettings
 
       - name: Verify code coverage thresholds
         run: |

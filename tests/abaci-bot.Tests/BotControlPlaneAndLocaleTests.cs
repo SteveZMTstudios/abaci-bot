@@ -1065,6 +1065,632 @@ public class BotControlPlaneAndLocaleTests
         }
     }
 
+    [Fact]
+    public void JsonBotStateStore_CorruptJson_LogsErrorAndCreatesCorruptBackup()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"bot-state-corrupt-err-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        var stateFile = Path.Combine(tempDir, "bot-state.json");
+        File.WriteAllText(stateFile, "{ invalid json");
+
+        var runtimeHealth = new RuntimeHealthState();
+        using var loggerFactory = LoggerFactory.Create(builder =>
+        {
+            builder.AddProvider(new RuntimeErrorLoggerProvider(runtimeHealth));
+        });
+        var logger = loggerFactory.CreateLogger<JsonBotStateStore>();
+
+        try
+        {
+            var opts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions { StateDirectory = tempDir });
+            using var store = new JsonBotStateStore(opts, logger);
+
+            Assert.Null(store.GetUserLocale("alice"));
+            Assert.Empty(store.GetIgnoredPackages("owner", "repo"));
+            Assert.False(File.Exists(stateFile));
+            var backups = Directory.GetFiles(tempDir, "bot-state.json.corrupt.*");
+            Assert.Single(backups);
+            Assert.Equal("{ invalid json", File.ReadAllText(backups[0]));
+            Assert.NotNull(runtimeHealth.GetLastError().LastError);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void JsonBotStateStore_WhenSaveStateFails_ThrowsAndRollsBackInMemoryControlPlaneState()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"bot-state-rollback-{Guid.NewGuid():N}");
+        var runtimeHealth = new RuntimeHealthState();
+        using var loggerFactory = LoggerFactory.Create(builder =>
+        {
+            builder.AddProvider(new RuntimeErrorLoggerProvider(runtimeHealth));
+        });
+        var logger = loggerFactory.CreateLogger<JsonBotStateStore>();
+
+        try
+        {
+            var opts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions { StateDirectory = tempDir });
+            using var store = new JsonBotStateStore(opts, logger);
+            store.SetIgnoredPackage("org", "repo", "keep-me", "valid", "alice");
+            store.SetUserLocale("alice", "en");
+
+            // Blocking bot-state.json.tmp with a directory deterministically forces SaveState write failure.
+            Directory.CreateDirectory(Path.Combine(tempDir, "bot-state.json.tmp"));
+
+            Assert.ThrowsAny<Exception>(() => store.SetIgnoredPackage("org", "repo", "fail-pkg", "reason", "bob"));
+            Assert.Null(store.GetIgnoredPackage("org", "repo", "fail-pkg"));
+            Assert.NotNull(store.GetIgnoredPackage("org", "repo", "keep-me"));
+
+            Assert.ThrowsAny<Exception>(() => store.RemoveIgnoredPackage("org", "repo", "keep-me"));
+            Assert.NotNull(store.GetIgnoredPackage("org", "repo", "keep-me"));
+
+            Assert.ThrowsAny<Exception>(() => store.SetUserLocale("alice", "zh"));
+            Assert.Equal("en", store.GetUserLocale("alice"));
+
+            Assert.ThrowsAny<Exception>(() => store.ClearUserLocale("alice"));
+            Assert.Equal("en", store.GetUserLocale("alice"));
+
+            Assert.NotNull(runtimeHealth.GetLastError().LastError);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task BotControlPlaneService_WhenStatePersistenceThrows_PostsExplicitFailureReplyInsteadOfSuccess()
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var perm = Substitute.For<IRepositoryPermissionService>();
+        perm.GetUserPermissionAsync("org", "repo", "maintainer", Arg.Any<CancellationToken>())
+            .Returns(RepositoryAccessLevel.Maintain);
+        perm.GetUserPermissionAsync("org", "repo", "outsider", Arg.Any<CancellationToken>())
+            .Returns(RepositoryAccessLevel.Read);
+
+        var failingStore = Substitute.For<IBotStateStore>();
+        failingStore.When(s => s.SetIgnoredPackage(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<string>()))
+            .Do(_ => throw new IOException("Read-only state directory"));
+        failingStore.When(s => s.RemoveIgnoredPackage(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>()))
+            .Do(_ => throw new IOException("Read-only state directory"));
+        failingStore.When(s => s.SetUserLocale(Arg.Any<string>(), Arg.Any<string>()))
+            .Do(_ => throw new IOException("Read-only state directory"));
+        failingStore.When(s => s.ClearUserLocale(Arg.Any<string>()))
+            .Do(_ => throw new IOException("Read-only state directory"));
+
+        var stateOpts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions { DefaultLocale = "en" });
+        var localeResolver = new LocaleResolver(stateOpts, failingStore);
+        var pkgOpts = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions());
+        var service = new BotControlPlaneService(gitHub, perm, failingStore, localeResolver, pkgOpts);
+
+        var context = new PullRequestContext(
+            gitHub, "captains", null, PullRequestEventType.IssueComment, "org", "repo", 88, "sha", "main",
+            false, false, "test", "@abaci-bot ignore dnf5", "maintainer", "maintainer", "created", Array.Empty<string>(),
+            commentAction: IssueCommentAction.Created);
+
+        await service.HandleCommandAsync(context, "abaci-bot", new ParsedBotCommand("ignore", "dnf5"), "maintainer");
+        await service.HandleCommandAsync(context, "abaci-bot", new ParsedBotCommand("unignore", "dnf5"), "maintainer");
+        await service.HandleCommandAsync(context, "abaci-bot", new ParsedBotCommand("lang", "zh"), "outsider");
+        await service.HandleCommandAsync(context, "abaci-bot", new ParsedBotCommand("lang", "reset"), "outsider");
+
+        await gitHub.Received(3).CreateCommentAsync(
+            "org", "repo", 88,
+            Arg.Is<string>(s => s.Contains("Failed to persist state to disk", StringComparison.Ordinal)),
+            Arg.Any<CancellationToken>());
+        await gitHub.Received(1).CreateCommentAsync(
+            "org", "repo", 88,
+            Arg.Is<string>(s => s.Contains("状态持久化失败", StringComparison.Ordinal)),
+            Arg.Any<CancellationToken>());
+        await gitHub.DidNotReceive().CreateCommentAsync(
+            "org", "repo", 88,
+            Arg.Is<string>(s => s.Contains("is now ignored", StringComparison.Ordinal) ||
+                                s.Contains("has been removed", StringComparison.Ordinal) ||
+                                s.Contains("已将您的回复语言偏好设置为", StringComparison.Ordinal) ||
+                                s.Contains("has been cleared", StringComparison.Ordinal)),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task JsonBotStateStore_ObsBlockAndCiCooldown_AreOrthogonal_AndStatusReportsThemSeparately()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"bot-state-obs-{Guid.NewGuid():N}");
+        try
+        {
+            var opts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions { StateDirectory = tempDir });
+            using (var store = new JsonBotStateStore(opts))
+            {
+                var ciUntil = DateTimeOffset.UtcNow.AddDays(30);
+                var obsUntil = DateTimeOffset.UtcNow.AddDays(15);
+
+                store.SetPackageFailure("org", "repo", "curl", 2, ciUntil);
+                store.SetObsBlockCooldown("org", "repo", "curl", obsUntil);
+
+                var both = store.GetPackageFailure("org", "repo", "curl");
+                Assert.NotNull(both);
+                Assert.Equal(2, both!.ConsecutiveFailures);
+                Assert.Equal(ciUntil, both.CooldownUntil);
+                Assert.Equal(obsUntil, both.ObsBlockedUntil);
+
+                // Clearing OBS block must preserve CI failure count and 30d CI cooldown
+                Assert.True(store.ClearObsBlockCooldown("org", "repo", "curl"));
+                var afterClearObs = store.GetPackageFailure("org", "repo", "curl");
+                Assert.NotNull(afterClearObs);
+                Assert.Equal(2, afterClearObs!.ConsecutiveFailures);
+                Assert.Equal(ciUntil, afterClearObs.CooldownUntil);
+                Assert.Null(afterClearObs.ObsBlockedUntil);
+
+                // Clearing CI failure when OBS block is active must preserve OBS block
+                store.SetObsBlockCooldown("org", "repo", "curl", obsUntil);
+                Assert.True(store.ClearPackageFailure("org", "repo", "curl"));
+                var afterClearCi = store.GetPackageFailure("org", "repo", "curl");
+                Assert.NotNull(afterClearCi);
+                Assert.Equal(0, afterClearCi!.ConsecutiveFailures);
+                Assert.Null(afterClearCi.CooldownUntil);
+                Assert.Equal(obsUntil, afterClearCi.ObsBlockedUntil);
+
+                // Status report shows OBS block without fabricating consecutive CI failures
+                var gitHub = Substitute.For<IGitHubService>();
+                var perm = Substitute.For<IRepositoryPermissionService>();
+                var localeResolver = new LocaleResolver(opts, store);
+                var pkgOpts = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions());
+                var cp = new BotControlPlaneService(gitHub, perm, store, localeResolver, pkgOpts);
+                var ctx = new PullRequestContext(
+                    gitHub, "captains", null, PullRequestEventType.IssueComment, "org", "repo", 77, "sha", "main",
+                    false, false, "bump", "@abaci-bot status curl", "alice", "alice", "created", Array.Empty<string>(),
+                    commentAction: IssueCommentAction.Created);
+
+                await cp.HandleCommandAsync(ctx, "abaci-bot", new ParsedBotCommand("status", "curl"), "alice");
+                await gitHub.Received(1).CreateCommentAsync(
+                    "org", "repo", 77,
+                    Arg.Is<string>(s =>
+                        s.Contains("Failure cooldown**: None", StringComparison.Ordinal) &&
+                        s.Contains("OBS post-merge block**: Cooldown until", StringComparison.Ordinal) &&
+                        !s.Contains("consecutive failure", StringComparison.Ordinal)),
+                    Arg.Any<CancellationToken>());
+            }
+
+            // Re-load from disk confirms orthogonality persisted cleanly
+            using var storeReloaded = new JsonBotStateStore(opts);
+            var reloaded = storeReloaded.GetPackageFailure("org", "repo", "curl");
+            Assert.NotNull(reloaded);
+            Assert.Equal(0, reloaded!.ConsecutiveFailures);
+            Assert.NotNull(reloaded.ObsBlockedUntil);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void JsonBotStateStore_RemainingMutatorsRollbackOnSaveFailure_AndCorruptBackupFailureThrowsFailFast()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"bot-state-mut-rollback-{Guid.NewGuid():N}");
+        var blockerDir = Path.Combine(tempDir, "bot-state.json.tmp");
+        try
+        {
+            var opts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions { StateDirectory = tempDir, LocaleRetentionDays = 30 });
+            using (var store = new JsonBotStateStore(opts))
+            {
+                store.SetPackageFailure("org", "repo", "curl", 1, DateTimeOffset.UtcNow.AddDays(5));
+                store.SetCursorWatermark("cursor-k", "v1");
+                store.AddPendingEphemeralComment(new PendingEphemeralComment("org", "repo", 10, 100L, DateTimeOffset.UtcNow.AddMinutes(-5), 0));
+
+                Directory.CreateDirectory(blockerDir);
+
+                Assert.ThrowsAny<Exception>(() => store.SetPackageFailure("org", "repo", "curl", 3, DateTimeOffset.UtcNow.AddDays(30)));
+                Assert.Equal(1, store.GetPackageFailure("org", "repo", "curl")?.ConsecutiveFailures);
+
+                Assert.ThrowsAny<Exception>(() => store.ClearPackageFailure("org", "repo", "curl"));
+                Assert.Equal(1, store.GetPackageFailure("org", "repo", "curl")?.ConsecutiveFailures);
+
+                Assert.ThrowsAny<Exception>(() => store.SetObsBlockCooldown("org", "repo", "zlib", DateTimeOffset.UtcNow.AddDays(10)));
+                Assert.Null(store.GetPackageFailure("org", "repo", "zlib"));
+
+                Assert.ThrowsAny<Exception>(() => store.TryMarkFailedPrRecorded("org", "repo", 55));
+
+                Assert.ThrowsAny<Exception>(() => store.SetCursorWatermark("cursor-k", "v2"));
+                Assert.Equal("v1", store.GetCursorWatermark("cursor-k"));
+                Assert.ThrowsAny<Exception>(() => store.SetCursorWatermark("cursor-k", null));
+                Assert.Equal("v1", store.GetCursorWatermark("cursor-k"));
+
+                Assert.ThrowsAny<Exception>(() => store.RecordEphemeralRetry("org", "repo", 100L, DateTimeOffset.UtcNow.AddMinutes(5)));
+                Assert.Equal(0, store.GetDueEphemeralComments(DateTimeOffset.UtcNow)[0].RetryCount);
+
+                Assert.ThrowsAny<Exception>(() => store.RemovePendingEphemeralComment("org", "repo", 100L));
+                Assert.Single(store.GetDueEphemeralComments(DateTimeOffset.UtcNow));
+
+                Assert.ThrowsAny<Exception>(() => store.AddPendingEphemeralComment(
+                    new PendingEphemeralComment("org", "repo", 11, 200L, DateTimeOffset.UtcNow.AddMinutes(-1))));
+                Assert.Single(store.GetDueEphemeralComments(DateTimeOffset.UtcNow));
+
+                Directory.Delete(blockerDir, recursive: true);
+
+                // Retrying previously failed cursor watermark succeeds instead of hitting stale memory equality
+                store.SetCursorWatermark("cursor-k", "v2");
+                Assert.Equal("v2", store.GetCursorWatermark("cursor-k"));
+            }
+
+            // Fail-fast when corrupt bot-state.json cannot be moved aside for backup (cross-platform seam, works on Windows and Linux)
+            var stateFilePath = Path.Combine(tempDir, "bot-state.json");
+            File.WriteAllText(stateFilePath, "{ invalid-json");
+            var ex = Assert.Throws<InvalidOperationException>(() => new JsonBotStateStore(
+                opts,
+                logger: null,
+                fileReader: null,
+                fileMover: (_, _) => throw new IOException("simulated move failure")));
+            Assert.Contains("back up corrupt bot state file", ex.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.True(File.Exists(stateFilePath));
+
+            // Fail-fast WITHOUT renaming or clearing valid bot-state.json on filesystem read I/O error
+            const string validJson = "{\"Cursors\":{\"k\":\"v1\"}}";
+            File.WriteAllText(stateFilePath, validJson);
+            var readEx = Assert.Throws<InvalidOperationException>(() => new JsonBotStateStore(
+                opts,
+                logger: null,
+                fileReader: _ => throw new IOException("simulated read EIO"),
+                fileMover: null));
+            Assert.Contains("Failed to read bot state file", readEx.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(validJson, File.ReadAllText(stateFilePath));
+            Assert.Empty(Directory.GetFiles(tempDir, "*.corrupt.*"));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task EphemeralReplyService_WhenRecordRetryThrows_DoesNotLogMisleadingExhaustedRetries()
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var gateway = Substitute.For<IEphemeralCommentGateway>();
+        gateway.DeleteCommentAsync("org", "repo", 500L, Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new HttpRequestException("503 Unavailable"));
+
+        var stateStore = Substitute.For<IBotStateStore>();
+        stateStore.GetDueEphemeralComments(Arg.Any<DateTimeOffset>())
+            .Returns(new[] { new PendingEphemeralComment("org", "repo", 10, 500L, DateTimeOffset.UtcNow.AddMinutes(-1), RetryCount: 0) });
+        stateStore.When(s => s.RecordEphemeralRetry("org", "repo", 500L, Arg.Any<DateTimeOffset>(), Arg.Any<int>()))
+            .Do(_ => throw new IOException("disk full"));
+
+        var capturedLogs = new List<(LogLevel Level, string Message)>();
+        using var loggerFactory = LoggerFactory.Create(b =>
+            b.AddProvider(new CapturingLoggerProvider(capturedLogs)));
+        var logger = loggerFactory.CreateLogger<EphemeralReplyService>();
+
+        var opts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions { EphemeralReplyAction = EphemeralReplyAction.Delete });
+        using var service = new EphemeralReplyService(gitHub, stateStore, opts, gateway, logger);
+
+        var processed = await service.ProcessDueRepliesAsync();
+        Assert.Equal(0, processed);
+        Assert.Contains(capturedLogs, l => l.Level == LogLevel.Error && l.Message.Contains("Failed to persist retry schedule", StringComparison.Ordinal));
+        Assert.DoesNotContain(capturedLogs, l => l.Message.Contains("Exhausted retries", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void RuntimeHealthState_SanitizeMessage_RedactsPosixAndWindowsPaths_PreservingUrlsAndRepoSlugs()
+    {
+        var state = new RuntimeHealthState();
+        state.RecordError(
+            "abaci_bot.Services.Test",
+            new IOException(@"Cannot open C:\secret\appsettings.json or /state/bot-state.json while contacting https://api.osv.dev/v1/querybatch for openRuyi-Project/openRuyi"),
+            "Persist failure on SPECS/curl/curl.spec");
+
+        var (lastError1, _) = state.GetLastError();
+        Assert.NotNull(lastError1);
+        Assert.DoesNotContain(@"C:\secret\appsettings.json", lastError1!, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("/state/bot-state.json", lastError1!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("[REDACTED_PATH]", lastError1!, StringComparison.Ordinal);
+        Assert.Contains("https://api.osv.dev/v1/querybatch", lastError1!, StringComparison.Ordinal);
+        Assert.Contains("openRuyi-Project/openRuyi", lastError1!, StringComparison.Ordinal);
+        Assert.Contains("SPECS/curl/curl.spec", lastError1!, StringComparison.Ordinal);
+
+        // Also cover space-containing Windows paths, UNC shares, file:// URIs, '+' POSIX paths, and /api + /health routes
+        state.RecordError(
+            "abaci_bot.Services.Test",
+            new IOException(@"Read C:\Program Files\abaci-bot\appsettings.json, \\fileserver\share\bot-state.json, file:///etc/secret.pem, /var/lib/g++/config.json"),
+            "Route /api/webhook and /health?verbose=true");
+
+        var (lastError2, _) = state.GetLastError();
+        Assert.NotNull(lastError2);
+        Assert.DoesNotContain("Program Files", lastError2!, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(@"\\fileserver\share", lastError2!, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("file:///etc/secret.pem", lastError2!, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("/var/lib/g++/config.json", lastError2!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("[REDACTED_PATH]", lastError2!, StringComparison.Ordinal);
+        Assert.Contains("/api/webhook", lastError2!, StringComparison.Ordinal);
+        Assert.Contains("/health?verbose=true", lastError2!, StringComparison.Ordinal);
+
+        // Windows forward-slash drive path, UNC share spaces, file:// spaces, and spaced leaf filename (split cleanly under 240-char cap).
+        state.RecordError(
+            "abaci_bot.Services.Test",
+            new IOException("Failed opening C:/Users/steve/secret.txt with https://api.osv.dev/v1/vulns"),
+            "Retry");
+        var (lastError3, _) = state.GetLastError();
+        Assert.NotNull(lastError3);
+        Assert.DoesNotContain("C:/Users", lastError3!, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", lastError3!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("[REDACTED_PATH]", lastError3!, StringComparison.Ordinal);
+        Assert.Contains("https://api.osv.dev/v1/vulns", lastError3!, StringComparison.Ordinal);
+
+        state.RecordError(
+            "abaci_bot.Services.Test",
+            new IOException(@"Cannot open C:\Users\steve\My Secret File.txt during sync"),
+            "Retry");
+        var (lastError4, _) = state.GetLastError();
+        Assert.NotNull(lastError4);
+        Assert.DoesNotContain("Secret", lastError4!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("[REDACTED_PATH] during sync", lastError4!, StringComparison.Ordinal);
+
+        state.RecordError(
+            "abaci_bot.Services.Test",
+            new IOException(@"Cannot read \\server\My Share\file.txt on host"),
+            "Retry");
+        var (lastError5, _) = state.GetLastError();
+        Assert.NotNull(lastError5);
+        Assert.DoesNotContain("Share", lastError5!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("[REDACTED_PATH] on host", lastError5!, StringComparison.Ordinal);
+
+        state.RecordError(
+            "abaci_bot.Services.Test",
+            new IOException("Blocked file:///C:/My Folder/x.txt from load"),
+            "Retry");
+        var (lastError6, _) = state.GetLastError();
+        Assert.NotNull(lastError6);
+        Assert.DoesNotContain("Folder", lastError6!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("[REDACTED_PATH] from load", lastError6!, StringComparison.Ordinal);
+
+        // POSIX spaced path segments and leaf filename while still keeping repo slug intact
+        state.RecordError(
+            "abaci_bot.Services.Test",
+            new IOException("Read /mnt/my data/secret file.txt during sync of openRuyi-Project/openRuyi"),
+            "Retry");
+        var (lastError7, _) = state.GetLastError();
+        Assert.NotNull(lastError7);
+        Assert.DoesNotContain("data/", lastError7!, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", lastError7!, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("file.txt", lastError7!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("[REDACTED_PATH] during sync of openRuyi-Project/openRuyi", lastError7!, StringComparison.Ordinal);
+
+        state.RecordError(
+            "abaci_bot.Services.Test",
+            new IOException("Missing /state/bot-state.json for openRuyi-Project/openRuyi"),
+            "Retry");
+        var (lastError8, _) = state.GetLastError();
+        Assert.NotNull(lastError8);
+        Assert.DoesNotContain("/state/bot-state.json", lastError8!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("[REDACTED_PATH] for openRuyi-Project/openRuyi", lastError8!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task BotControlPlaneService_StatusQuery_DisplaysOpenBlockedIssue_AndDegradesCleanlyOnSearchError()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"bcp-blocked-status-{Guid.NewGuid():N}");
+        try
+        {
+            using var store = new JsonBotStateStore(Microsoft.Extensions.Options.Options.Create(new BotStateOptions { StateDirectory = tempDir }));
+            var gitHub = Substitute.For<IGitHubService>();
+            var perm = Substitute.For<IRepositoryPermissionService>();
+            var pagedSearch = Substitute.For<IPagedIssueSearchGateway>();
+            var blockedIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+            typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(blockedIssue, 123);
+            typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(blockedIssue, "<!-- abaci-obs-blocked: curl -->");
+
+            pagedSearch.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.AutoUpdateBlocked, Arg.Any<CancellationToken>())
+                .Returns(new GitHubSearchPageResult<Issue>(new[] { blockedIssue }, 1, false));
+
+            var localeOpts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions { DefaultLocale = "en", StateDirectory = tempDir });
+            var pkgOpts = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions());
+            var localeResolver = new LocaleResolver(localeOpts, store);
+            var svc = new BotControlPlaneService(gitHub, perm, store, localeResolver, pkgOpts, pagedIssueSearch: pagedSearch);
+
+            var enCtx = new PullRequestContext(
+                gitHubService: gitHub,
+                teamName: "captains",
+                headers: null,
+                eventType: PullRequestEventType.IssueComment,
+                owner: "owner",
+                repo: "repo",
+                prNumber: 50,
+                headSha: "sha",
+                baseBranch: "main",
+                isDraft: false,
+                isMerged: false,
+                title: "test",
+                body: "@abaci-bot status curl",
+                senderLogin: "alice",
+                authorLogin: "alice",
+                action: "created",
+                existingLabels: Array.Empty<string>(),
+                commentAction: Octokit.Webhooks.Events.IssueComment.IssueCommentAction.Created);
+
+            string? enReply = null;
+            gitHub.When(g => g.CreateCommentAsync("owner", "repo", 50, Arg.Any<string>(), Arg.Any<CancellationToken>()))
+                .Do(ci => enReply = ci.ArgAt<string>(3));
+
+            await svc.HandleCommandAsync(enCtx, "abaci-bot", new ParsedBotCommand("status", "curl"), "alice");
+            Assert.NotNull(enReply);
+            Assert.Contains("- **Open blocked issue**: #123", enReply!, StringComparison.Ordinal);
+
+            // Switch caller to Chinese locale and confirm localization
+            store.SetUserLocale("alice", "zh");
+            string? zhReply = null;
+            gitHub.When(g => g.CreateCommentAsync("owner", "repo", 50, Arg.Any<string>(), Arg.Any<CancellationToken>()))
+                .Do(ci => zhReply = ci.ArgAt<string>(3));
+
+            await svc.HandleCommandAsync(enCtx, "abaci-bot", new ParsedBotCommand("status", "curl"), "alice");
+            Assert.NotNull(zhReply);
+            Assert.Contains("- **阻塞跟踪 Issue**：#123", zhReply!, StringComparison.Ordinal);
+
+            // Fail-soft: search exception must still post status report without throwing
+            pagedSearch.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.AutoUpdateBlocked, Arg.Any<CancellationToken>())
+                .Returns<Task<GitHubSearchPageResult<Issue>>>(_ => throw new HttpRequestException("Search 503"));
+            string? fallbackReply = null;
+            gitHub.When(g => g.CreateCommentAsync("owner", "repo", 50, Arg.Any<string>(), Arg.Any<CancellationToken>()))
+                .Do(ci => fallbackReply = ci.ArgAt<string>(3));
+
+            await svc.HandleCommandAsync(enCtx, "abaci-bot", new ParsedBotCommand("status", "curl"), "alice");
+            Assert.NotNull(fallbackReply);
+            Assert.Contains("- **失败冷却**：无", fallbackReply!, StringComparison.Ordinal);
+
+            // S5 + S8: truncated search index surfaces note, and decayed failure (>30d) shows None/无
+            var decayedDir = Path.Combine(tempDir, "decayed");
+            Directory.CreateDirectory(decayedDir);
+            var decayedStatePath = Path.Combine(decayedDir, "bot-state.json");
+            File.WriteAllText(decayedStatePath, $$"""
+                {
+                  "Repositories": {
+                    "owner/repo": {
+                      "PackageFailures": {
+                        "curl": {
+                          "ConsecutiveFailures": 2,
+                          "CooldownUntil": null,
+                          "ObsBlockedUntil": null,
+                          "LastFailureAt": "{{DateTimeOffset.UtcNow.AddDays(-45):O}}"
+                        }
+                      }
+                    }
+                  }
+                }
+                """);
+            using var decayedStore = new JsonBotStateStore(Microsoft.Extensions.Options.Options.Create(new BotStateOptions
+            {
+                StateDirectory = decayedDir
+            }));
+            var truncatedSearch = Substitute.For<IPagedIssueSearchGateway>();
+            truncatedSearch.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.AutoUpdateBlocked, Arg.Any<CancellationToken>())
+                .Returns(new GitHubSearchPageResult<Issue>(Array.Empty<Issue>(), 1200, true));
+
+            var decayedSvc = new BotControlPlaneService(
+                gitHub,
+                perm,
+                decayedStore,
+                new LocaleResolver(localeOpts, decayedStore),
+                pkgOpts,
+                pagedIssueSearch: truncatedSearch);
+
+            string? truncatedEnReply = null;
+            gitHub.When(g => g.CreateCommentAsync("owner", "repo", 50, Arg.Any<string>(), Arg.Any<CancellationToken>()))
+                .Do(ci => truncatedEnReply = ci.ArgAt<string>(3));
+            await decayedSvc.HandleCommandAsync(enCtx, "abaci-bot", new ParsedBotCommand("status", "curl"), "alice");
+            Assert.NotNull(truncatedEnReply);
+            Assert.Contains("- **Failure cooldown**: None", truncatedEnReply!, StringComparison.Ordinal);
+            Assert.Contains("search index truncated", truncatedEnReply!, StringComparison.OrdinalIgnoreCase);
+
+            decayedStore.SetUserLocale("alice", "zh");
+            string? truncatedZhReply = null;
+            gitHub.When(g => g.CreateCommentAsync("owner", "repo", 50, Arg.Any<string>(), Arg.Any<CancellationToken>()))
+                .Do(ci => truncatedZhReply = ci.ArgAt<string>(3));
+            await decayedSvc.HandleCommandAsync(enCtx, "abaci-bot", new ParsedBotCommand("status", "curl"), "alice");
+            Assert.NotNull(truncatedZhReply);
+            Assert.Contains("- **失败冷却**：无", truncatedZhReply!, StringComparison.Ordinal);
+            Assert.Contains("搜索索引已截断", truncatedZhReply!, StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void JsonBotStateStore_NullEntriesAndMissingOrUnreadableFile_HandledSafely()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"abaci-state-s1-s2-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var statePath = Path.Combine(tempDir, "bot-state.json");
+            File.WriteAllText(statePath, """
+                {
+                  "UserLocales": { "alice": null, "bob": { "Locale": "zh", "UpdatedAt": "2026-11-24T00:00:00Z" } },
+                  "PendingEphemeralComments": [ null ],
+                  "Cursors": { "k1": null, "k2": "v2" },
+                  "Repositories": {
+                    "empty/repo": null,
+                    "org/repo": {
+                      "IgnoredPackages": { "nullpkg": null },
+                      "PackageFailures": { "nullfail": null },
+                      "RecordedFailedPrs": [1, 2]
+                    }
+                  }
+                }
+                """);
+
+            var opts = Microsoft.Extensions.Options.Options.Create(new BotStateOptions
+            {
+                StateDirectory = tempDir
+            });
+
+            using (var store = new JsonBotStateStore(opts))
+            {
+                Assert.Null(store.GetUserLocale("alice"));
+                Assert.Equal("zh", store.GetUserLocale("bob"));
+                Assert.Equal("v2", store.GetCursorWatermark("k2"));
+                Assert.Null(store.GetCursorWatermark("k1"));
+                Assert.Empty(store.GetIgnoredPackages("org", "repo"));
+                Assert.False(store.TryMarkFailedPrRecorded("org", "repo", 1));
+            }
+
+            // Missing file from fileReader returns empty state cleanly (FileNotFoundException).
+            using (var missingStore = new JsonBotStateStore(
+                opts,
+                logger: null,
+                fileReader: _ => throw new FileNotFoundException("missing", statePath),
+                fileMover: null))
+            {
+                Assert.Null(missingStore.GetUserLocale("bob"));
+            }
+
+            // Unreadable file fails closed even when File.Exists would return false or reader denies access.
+            var ex = Assert.Throws<InvalidOperationException>(() => new JsonBotStateStore(
+                opts,
+                logger: null,
+                fileReader: _ => throw new UnauthorizedAccessException("permission denied"),
+                fileMover: null));
+            Assert.Contains("Refusing to back up or start with empty state", ex.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    private sealed class CapturingLoggerProvider(List<(LogLevel Level, string Message)> entries) : ILoggerProvider
+    {
+        public ILogger CreateLogger(string categoryName) => new CapturingLogger(entries);
+        public void Dispose() { }
+
+        private sealed class CapturingLogger(List<(LogLevel Level, string Message)> entries) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+                => entries.Add((logLevel, formatter(state, exception)));
+        }
+    }
+
     private sealed class MutableTimeProvider : TimeProvider
     {
         private DateTimeOffset _utcNow;

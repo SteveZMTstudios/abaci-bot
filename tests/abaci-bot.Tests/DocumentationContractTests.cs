@@ -406,6 +406,64 @@ public class DocumentationContractTests
         Assert.True(missing.Count == 0, "Documentation references missing test files:\n" + string.Join("\n", missing));
     }
 
+    [Fact]
+    public void MutexGroups_MatchArchitectureAndLabelsDocumentation()
+    {
+        var codeGroups = new abaci_bot.Pipelines.LabelMutexEngine().MutexGroups;
+
+        var architectureText = File.ReadAllText(Path.Combine(RepoRoot, "docs", "architecture.md"));
+        var archSection = Regex.Match(architectureText, @"### Mutex Groups(?<body>.*?)\n---", RegexOptions.Singleline);
+        Assert.True(archSection.Success, "docs/architecture.md is missing '### Mutex Groups' section.");
+
+        var archGroups = Regex.Matches(archSection.Groups["body"].Value, @"^\d+\.\s+\*\*[^*]+\*\*:\s*(?<rest>.+)$", RegexOptions.Multiline)
+            .Select(m =>
+            {
+                var beforeNotes = m.Groups["rest"].Value.Split('(')[0];
+                return Regex.Matches(beforeNotes, "`([^`]+)`")
+                    .Select(lbl => lbl.Groups[1].Value.Trim())
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            })
+            .ToList();
+
+        Assert.Equal(codeGroups.Count, archGroups.Count);
+        for (int i = 0; i < codeGroups.Count; i++)
+        {
+            Assert.NotEmpty(codeGroups[i]);
+            Assert.NotEmpty(archGroups[i]);
+            Assert.True(
+                codeGroups[i].SetEquals(archGroups[i]),
+                $"docs/architecture.md mutex group #{i + 1} drifted: doc=[{string.Join(", ", archGroups[i])}], code=[{string.Join(", ", codeGroups[i])}]");
+        }
+
+        var labelsText = File.ReadAllText(Path.Combine(RepoRoot, "docs", "labels.md"));
+        var proseCountMatch = Regex.Match(labelsText, @"across\s+(?<count>\d+)\s+distinct", RegexOptions.IgnoreCase);
+        Assert.True(proseCountMatch.Success, "docs/labels.md is missing mutex group count summary.");
+        Assert.Equal(codeGroups.Count, int.Parse(proseCountMatch.Groups["count"].Value));
+
+        var labelSubgraphs = Regex.Matches(labelsText, @"subgraph G(?<num>\d+)\[""[^""]+""\]\s*\r?\n(?<body>.*?)\r?\n\s*end", RegexOptions.Singleline)
+            .OrderBy(m => int.Parse(m.Groups["num"].Value))
+            .Select(m =>
+            {
+                var uncommentedLines = m.Groups["body"].Value
+                    .Split('\n')
+                    .Where(line => !line.TrimStart().StartsWith("%%", StringComparison.Ordinal));
+                var cleanedBody = string.Join('\n', uncommentedLines);
+                return Regex.Matches(cleanedBody, @"\[""([^""]+)""\]")
+                    .Select(node => node.Groups[1].Value.Trim())
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            })
+            .ToList();
+
+        Assert.Equal(codeGroups.Count, labelSubgraphs.Count);
+        for (int i = 0; i < codeGroups.Count; i++)
+        {
+            Assert.NotEmpty(labelSubgraphs[i]);
+            Assert.True(
+                codeGroups[i].SetEquals(labelSubgraphs[i]),
+                $"docs/labels.md mutex subgraph G{i + 1} drifted: doc=[{string.Join(", ", labelSubgraphs[i])}], code=[{string.Join(", ", codeGroups[i])}]");
+        }
+    }
+
     private static string ToSnakeCase(string value)
     {
         return Regex.Replace(value, "(?<!^)([A-Z])", "_$1").ToLowerInvariant();

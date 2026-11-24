@@ -1612,20 +1612,22 @@ public class GitHubServiceTests
         Assert.Null(await service.FindOpenPullRequestByHeadAsync("owner", "repo", "heads/feat"));
         Assert.Null(await service.FindOpenPullRequestByHeadAsync("owner", "repo", "feat"));
 
-        // EnsureLabelsExistAsync failure paths
+        // EnsureLabelsExistAsync failure paths (fail-closed)
         var issueClient = Substitute.For<IIssuesClient>();
         var labelsClient = Substitute.For<IIssuesLabelsClient>();
         client.Issue.Returns(issueClient);
         issueClient.Labels.Returns(labelsClient);
         labelsClient.GetAllForRepository("owner", "repo")
             .Returns(Task.FromException<IReadOnlyList<Label>>(new InvalidOperationException("list err")));
-        await service.EnsureLabelsExistAsync("owner", "repo", new[] { ("L1", "ffffff", "d") });
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.EnsureLabelsExistAsync("owner", "repo", new[] { ("L1", "ffffff", "d") }));
 
         labelsClient.GetAllForRepository("owner", "repo")
             .Returns(Task.FromResult<IReadOnlyList<Label>>(Array.Empty<Label>()));
         labelsClient.Create("owner", "repo", Arg.Any<NewLabel>())
             .Returns(Task.FromException<Label>(new InvalidOperationException("create err")));
-        await service.EnsureLabelsExistAsync("owner", "repo", new[] { ("L1", "ffffff", "d") });
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.EnsureLabelsExistAsync("owner", "repo", new[] { ("L1", "ffffff", "d") }));
 
         // GetBranchLatestCommitAsync: empty branchModel.Commit, author fallback when Committer is null
         var reposClient = Substitute.For<IRepositoriesClient>();
@@ -2129,6 +2131,82 @@ public class GitHubServiceTests
             await service.GetPullRequestAsync("owner", "repo", 1);
             Assert.Contains("ghs_install_tok", prAuthHeader, StringComparison.Ordinal);
         }
+    }
+
+    [Fact]
+    public async Task VerifyCollaboratorPermissionProbeAsync_InPatMode_AlwaysProbesNonSelfLogin()
+    {
+        var (pem, _) = GenerateRsaKeyPair();
+
+        var patUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(patUser, "pat-bot");
+
+        // 1. Repository owner != PAT user -> probes owner instead of PAT self
+        var client1 = Substitute.For<IGitHubClient>();
+        client1.Connection.Returns(Substitute.For<IConnection>());
+        var usersClient1 = Substitute.For<IUsersClient>();
+        usersClient1.Current().Returns(Task.FromResult(patUser));
+        client1.User.Returns(usersClient1);
+        var repos1 = Substitute.For<IRepositoriesClient>();
+        var collab1 = Substitute.For<IRepoCollaboratorsClient>();
+        repos1.Collaborator.Returns(collab1);
+        client1.Repository.Returns(repos1);
+        collab1.ReviewPermission("openRuyi-Project", "openRuyi", "openRuyi-Project")
+            .Returns(Task.FromResult(new CollaboratorPermissionResponse("read", "read", new Collaborator())));
+
+        var svc1 = new GitHubService(12345, pem, 67890, "ghp_pat_token", client1);
+        await svc1.VerifyCollaboratorPermissionProbeAsync("openRuyi-Project", "openRuyi");
+        await collab1.Received(1).ReviewPermission("openRuyi-Project", "openRuyi", "openRuyi-Project");
+        await collab1.DidNotReceive().ReviewPermission("openRuyi-Project", "openRuyi", "pat-bot");
+
+        // 2. Repository owner == PAT user -> falls back to probing "ghost" instead of PAT self
+        var client2 = Substitute.For<IGitHubClient>();
+        client2.Connection.Returns(Substitute.For<IConnection>());
+        var usersClient2 = Substitute.For<IUsersClient>();
+        usersClient2.Current().Returns(Task.FromResult(patUser));
+        client2.User.Returns(usersClient2);
+        var repos2 = Substitute.For<IRepositoriesClient>();
+        var collab2 = Substitute.For<IRepoCollaboratorsClient>();
+        repos2.Collaborator.Returns(collab2);
+        client2.Repository.Returns(repos2);
+        var notFoundResp = Substitute.For<IResponse>();
+        notFoundResp.StatusCode.Returns(HttpStatusCode.NotFound);
+        collab2.ReviewPermission("pat-bot", "personal-repo", "ghost")
+            .Returns<Task<CollaboratorPermissionResponse>>(_ => throw new NotFoundException(notFoundResp));
+
+        var svc2 = new GitHubService(12345, pem, 67890, "ghp_pat_token", client2);
+        await svc2.VerifyCollaboratorPermissionProbeAsync("pat-bot", "personal-repo");
+        await collab2.Received(1).ReviewPermission("pat-bot", "personal-repo", "ghost");
+        await collab2.DidNotReceive().ReviewPermission("pat-bot", "personal-repo", "pat-bot");
+
+        // 3. Private repo invisible to PAT -> Repository.Get throws NotFoundException and must NOT be swallowed (G1)
+        var client3 = Substitute.For<IGitHubClient>();
+        client3.Connection.Returns(Substitute.For<IConnection>());
+        var usersClient3 = Substitute.For<IUsersClient>();
+        usersClient3.Current().Returns(Task.FromResult(patUser));
+        client3.User.Returns(usersClient3);
+        var repos3 = Substitute.For<IRepositoriesClient>();
+        repos3.Get("org", "private-repo").Returns<Task<Repository>>(_ => throw new NotFoundException(notFoundResp));
+        client3.Repository.Returns(repos3);
+
+        var svc3 = new GitHubService(12345, pem, 67890, "ghp_pat_token", client3);
+        await Assert.ThrowsAsync<NotFoundException>(() => svc3.VerifyCollaboratorPermissionProbeAsync("org", "private-repo"));
+
+        // 4. Public repo visible to PAT with only Triage permission (Push=false) -> fails fast (S1 defense-in-depth)
+        var client4 = Substitute.For<IGitHubClient>();
+        client4.Connection.Returns(Substitute.For<IConnection>());
+        var usersClient4 = Substitute.For<IUsersClient>();
+        usersClient4.Current().Returns(Task.FromResult(patUser));
+        client4.User.Returns(usersClient4);
+        var repos4 = Substitute.For<IRepositoriesClient>();
+        var readOnlyPerms = new RepositoryPermissions(admin: false, push: false, triage: true, maintain: false, pull: true);
+        var publicRepoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.Permissions))?.SetValue(publicRepoObj, readOnlyPerms);
+        repos4.Get("org", "public-repo").Returns(Task.FromResult(publicRepoObj));
+        client4.Repository.Returns(repos4);
+
+        var svc4 = new GitHubService(12345, pem, 67890, "ghp_pat_token", client4);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => svc4.VerifyCollaboratorPermissionProbeAsync("org", "public-repo"));
     }
 
     private sealed class ControllableHttpMessageHandler : HttpMessageHandler

@@ -31,7 +31,8 @@ public interface IRepositoryPermissionService
         CancellationToken ct = default);
 
     /// <summary>
-    /// Probes repository collaborator endpoint access during startup to verify elevated GitHub App installation permissions.
+    /// Probes repository collaborator endpoint access during startup to verify elevated GitHub App installation permissions
+    /// (or <c>push</c>+ access when <c>PackageUpdate:BotPat</c> is configured).
     /// </summary>
     Task VerifyCollaboratorPermissionProbeAsync(
         string owner,
@@ -39,8 +40,9 @@ public interface IRepositoryPermissionService
         CancellationToken ct = default);
 
     /// <summary>
-    /// Probes whether the active credential holds sufficient permissions to execute <c>archivePullRequest</c>/<c>unarchivePullRequest</c>
-    /// (requires a <c>triage</c>+ user PAT via <c>PackageUpdate:BotPat</c>; fails fast in GitHub App-only mode) on <paramref name="owner"/>/<paramref name="repo"/>.
+    /// Probes whether the active credential holds sufficient permissions to execute <c>archivePullRequest</c>
+    /// (requires a <c>triage</c>+ user PAT via <c>PackageUpdate:BotPat</c>—or <c>push</c>+ when combined with collaborator probing;
+    /// fails fast when permissions metadata is unavailable or in GitHub App-only mode) on <paramref name="owner"/>/<paramref name="repo"/>.
     /// </summary>
     Task VerifyArchivePermissionProbeAsync(
         string owner,

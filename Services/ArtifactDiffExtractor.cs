@@ -10,6 +10,7 @@ namespace abaci_bot.Services;
 /// </summary>
 public static class ArtifactDiffExtractor
 {
+    private const int MaxDiffBytes = 10 * 1024 * 1024;
     private static readonly byte[] ZipMagic = { 0x50, 0x4B, 0x03, 0x04 };
     private static readonly string[] LineSeparators = { "\r\n", "\r", "\n" };
 
@@ -18,16 +19,22 @@ public static class ArtifactDiffExtractor
         if (stream == null)
             return string.Empty;
 
-        // Ensure we can inspect the first 4 bytes
+        byte[]? inputBytes = null;
         if (!stream.CanSeek)
         {
-            var ms = new MemoryStream();
-            await stream.CopyToAsync(ms, ct);
-            ms.Position = 0;
-            stream = ms;
+            inputBytes = await ReadBoundedBytesAsync(stream, MaxDiffBytes, ct);
+            if (inputBytes == null || inputBytes.Length == 0)
+                return string.Empty;
+
+            stream = new MemoryStream(inputBytes, writable: false);
+        }
+        else if (stream.Length > MaxDiffBytes)
+        {
+            return string.Empty;
         }
 
         var header = new byte[4];
+        stream.Position = 0;
         var bytesRead = await stream.ReadAsync(header.AsMemory(0, 4), ct);
         stream.Position = 0;
 
@@ -44,22 +51,45 @@ public static class ArtifactDiffExtractor
                 e.Name.EndsWith(".diff", StringComparison.OrdinalIgnoreCase) ||
                 e.Name.EndsWith(".patch", StringComparison.OrdinalIgnoreCase));
 
-            if (diffEntry != null)
-            {
-                // Max 10 MiB safety limit against decompression bomb
-                if (diffEntry.Length > 10 * 1024 * 1024)
-                    return string.Empty;
+            if (diffEntry == null || diffEntry.Length > MaxDiffBytes)
+                return string.Empty;
 
-                using var reader = new StreamReader(diffEntry.Open(), Encoding.UTF8);
-                return await reader.ReadToEndAsync(ct);
-            }
+            await using var entryStream = diffEntry.Open();
+            var decompressed = await ReadBoundedBytesAsync(entryStream, MaxDiffBytes, ct);
+            if (decompressed == null)
+                return string.Empty;
 
-            return string.Empty;
+            using var reader = new StreamReader(new MemoryStream(decompressed, writable: false), Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            return await reader.ReadToEndAsync(ct);
         }
 
-        // Raw text stream (.diff / .patch)
-        using var textReader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true);
+        if (inputBytes == null)
+        {
+            inputBytes = await ReadBoundedBytesAsync(stream, MaxDiffBytes, ct);
+            if (inputBytes == null)
+                return string.Empty;
+        }
+
+        using var textReader = new StreamReader(new MemoryStream(inputBytes, writable: false), Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
         return await textReader.ReadToEndAsync(ct);
+    }
+
+    private static async Task<byte[]?> ReadBoundedBytesAsync(Stream source, int maxBytes, CancellationToken ct)
+    {
+        using var ms = new MemoryStream();
+        var buffer = new byte[8192];
+        int read;
+        while ((read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), ct)) > 0)
+        {
+            if (ms.Length + read > maxBytes)
+            {
+                return null;
+            }
+
+            ms.Write(buffer, 0, read);
+        }
+
+        return ms.ToArray();
     }
 
     /// <summary>

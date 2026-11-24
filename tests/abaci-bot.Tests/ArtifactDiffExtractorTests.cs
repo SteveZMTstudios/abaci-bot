@@ -80,4 +80,84 @@ public class ArtifactDiffExtractorTests
         var otherChanges = ArtifactDiffExtractor.ExtractFileRemoteAssetChanges(multiDiff, "SPECS/other/other.spec");
         Assert.Empty(otherChanges);
     }
+
+    [Fact]
+    public async Task ExtractDiffContentAsync_OversizedNonSeekableStreamAndOversizedZipEntry_ReturnsEmptyWithoutOom()
+    {
+        // 1. Non-seekable stream exceeding 10 MiB hard cap aborts early and returns empty
+        using var oversizedRaw = new NonSeekableRepeatingStream((byte)'+', 11 * 1024 * 1024);
+        var rawResult = await ArtifactDiffExtractor.ExtractDiffContentAsync(oversizedRaw);
+        Assert.Equal(string.Empty, rawResult);
+        Assert.True(oversizedRaw.TotalBytesRead <= (10 * 1024 * 1024) + 16384);
+
+        // 2. Highly-compressible ZIP entry exceeding 10 MiB decompressed cap returns empty without unbounded ReadToEnd
+        using var zipMs = new MemoryStream();
+        using (var archive = new ZipArchive(zipMs, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            var entry = archive.CreateEntry("bomb.diff");
+            await using var entryStream = entry.Open();
+            var chunk = new byte[64 * 1024];
+            Array.Fill(chunk, (byte)'a');
+            for (int written = 0; written < 11 * 1024 * 1024; written += chunk.Length)
+            {
+                await entryStream.WriteAsync(chunk);
+            }
+        }
+        zipMs.Position = 0;
+
+        var zipResult = await ArtifactDiffExtractor.ExtractDiffContentAsync(zipMs);
+        Assert.Equal(string.Empty, zipResult);
+    }
+
+    private sealed class NonSeekableRepeatingStream : Stream
+    {
+        private readonly byte _fill;
+        private readonly long _totalLength;
+        public long TotalBytesRead { get; private set; }
+
+        public NonSeekableRepeatingStream(byte fill, long totalLength)
+        {
+            _fill = fill;
+            _totalLength = totalLength;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var remaining = _totalLength - TotalBytesRead;
+            if (remaining <= 0)
+                return 0;
+
+            var toCopy = (int)Math.Min(count, remaining);
+            Array.Fill(buffer, _fill, offset, toCopy);
+            TotalBytesRead += toCopy;
+            return toCopy;
+        }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var remaining = _totalLength - TotalBytesRead;
+            if (remaining <= 0)
+                return ValueTask.FromResult(0);
+
+            var toCopy = (int)Math.Min(buffer.Length, remaining);
+            buffer[..toCopy].Span.Fill(_fill);
+            TotalBytesRead += toCopy;
+            return ValueTask.FromResult(toCopy);
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
 }

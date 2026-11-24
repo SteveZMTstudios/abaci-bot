@@ -21,6 +21,7 @@ public sealed class BotControlPlaneService : IBotControlPlaneService
     private readonly PackageUpdateOptions _packageUpdateOptions;
     private readonly ISpecCatalog? _specCatalog;
     private readonly IEphemeralReplyService? _ephemeralReplies;
+    private readonly IPagedIssueSearchGateway? _pagedIssueSearch;
     private readonly ILogger<BotControlPlaneService>? _logger;
 
     public BotControlPlaneService(
@@ -31,7 +32,8 @@ public sealed class BotControlPlaneService : IBotControlPlaneService
         IOptions<PackageUpdateOptions> packageUpdateOptions,
         ISpecCatalog? specCatalog = null,
         ILogger<BotControlPlaneService>? logger = null,
-        IEphemeralReplyService? ephemeralReplies = null)
+        IEphemeralReplyService? ephemeralReplies = null,
+        IPagedIssueSearchGateway? pagedIssueSearch = null)
     {
         _gitHub = gitHub;
         _permissionService = permissionService;
@@ -41,6 +43,7 @@ public sealed class BotControlPlaneService : IBotControlPlaneService
         _specCatalog = specCatalog;
         _logger = logger;
         _ephemeralReplies = ephemeralReplies;
+        _pagedIssueSearch = pagedIssueSearch ?? gitHub as IPagedIssueSearchGateway;
     }
 
     public async Task HandleCommandAsync(
@@ -100,7 +103,15 @@ public sealed class BotControlPlaneService : IBotControlPlaneService
             return;
         }
 
-        _stateStore.SetIgnoredPackage(context.Owner, context.Repo, pkg, reason, senderLogin);
+        try
+        {
+            _stateStore.SetIgnoredPackage(context.Owner, context.Repo, pkg, reason, senderLogin);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            await ReplyPersistenceFailureAsync(context, senderLogin, ex, $"ignore package '{pkg}'", isZh, cancellationToken);
+            return;
+        }
         _logger?.LogInformation("Package '{Package}' ignored in {Owner}/{Repo} by {Sender} (Reason: {Reason})",
             pkg, context.Owner, context.Repo, senderLogin, reason ?? "none");
 
@@ -144,7 +155,16 @@ public sealed class BotControlPlaneService : IBotControlPlaneService
             return;
         }
 
-        var removed = _stateStore.RemoveIgnoredPackage(context.Owner, context.Repo, pkg);
+        bool removed;
+        try
+        {
+            removed = _stateStore.RemoveIgnoredPackage(context.Owner, context.Repo, pkg);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            await ReplyPersistenceFailureAsync(context, senderLogin, ex, $"unignore package '{pkg}'", isZh, cancellationToken);
+            return;
+        }
         var msg = (removed, isZh) switch
         {
             (true, true) => $"@{senderLogin} 已将软件包 `{pkg}` 从自动更新忽略列表中移除。",
@@ -230,6 +250,21 @@ public sealed class BotControlPlaneService : IBotControlPlaneService
             }
         }
 
+        var now = DateTimeOffset.UtcNow;
+        var cooldownDays = _packageUpdateOptions.GiveUpIssueCooldownDays > 0
+            ? _packageUpdateOptions.GiveUpIssueCooldownDays
+            : 30;
+        var decayWindow = TimeSpan.FromDays(cooldownDays);
+        var failureDecayed = failureEntry?.LastFailureAt.HasValue == true &&
+                             now - failureEntry.LastFailureAt.Value > decayWindow;
+        var activeConsecutiveFailures = failureDecayed ? 0 : (failureEntry?.ConsecutiveFailures ?? 0);
+        var hasActiveCooldown = failureEntry?.CooldownUntil.HasValue == true &&
+                                failureEntry.CooldownUntil.Value > now;
+        var hasCiFailure = activeConsecutiveFailures > 0 || hasActiveCooldown;
+        var hasObsBlock = failureEntry?.ObsBlockedUntil.HasValue == true &&
+                          failureEntry.ObsBlockedUntil.Value > now;
+        var (openBlockedIssueNumber, blockedSearchTruncated) = await TryFindOpenBlockedIssueNumberAsync(context.Owner, context.Repo, pkg, cancellationToken);
+
         var report = new StringBuilder();
         if (isZh)
         {
@@ -240,9 +275,24 @@ public sealed class BotControlPlaneService : IBotControlPlaneService
             report.AppendLine(specNoAutoReason != null
                 ? $"- **SPEC `#!NoAutoUpdate`**：是（{specNoAutoReason}）"
                 : "- **SPEC `#!NoAutoUpdate`**：否");
-            report.Append(failureEntry != null
-                ? FormattableString.Invariant($"- **失败冷却**：连续失败 {failureEntry.ConsecutiveFailures} 次{(failureEntry.CooldownUntil.HasValue ? $"，冷却至 {failureEntry.CooldownUntil.Value:u}" : "")}")
+            report.Append(hasCiFailure
+                ? FormattableString.Invariant($"- **失败冷却**：连续失败 {activeConsecutiveFailures} 次{(hasActiveCooldown ? $"，冷却至 {failureEntry!.CooldownUntil!.Value:u}" : "")}")
                 : "- **失败冷却**：无");
+            if (hasObsBlock)
+            {
+                report.AppendLine();
+                report.Append(FormattableString.Invariant($"- **OBS 构建阻塞冷却**：冷却至 {failureEntry!.ObsBlockedUntil!.Value:u}"));
+            }
+            if (openBlockedIssueNumber.HasValue)
+            {
+                report.AppendLine();
+                report.Append(FormattableString.Invariant($"- **阻塞跟踪 Issue**：#{openBlockedIssueNumber.Value}"));
+            }
+            else if (blockedSearchTruncated)
+            {
+                report.AppendLine();
+                report.Append("- **阻塞跟踪 Issue**：未在前序检索页中找到（搜索索引已截断，可能仍有更早 Issue）");
+            }
         }
         else
         {
@@ -253,12 +303,78 @@ public sealed class BotControlPlaneService : IBotControlPlaneService
             report.AppendLine(specNoAutoReason != null
                 ? $"- **SPEC `#!NoAutoUpdate`**: Yes ({specNoAutoReason})"
                 : "- **SPEC `#!NoAutoUpdate`**: No");
-            report.Append(failureEntry != null
-                ? FormattableString.Invariant($"- **Failure cooldown**: {failureEntry.ConsecutiveFailures} consecutive failure(s){(failureEntry.CooldownUntil.HasValue ? $", cooldown until {failureEntry.CooldownUntil.Value:u}" : "")}")
+            report.Append(hasCiFailure
+                ? FormattableString.Invariant($"- **Failure cooldown**: {activeConsecutiveFailures} consecutive failure(s){(hasActiveCooldown ? $", cooldown until {failureEntry!.CooldownUntil!.Value:u}" : "")}")
                 : "- **Failure cooldown**: None");
+            if (hasObsBlock)
+            {
+                report.AppendLine();
+                report.Append(FormattableString.Invariant($"- **OBS post-merge block**: Cooldown until {failureEntry!.ObsBlockedUntil!.Value:u}"));
+            }
+            if (openBlockedIssueNumber.HasValue)
+            {
+                report.AppendLine();
+                report.Append(FormattableString.Invariant($"- **Open blocked issue**: #{openBlockedIssueNumber.Value}"));
+            }
+            else if (blockedSearchTruncated)
+            {
+                report.AppendLine();
+                report.Append("- **Open blocked issue**: None found in scanned pages (search index truncated; older issues may exist)");
+            }
         }
 
         await TryPostReplyAsync(context, report.ToString(), ephemeral: false, cancellationToken);
+    }
+
+    private async Task<(int? IssueNumber, bool IndexTruncated)> TryFindOpenBlockedIssueNumberAsync(
+        string owner,
+        string repo,
+        string pkg,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            IReadOnlyList<Issue>? blockedIssues;
+            var isTruncated = false;
+            if (_pagedIssueSearch != null)
+            {
+                var page = await _pagedIssueSearch.SearchOpenIssuesByLabelAsync(
+                    owner, repo, GitHubLabels.AutoUpdateBlocked, cancellationToken);
+                blockedIssues = page?.Items;
+                isTruncated = page?.IsTruncated == true;
+            }
+            else
+            {
+                blockedIssues = await _gitHub.SearchStaleCandidatesAsync(
+                    owner,
+                    repo,
+                    DateTimeOffset.UtcNow.AddDays(1),
+                    isPr: false,
+                    labelFilter: $"label:\"{GitHubLabels.AutoUpdateBlocked}\" is:issue is:open",
+                    ct: cancellationToken);
+            }
+
+            if (blockedIssues != null)
+            {
+                foreach (var issue in blockedIssues)
+                {
+                    if (issue != null &&
+                        PackageUpdateService.TryExtractBlockedPackage(issue, out var blockedPkg) &&
+                        string.Equals(blockedPkg, pkg, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return (issue.Number, false);
+                    }
+                }
+            }
+
+            return (null, isTruncated);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogDebug(ex, "Could not inspect open blocked issues for status query on {Package}", pkg);
+        }
+
+        return (null, false);
     }
 
     private async Task HandleLangAsync(
@@ -285,7 +401,15 @@ public sealed class BotControlPlaneService : IBotControlPlaneService
         var normalizedArg = arg.Trim().ToLowerInvariant();
         if (normalizedArg == "reset")
         {
-            _stateStore.ClearUserLocale(senderLogin);
+            try
+            {
+                _stateStore.ClearUserLocale(senderLogin);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                await ReplyPersistenceFailureAsync(context, senderLogin, ex, "reset language preference", IsChineseReply(context, senderLogin), cancellationToken);
+                return;
+            }
             var effective = _localeResolver.ResolveForReply(context.Owner, context.Repo, senderLogin);
             var isZh = string.Equals(effective, "zh", StringComparison.OrdinalIgnoreCase);
             await TryPostReplyAsync(
@@ -311,12 +435,39 @@ public sealed class BotControlPlaneService : IBotControlPlaneService
             return;
         }
 
-        _stateStore.SetUserLocale(senderLogin, normalizedArg);
+        try
+        {
+            _stateStore.SetUserLocale(senderLogin, normalizedArg);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            await ReplyPersistenceFailureAsync(context, senderLogin, ex, $"set language preference '{normalizedArg}'", normalizedArg == "zh", cancellationToken);
+            return;
+        }
         var confirmMsg = normalizedArg == "zh"
             ? $"@{senderLogin} 已将您的回复语言偏好设置为 `zh`（中文）。"
             : $"@{senderLogin} Your reply language preference has been set to `en` (English).";
 
         await TryPostReplyAsync(context, confirmMsg, ephemeral: false, cancellationToken);
+    }
+
+    private Task ReplyPersistenceFailureAsync(
+        PullRequestContext context,
+        string senderLogin,
+        Exception ex,
+        string operation,
+        bool isZh,
+        CancellationToken cancellationToken)
+    {
+        _logger?.LogError(
+            ex,
+            "Failed to persist state change for control-plane action ({Operation}) on {Owner}/{Repo}#{PrNumber}.",
+            operation, context.Owner, context.Repo, context.PrNumber);
+
+        var body = isZh
+            ? $"@{senderLogin} 状态持久化失败（请检查机器人存储目录挂载与写权限），操作未生效。"
+            : $"@{senderLogin} Failed to persist state to disk (please check state directory mount and write permissions); the change was not applied.";
+        return TryPostReplyAsync(context, body, ephemeral: false, cancellationToken);
     }
 
     private async Task TryPostReplyAsync(

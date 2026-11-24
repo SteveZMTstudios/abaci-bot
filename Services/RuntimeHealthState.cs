@@ -34,6 +34,26 @@ public sealed partial class RuntimeHealthState
         RegexOptions.IgnoreCase)]
     private static partial Regex SecretTokenRegex();
 
+    [GeneratedRegex(
+        @"file://(?:/?[A-Za-z]:)?(?:[\\/](?:[^\s\\/:""'<>|,;)\]]+(?: [^\s\\/:""'<>|,;)\]]+){0,3})(?=[\\/]))*[\\/](?:[^\s\\/:""'<>|,;)\].]+(?: [^\s\\/:""'<>|,;)\].]+){1,4}(?:\.[A-Za-z0-9]{1,10}){1,2}(?=$|[\s""'<>|,;)\]:])|[^\s\\""'<>|,;)\]]*)|file://[^\s""'<>|,;)\]]+",
+        RegexOptions.IgnoreCase)]
+    private static partial Regex FileUriPathRegex();
+
+    [GeneratedRegex(
+        @"\\\\[A-Za-z0-9._-]+\\(?:[A-Za-z0-9.$_-]+(?: [A-Za-z0-9.$_-]+){0,3}(?=[\\/])|[A-Za-z0-9.$_-]+)(?:(?:[\\/](?:[^\s\\/:""'<>|,;)\]]+(?: [^\s\\/:""'<>|,;)\]]+){0,3})(?=[\\/]))*[\\/](?:[^\s\\/:""'<>|,;)\].]+(?: [^\s\\/:""'<>|,;)\].]+){1,4}(?:\.[A-Za-z0-9]{1,10}){1,2}(?=$|[\s""'<>|,;)\]:])|[^\s\\""'<>|,;)\]]*))?",
+        RegexOptions.IgnoreCase)]
+    private static partial Regex UncPathRegex();
+
+    [GeneratedRegex(
+        @"(?<![A-Za-z0-9_])[A-Za-z]:(?=[\\/])(?!//)(?:[\\/](?:[^\s\\/:""'<>|,;)\]]+(?: [^\s\\/:""'<>|,;)\]]+){0,3})(?=[\\/]))*[\\/](?:[^\s\\/:""'<>|,;)\].]+(?: [^\s\\/:""'<>|,;)\].]+){1,4}(?:\.[A-Za-z0-9]{1,10}){1,2}(?=$|[\s""'<>|,;)\]:])|[^\s\\""'<>|,;)\]]*)",
+        RegexOptions.IgnoreCase)]
+    private static partial Regex WindowsDrivePathRegex();
+
+    [GeneratedRegex(
+        @"(?<=^|[\s""'(\[=])/(?!api(?:/|$|\s|\?)|health(?:/|$|\s|\?))(?:[A-Za-z0-9._+-]+/|[A-Za-z0-9_+-]+(?: [A-Za-z0-9_+-]+){1,3}/)+(?:[A-Za-z0-9_+-]+(?: [A-Za-z0-9_+-]+){1,4}(?:\.[A-Za-z0-9]{1,10}){1,2}(?=$|[\s""'<>|,;)\]:])|[A-Za-z0-9._+-]*/?)",
+        RegexOptions.IgnoreCase)]
+    private static partial Regex PosixPathRegex();
+
     public DateTimeOffset StartedAtUtc { get; }
 
     public RuntimeHealthState(TimeProvider? timeProvider = null)
@@ -198,6 +218,10 @@ public sealed partial class RuntimeHealthState
     private static string SanitizeMessage(string message)
     {
         var sanitized = SecretTokenRegex().Replace(message, "[REDACTED]");
+        sanitized = FileUriPathRegex().Replace(sanitized, "[REDACTED_PATH]");
+        sanitized = UncPathRegex().Replace(sanitized, "[REDACTED_PATH]");
+        sanitized = WindowsDrivePathRegex().Replace(sanitized, "[REDACTED_PATH]");
+        sanitized = PosixPathRegex().Replace(sanitized, "[REDACTED_PATH]");
         return sanitized.Length > 240 ? sanitized[..240] : sanitized;
     }
 

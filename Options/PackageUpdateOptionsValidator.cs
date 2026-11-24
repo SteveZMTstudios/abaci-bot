@@ -27,9 +27,9 @@ public class PackageUpdateOptionsValidator : IValidateOptions<PackageUpdateOptio
             failures.Add($"{nameof(options.MaxConcurrentPullRequests)} must be positive (got {options.MaxConcurrentPullRequests}).");
         }
 
-        if (options.FailedPrTtlDays <= 0)
+        if (options.FailedPrTtlDays is < 1 or > 363)
         {
-            failures.Add($"{nameof(options.FailedPrTtlDays)} must be positive (got {options.FailedPrTtlDays}).");
+            failures.Add($"{nameof(options.FailedPrTtlDays)} must be between 1 and 363 (got {options.FailedPrTtlDays}).");
         }
 
         if (options.CooldownHours < 0)

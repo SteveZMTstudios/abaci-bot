@@ -223,4 +223,19 @@ public class ConversationGuardModuleTests
 
         await _guardService.DidNotReceiveWithAnyArgs().HandleCommandAsync(default!, default!, default!, default);
     }
+
+    [Fact]
+    public async Task ProcessAsync_UnarchiveCommand_IsIgnoredBecauseArchivedPrsAreReadOnly()
+    {
+        var module = CreateModule(new ConversationGuardOptions
+        {
+            Enabled = true,
+            RepositoryAllowList = new List<string> { "openRuyi-Project/openRuyi" }
+        });
+        var context = CreateContext("@abaci-bot unarchive", senderLogin: "alice");
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        await _guardService.DidNotReceiveWithAnyArgs().HandleCommandAsync(default!, default!, default!, default);
+    }
 }

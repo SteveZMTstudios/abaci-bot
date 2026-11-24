@@ -9,7 +9,8 @@ public sealed record IgnoredPackageEntry(
 public sealed record PackageFailureEntry(
     int ConsecutiveFailures,
     DateTimeOffset? CooldownUntil,
-    DateTimeOffset? LastFailureAt = null);
+    DateTimeOffset? LastFailureAt = null,
+    DateTimeOffset? ObsBlockedUntil = null);
 
 public sealed record PendingEphemeralComment(
     string Owner,
@@ -41,6 +42,8 @@ public interface IBotStateStore
     PackageFailureEntry? GetPackageFailure(string owner, string repo, string packageName);
     void SetPackageFailure(string owner, string repo, string packageName, int consecutiveFailures, DateTimeOffset? cooldownUntil);
     bool ClearPackageFailure(string owner, string repo, string packageName);
+    void SetObsBlockCooldown(string owner, string repo, string packageName, DateTimeOffset blockedUntil);
+    bool ClearObsBlockCooldown(string owner, string repo, string packageName);
     bool TryMarkFailedPrRecorded(string owner, string repo, int prNumber);
 
     void AddPendingEphemeralComment(PendingEphemeralComment entry);

@@ -23,7 +23,7 @@ public partial class ConversationGuardService : IConversationGuardService
     private readonly ILogger<ConversationGuardService>? _logger;
     private readonly PendingConfirmationStore _confirmationStore;
 
-    [GeneratedRegex(@"^@?(?<user>[a-zA-Z0-9_\-]+(?:\[bot\])?)(?:\s|$)", RegexOptions.IgnoreCase)]
+    [GeneratedRegex(@"^@?(?<user>[a-zA-Z0-9_\-]+(?:\[bot\])?)(?:[\s:,.!?;)\]""'”’]|$)", RegexOptions.IgnoreCase)]
     private static partial Regex HideTargetUserRegex();
 
     public ConversationGuardService(
@@ -131,6 +131,35 @@ public partial class ConversationGuardService : IConversationGuardService
         }
     }
 
+    private async Task<bool> IsProtectedMaintainerAsync(
+        string owner,
+        string repo,
+        string username,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            return false;
+        }
+
+        try
+        {
+            var level = await _permissionService.GetUserPermissionAsync(owner, repo, username, cancellationToken);
+            return level >= RepositoryAccessLevel.Triage;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Target protection fails closed so transient API/rate-limit errors never fold a maintainer's comment.
+            _logger?.LogWarning(
+                ex,
+                "Failed to query repository collaborator permission for target '{Username}' on '{Owner}/{Repo}'; treating target as protected maintainer fail-closed.",
+                username,
+                owner,
+                repo);
+            return true;
+        }
+    }
+
     private async Task TryPostReplyAsync(
         PullRequestContext context,
         string commentBody,
@@ -199,6 +228,14 @@ public partial class ConversationGuardService : IConversationGuardService
             _logger?.LogWarning(
                 ex,
                 "Cannot post {Action} announcement on {Owner}/{Repo}#{PrNumber}; conversation may already be locked or archived.",
+                actionDescription, context.Owner, context.Repo, context.PrNumber);
+            return (false, 0);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogError(
+                ex,
+                "Failed to post {Action} announcement on {Owner}/{Repo}#{PrNumber}.",
                 actionDescription, context.Owner, context.Repo, context.PrNumber);
             return (false, 0);
         }
@@ -418,21 +455,6 @@ public partial class ConversationGuardService : IConversationGuardService
         _logger?.LogInformation("Unlocking conversation for {Owner}/{Repo}#{PrNumber} requested by maintainer {Sender}",
             context.Owner, context.Repo, context.PrNumber, senderLogin);
 
-        bool unarchiveFailed = false;
-        if (_options.ArchiveEnabled)
-        {
-            try
-            {
-                await _gitHub.UnarchivePullRequestAsync(context.Owner, context.Repo, context.PrNumber, null, cancellationToken);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                unarchiveFailed = true;
-                _logger?.LogWarning(ex, "Unarchive attempt failed during unlock for {Owner}/{Repo}#{PrNumber}",
-                    context.Owner, context.Repo, context.PrNumber);
-            }
-        }
-
         try
         {
             await _gitHub.UnlockIssueAsync(context.Owner, context.Repo, context.PrNumber, cancellationToken);
@@ -452,13 +474,9 @@ public partial class ConversationGuardService : IConversationGuardService
             return;
         }
 
-        var unlockMessage = unarchiveFailed
-            ? (isZh
-                ? $"此对话已由 @{senderLogin} 解锁（注意：自动取消归档未成功，请确认归档权限）。"
-                : $"This conversation has been unlocked by @{senderLogin} (note: automatic unarchiving failed; please verify archive permissions).")
-            : (isZh
-                ? $"此对话已由 @{senderLogin} 解锁。"
-                : $"This conversation has been unlocked by @{senderLogin}.");
+        var unlockMessage = isZh
+            ? $"此对话已由 @{senderLogin} 解锁。"
+            : $"This conversation has been unlocked by @{senderLogin}.";
 
         await TryPostReplyAsync(
             context,
@@ -505,7 +523,7 @@ public partial class ConversationGuardService : IConversationGuardService
             return;
         }
 
-        if (await HasTriageOrHigherPermissionAsync(context.Owner, context.Repo, targetUser, cancellationToken))
+        if (await IsProtectedMaintainerAsync(context.Owner, context.Repo, targetUser, cancellationToken))
         {
             await TryPostReplyAsync(
                 context,
@@ -561,7 +579,7 @@ public partial class ConversationGuardService : IConversationGuardService
 
             if (botComments.Count > 0)
             {
-                if (await HasTriageOrHigherPermissionAsync(context.Owner, context.Repo, botLoginCandidate, cancellationToken))
+                if (await IsProtectedMaintainerAsync(context.Owner, context.Repo, botLoginCandidate, cancellationToken))
                 {
                     await TryPostReplyAsync(
                         context,

@@ -331,4 +331,39 @@ public class SpecVersionRewriterTests
         Assert.False(rewriter.Rewrite(validContext, "8.22.0;id").Success);
         Assert.False(rustRewriter.Rewrite(new SpecContext("rust-foo", "rust-foo", "%global crate_name foo\nVersion: 1.0.0\n", "path"), "1.0.1;id").Success);
     }
+
+    [Fact]
+    public void RustCrateSpecRewriter_RejectsMultipleFullVersionDirectives()
+    {
+        var original = """
+            %global crate_name foo
+            %global full_version 1.0.0
+            %global full_version 1.0.0+extra
+
+            Name:           rust-foo
+            Version:        1.0.0
+            Release:        %autorelease
+            """;
+
+        var rewriter = new RustCrateSpecRewriter();
+        var context = new SpecContext("rust-foo", "rust-foo", original, "SPECS/rust-foo/rust-foo.spec");
+
+        Assert.False(rewriter.CanHandle(context));
+        var result = rewriter.Rewrite(context, "1.0.1");
+        Assert.False(result.Success);
+        Assert.Contains("Multiple '%global full_version'", result.ErrorMessage);
+
+        var indentedDuplicate = """
+            %global crate_name foo
+            %global full_version 1.0.0
+              %global full_version 1.0.1
+
+            Name:           rust-foo
+            Version:        1.0.0
+            Release:        %autorelease
+            """;
+        var indentedContext = new SpecContext("rust-foo", "rust-foo", indentedDuplicate, "SPECS/rust-foo/rust-foo.spec");
+        Assert.False(rewriter.CanHandle(indentedContext));
+        Assert.False(rewriter.Rewrite(indentedContext, "1.0.2").Success);
+    }
 }

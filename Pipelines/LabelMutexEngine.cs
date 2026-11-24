@@ -74,6 +74,8 @@ public class LabelMutexEngine
         }
     };
 
+    internal IReadOnlyList<IReadOnlySet<string>> MutexGroups => _mutexGroups;
+
     /// <summary>
     /// Computes the net label additions and removals required to reflect module intents
     /// while enforcing mutual-exclusion rules across known label groups.

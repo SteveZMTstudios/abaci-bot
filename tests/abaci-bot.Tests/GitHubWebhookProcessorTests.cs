@@ -1051,7 +1051,8 @@ public class GitHubWebhookProcessorTests
         FakeGitHubService github,
         abaci_bot.Options.TargetClassificationOptions? targetOptions = null,
         abaci_bot.Options.ChangeTypeClassificationOptions? changeTypeOptions = null,
-        abaci_bot.Options.BotDetectionOptions? botOptions = null)
+        abaci_bot.Options.BotDetectionOptions? botOptions = null,
+        IBotIdentityProvider? botIdentity = null)
     {
         var config = new ConfigurationManager
         {
@@ -1064,7 +1065,7 @@ public class GitHubWebhookProcessorTests
         var pipeline = CreateFullPipeline(github, targetOptions, changeTypeOptions, botOptions);
         var lockManager = new abaci_bot.Pipelines.PullRequestLockManager();
 
-        return new TestGitHubWebhookProcessor(github, config, pipeline, lockManager, mutexEngine);
+        return new TestGitHubWebhookProcessor(github, config, pipeline, lockManager, mutexEngine, botIdentity: botIdentity);
     }
 
     #region Governance Pipeline End-to-End & Mixed-Case Captains Verification
@@ -1901,8 +1902,9 @@ public class GitHubWebhookProcessorTests
             abaci_bot.Pipelines.LabelMutexEngine mutexEngine,
             IArtifactService? artifactService = null,
             IAbiDiffService? abiDiffService = null,
-            TimeProvider? timeProvider = null)
-            : base(github, config, pipeline, lockManager, mutexEngine, artifactService: artifactService, abiDiffService: abiDiffService, timeProvider: timeProvider)
+            TimeProvider? timeProvider = null,
+            IBotIdentityProvider? botIdentity = null)
+            : base(github, config, pipeline, lockManager, mutexEngine, artifactService: artifactService, abiDiffService: abiDiffService, timeProvider: timeProvider, botIdentity: botIdentity)
         {
             _testGithub = github;
         }
@@ -3000,6 +3002,32 @@ public class GitHubWebhookProcessorTests
         // d1 was evicted -> replaying d1 executes ready transition
         await processor.ProcessPullRequestAsync(new WebhookHeaders { Delivery = "d1" }, readyPayload, PullRequestAction.Opened);
         Assert.True(github.LabelOperations.Count > opsBeforeEvictionCheck);
+    }
+
+    [Fact]
+    public async Task NonPrIssue_WhenOwnBotPatLoginCommentsOnStaleIssue_DoesNotRemoveStatusStale()
+    {
+        var github = new FakeGitHubService();
+        var botIdentity = Substitute.For<IBotIdentityProvider>();
+        botIdentity.GetBotLoginAsync(Arg.Any<CancellationToken>()).Returns("custom-pat-account");
+        var processor = CreateFullProcessor(github, botIdentity: botIdentity);
+
+        var issue = Create<WebhookIssue>(
+            (nameof(WebhookIssue.Number), 104L),
+            (nameof(WebhookIssue.Title), "Stale Issue"),
+            (nameof(WebhookIssue.User), User("issue-creator")),
+            (nameof(WebhookIssue.PullRequest), null),
+            (nameof(WebhookIssue.Labels), Labels(new[] { GitHubLabels.StatusStale })));
+
+        var patBotUser = User("custom-pat-account");
+        var commentEvent = Create<WebhookIssueCommentCreatedEvent>(
+            (nameof(WebhookIssueCommentCreatedEvent.Issue), issue),
+            (nameof(WebhookIssueCommentCreatedEvent.Repository), Repository()),
+            (nameof(WebhookIssueCommentCreatedEvent.Sender), patBotUser));
+
+        await processor.ProcessIssueCommentAsync(commentEvent, IssueCommentAction.Created);
+
+        Assert.Empty(github.LabelOperations);
     }
 
     private sealed class TestFakeTimeProvider : TimeProvider

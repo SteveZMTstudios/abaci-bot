@@ -363,12 +363,13 @@
     // Empty: sweeps are skipped.
     // Default: "openRuyi-Project/openRuyi".
     "TargetRepository": "openRuyi-Project/openRuyi",
-    // Format: GitHub login used to author update PRs.
-    // Empty: invalid when Enabled=true.
+    // Format: fallback GitHub login used only when no live IBotIdentityProvider is resolved (live App slug or BotPat user overrides this at runtime).
+    // Empty: allowed at startup; branch commit ownership, post-merge verification, and bot-triage checks fail closed whenever live identity resolution also fails.
     // Default: "aqua-rium".
     "BotLogin": "aqua-rium",
-    // Format: PAT with repository write access.
-    // Empty: the GitHub App installation token is used instead.
+    // Format: PAT with repository push+ access when combined with ConversationGuard:Enabled=true (ArchiveEnabled=true checks triage+, while collaborator probing in PAT mode requires push+).
+    // Note: when set, ALL bot GitHub API identity and writes switch from the App token to this user (use a dedicated machine user).
+    // Empty: the GitHub App installation token is used instead (ConversationGuard:ArchiveEnabled=true is disallowed).
     // Default: empty (the App installation token is used).
     "BotPat": "",
     // Format: branch name prefix.
@@ -388,7 +389,7 @@
       // Unit: hours. Range: > 0. Default: 48.
       "StaleThresholdHours": 48,
       // Format: local file path for persisting Lookout first-observed timestamps across restarts.
-      // Empty: defaults to lookout-first-seen.json under the local application data directory.
+      // Empty: defaults to lookout-first-seen.json under BotState:StateDirectory (/state in Docker Compose, or the local application data directory when unset).
       // Default: "".
       "FirstSeenStatePath": ""
     },
@@ -421,12 +422,12 @@
       // Default: "riscv64".
       "TargetArch": "riscv64",
       // Default: false.
-      // true: a non-successful post-merge OBS build applies Auto-Update: Blocked.
+      // true: a Failed, Unresolvable, or Broken post-merge OBS build applies Auto-Update: Blocked.
       // false: OBS results are reported without applying a label.
       "RequireObsSuccessAfterMerge": false
     },
     // Default: false.
-    // false: updates crossing a major version boundary are skipped.
+    // false: updates crossing a major version boundary (or differing versions whose major component cannot be parsed) are skipped fail-closed.
     "AllowCrossMajorVersion": false,
     // Default: true.
     // true: packages carrying downstream patch files are skipped.
@@ -435,7 +436,9 @@
     "MaxCandidatesPerSweep": 5,
     // Range: >= 1. Default: 5.
     "MaxConcurrentPullRequests": 5,
-    // Unit: days. Range: >= 1. Default: 7.
+    // Unit: days. Range: 1..363. Default: 7.
+    // Days an inactive pull request with failing CI stays open before auto-closure, and age before unverified merged PR branches are reclaimed.
+    // Coupled OBS lookback window computes Math.Clamp(FailedPrTtlDays + 2, 7, 365); values outside 1..363 fail startup validation.
     "FailedPrTtlDays": 7,
     // Unit: hours. Range: >= 0. Default: 72.
     // Minimum age in hours an upstream release (or persisted first observation when the source omits release timestamps) must reach before submission.
@@ -448,7 +451,7 @@
     // true: a tracking issue is filed when the failure limit is reached.
     "IssueOnGivingUp": true,
     // Unit: days. Range: >= 1. Default: 30.
-    // Duration a package remains in failure cooldown after reaching consecutive CI failure limits.
+    // Shared recovery horizon controlling CI give-up cooldown, LastFailureAt decay window, and fallback OBS block cooldown if issue creation fails.
     // Setting 0 or empty is rejected by options validation.
     "GiveUpIssueCooldownDays": 30,
     // Format: label name.
@@ -572,7 +575,7 @@
     "RepositoryAllowList": [],
     // Default: false.
     // false: archive commands are rejected (recommended for GitHub App-only deployments).
-    // true: pull request archiving/unarchiving via GraphQL is enabled; requires a triage+ user PAT via PackageUpdate:BotPat (GitHub App-only mode fails fast on startup).
+    // true: pull request archiving via GraphQL (@<bot> archive) is enabled; requires a triage+ user PAT via PackageUpdate:BotPat (GitHub App-only mode fails fast on startup). Archived PRs become strictly read-only on GitHub and must be unarchived out-of-band via Web UI or `gh api graphql`.
     "ArchiveEnabled": false,
     // Unit: days. Range: 7..365. Default: 60.
     // Threshold based on closed_at after which closed PRs are automatically locked to prevent post-closure harassment.

@@ -13,6 +13,16 @@ public class UpdateAdmissionTests
     [InlineData("1.2.3", "1.3.0", false)]       // Standard SemVer minor update
     [InlineData("1.2.3", "2.0.0", true)]        // Standard SemVer major update
     [InlineData("v1.2.3", "v1.4.0", false)]     // Leading 'v' prefix
+    [InlineData("v1.2.3", "1.3.0", false)]      // Leading 'v' stripped on one side
+    [InlineData("v.1.0", "v.2.0", false)]       // Dot-delimited 'v' major token
+    [InlineData("2026c", "2026d", false)]       // CalVer year + letter suffix (e.g. tzdata)
+    [InlineData("2026c", "2027a", true)]        // CalVer cross year with letter suffix
+    [InlineData("3_508", "3_509", false)]       // Underscore delimiter same major (e.g. iozone)
+    [InlineData("3_508", "4_001", true)]        // Underscore delimiter cross major
+    [InlineData("B.02.20", "B.02.21", false)]   // Delimited alpha major same series (e.g. lshw)
+    [InlineData("B.02.20", "C.01.00", true)]    // Delimited alpha major cross series
+    [InlineData("B.02.20", "1.0.0", true)]      // Incompatible token kinds fail closed
+    [InlineData("snapshot20240101", "snapshot20250101", true)] // Undelimited opaque tokens fail closed
     [InlineData("0.4.88+curl-8.19.0", "0.4.89", false)] // Strips build suffix
     [InlineData("1:2.0.0", "2.0.0", true)]       // Epoch 1 -> Epoch 0 crosses epoch boundary
     [InlineData("1:2.0.0", "2:2.0.0", true)]     // Epoch 1 -> Epoch 2 crosses epoch boundary
@@ -119,12 +129,15 @@ public class UpdateAdmissionTests
     }
 
     [Fact]
-    public void IsCrossMajorVersion_HandlesInvalidOrEmptyVersions()
+    public void IsCrossMajorVersion_FailsClosedOnUnparseableOrEmptyDifferingVersions_AndAllowsIdentical()
     {
-        Assert.False(UpdateAdmission.IsCrossMajorVersion("", "1.0"));
-        Assert.False(UpdateAdmission.IsCrossMajorVersion("1.0", ""));
-        Assert.False(UpdateAdmission.IsCrossMajorVersion("abc", "1.0"));
-        Assert.False(UpdateAdmission.IsCrossMajorVersion("1.0", "abc"));
+        Assert.True(UpdateAdmission.IsCrossMajorVersion("", "1.0"));
+        Assert.True(UpdateAdmission.IsCrossMajorVersion("1.0", ""));
+        Assert.True(UpdateAdmission.IsCrossMajorVersion("abc", "1.0"));
+        Assert.True(UpdateAdmission.IsCrossMajorVersion("1.0", "abc"));
+        Assert.True(UpdateAdmission.IsCrossMajorVersion("abc", "def"));
+        Assert.False(UpdateAdmission.IsCrossMajorVersion("abc", "abc"));
+        Assert.False(UpdateAdmission.IsCrossMajorVersion("", ""));
     }
 
     [Theory]
@@ -204,5 +217,10 @@ public class UpdateAdmissionTests
         Assert.True(UpdateAdmission.TryExtractCurrentVersion(
             "%global full_version %{version}\nVersion: 1.2.3\n", out var fallback));
         Assert.Equal("1.2.3", fallback);
+
+        // Indented %global full_version is also recognized consistently with RustCrateSpecRewriter
+        Assert.True(UpdateAdmission.TryExtractCurrentVersion(
+            "  %global full_version 1.4.0\nVersion: 1.4.0\n", out var indented));
+        Assert.Equal("1.4.0", indented);
     }
 }

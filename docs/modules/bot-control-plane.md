@@ -12,7 +12,7 @@
 |---|---|---|
 | `@<bot> ignore <package> [reason]` | Collaborators (`triage`+) | Persists a runtime ignore entry for `<package>` in `bot-state.json` (`owner/repo`). `PackageUpdateService` skips the package on subsequent sweeps without requiring a spec commit. |
 | `@<bot> unignore <package>` | Collaborators (`triage`+) | Removes `<package>` from the runtime ignore list in `bot-state.json` so automated updates can resume. |
-| `@<bot> status [package]` | Any commenter | Reports runtime ignore status, in-spec `#!NoAutoUpdate` directive status, and persistent failure cooldown state. When `<package>` is omitted on an `autoupdate/<pkg>` PR, the package name is inferred from the head branch; otherwise lists all runtime-ignored packages in the repository. |
+| `@<bot> status [package]` | Any commenter | Reports runtime ignore status, in-spec `#!NoAutoUpdate` directive status, persistent CI failure cooldown, OBS post-merge fallback cooldown (`ObsBlockedUntil`), and any open `Auto-Update: Blocked` tracking issue (`#<N>`). When `<package>` is omitted on an `autoupdate/<pkg>` PR, the package name is inferred from the head branch; otherwise lists all runtime-ignored packages in the repository. |
 | `@<bot> lang <en\|zh\|reset>` | Any commenter (unless disabled by `RepositoryForcedLocales`) | Sets or clears the caller's personal response language preference (`en` or `zh`). Disabled when the repository configures `BotState:RepositoryForcedLocales`. |
 
 ---
@@ -50,5 +50,7 @@ Configured under the `BotState` JSON section:
 
 - **Single-Instance Exclusive State Lock**: `JsonBotStateStore` acquires an OS-level exclusive lock handle (`FileShare.None`) on `bot-state.lock` in `BotState:StateDirectory` at startup. Starting a second instance targeting the same state directory fails fast with `InvalidOperationException` rather than silently overwriting `bot-state.json` (the OS releases the lock automatically on process exit).
 - **Atomic Persistence**: `JsonBotStateStore` writes to a temporary file and atomically replaces `bot-state.json`.
-- **Corrupt State Fallback**: Invalid JSON logs a warning and falls back to an empty in-memory state instead of crashing startup.
+- **Corrupt State vs. I/O Read Failure**: Invalid JSON syntax or null-deserializing `bot-state.json` logs `LogLevel.Error` (surfaced via `/health?verbose=true` `runtime.lastError`), moves the corrupt file to `bot-state.json.corrupt.<yyyyMMddHHmmss>`, and starts with an empty in-memory state (failing fast with `InvalidOperationException` if moving the corrupt file fails). Conversely, filesystem read/permission errors (`IOException` / `UnauthorizedAccessException`) reading an existing `bot-state.json` fail fast immediately without renaming or clearing the file.
+- **Persistence Failure Handling**: Runtime disk write errors during `SaveState` log `LogLevel.Error` and throw; `JsonBotStateStore` rolls back in-memory state for control-plane mutations so memory never diverges from disk, and `BotControlPlaneService` replies explicitly that persistence failed and the command was not applied.
+- **State-First Commit & Reply Resilience**: Control-plane mutations persist on disk before posting GitHub confirmation comments; HTTP 403 (`ForbiddenException`) or transient reply failures on locked/archived pull requests are logged safely without rolling back committed state.
 - **Fail-Closed Authorization**: `ignore` and `unignore` verify `triage`+ repository permission via `IRepositoryPermissionService`; lookup errors deny the mutation.

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 using abaci_bot.Options;
 using Microsoft.Extensions.Logging;
@@ -12,6 +13,8 @@ namespace abaci_bot.Services;
 /// </summary>
 public class ObsPostMergeVerifier
 {
+    private const int MaxWarnedNonShaRevisions = 2048;
+
     private readonly IGitHubService _gitHubService;
     private readonly IObsBuildService _obsBuildService;
     private readonly PackageUpdateOptions _options;
@@ -19,6 +22,9 @@ public class ObsPostMergeVerifier
     private readonly IPagedIssueSearchGateway? _pagedIssueSearch;
     private readonly IObsBuildFreshnessGateway? _freshnessGateway;
     private readonly ISpecCatalog? _specCatalog;
+    private readonly IBotStateStore? _stateStore;
+    private readonly IBotIdentityProvider? _botIdentity;
+    private readonly ConcurrentDictionary<string, byte> _warnedNonShaRevisions = new(StringComparer.OrdinalIgnoreCase);
 
     private static readonly Regex PackageTitleRegex = new(
         @"^SPECS:\s*bump\s+(?<pkg>\S+)(?:\s+\S+\s*->\s*(?<ver>\S+))?",
@@ -50,7 +56,9 @@ public class ObsPostMergeVerifier
         ILogger<ObsPostMergeVerifier>? logger = null,
         IPagedIssueSearchGateway? pagedIssueSearch = null,
         IObsBuildFreshnessGateway? freshnessGateway = null,
-        ISpecCatalog? specCatalog = null)
+        ISpecCatalog? specCatalog = null,
+        IBotStateStore? stateStore = null,
+        IBotIdentityProvider? botIdentity = null)
     {
         _gitHubService = gitHubService;
         _obsBuildService = obsBuildService;
@@ -59,6 +67,8 @@ public class ObsPostMergeVerifier
         _pagedIssueSearch = pagedIssueSearch ?? gitHubService as IPagedIssueSearchGateway;
         _freshnessGateway = freshnessGateway ?? obsBuildService as IObsBuildFreshnessGateway;
         _specCatalog = specCatalog;
+        _stateStore = stateStore;
+        _botIdentity = botIdentity ?? gitHubService as IBotIdentityProvider;
     }
 
     private static readonly string[] BlockedLabels = { GitHubLabels.AutoUpdateBlocked };
@@ -72,7 +82,8 @@ public class ObsPostMergeVerifier
         var owner = parts[0].Trim();
         var repo = parts[1].Trim();
 
-        var checkSince = DateTimeOffset.UtcNow.AddDays(-7);
+        var lookbackDays = (int)Math.Clamp((long)_options.FailedPrTtlDays + 2L, 7L, 365L);
+        var checkSince = DateTimeOffset.UtcNow.AddDays(-lookbackDays);
 
         IReadOnlyList<Octokit.PullRequest> mergedPrs;
         try
@@ -91,9 +102,15 @@ public class ObsPostMergeVerifier
         var isBlockedIndexTruncated = false;
         var handledPackages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        IReadOnlySet<string>? ownBotLogins = null;
         if (mergedPrs.Count > 0)
         {
             _logger?.LogInformation("Evaluating {Count} merged bot PRs for OBS build synchronization", mergedPrs.Count);
+            ownBotLogins = await BotCommitOwnership.ResolveOwnBotLoginsAsync(
+                _botIdentity,
+                _options.BotLogin,
+                requireLiveWhenProviderPresent: true,
+                ct);
         }
 
         foreach (var pr in mergedPrs)
@@ -101,171 +118,229 @@ public class ObsPostMergeVerifier
             if (ct.IsCancellationRequested)
                 break;
 
-            var match = PackageTitleRegex.Match(pr.Title ?? string.Empty);
-            if (!match.Success)
-                continue;
-
-            var packageName = match.Groups["pkg"].Value.Trim();
-            var targetVersion = match.Groups["ver"].Success ? match.Groups["ver"].Value.Trim() : null;
-            var mergeSha = pr.MergeCommitSha;
-            if (string.IsNullOrWhiteSpace(mergeSha))
-                continue;
-
-            var serviceRevision = await _obsBuildService.GetPackageServiceRevisionAsync(
-                _options.Obs.Project, packageName, ct);
-
-            if (string.IsNullOrEmpty(serviceRevision))
+            if (!string.IsNullOrWhiteSpace(pr.User?.Login) &&
+                (ownBotLogins == null ||
+                 ownBotLogins.Count == 0 ||
+                 !BotCommitOwnership.IsOwnBotLogin(pr.User.Login, ownBotLogins)))
             {
-                _logger?.LogDebug("OBS _service not found or no revision for {Package}", packageName);
+                _logger?.LogDebug(
+                    "Ignoring merged PR #{PrNumber} authored by '{Author}' (own bot logins resolved={ResolvedCount}) during post-merge OBS verification",
+                    pr.Number, pr.User.Login, ownBotLogins?.Count ?? 0);
                 continue;
             }
 
-            if (!string.Equals(serviceRevision, mergeSha, StringComparison.OrdinalIgnoreCase))
+            try
             {
-                _logger?.LogDebug("OBS _service revision ({ObsRev}) does not match PR merge SHA ({MergeSha}) for {Package}; pending sync",
-                    serviceRevision, mergeSha, packageName);
-                continue;
-            }
+                var match = PackageTitleRegex.Match(pr.Title ?? string.Empty);
+                if (!match.Success)
+                    continue;
 
-            // Revision matches: OBS has synchronized this merged commit! Now check _result
-            var buildResult = await _obsBuildService.GetPackageBuildResultAsync(
-                _options.Obs.Project, packageName, _options.Obs.TargetRepository, _options.Obs.TargetArch, ct);
-
-            _logger?.LogInformation("OBS build result for merged PR #{PrNumber} ({Package}): {Status} (dirty={Dirty})",
-                pr.Number, packageName, buildResult.Code, buildResult.IsDirty);
-
-            if (buildResult.Code == ObsStatusCode.Succeeded)
-            {
-                var isFreshSuccess = await VerifyObsSuccessIsFreshAsync(buildResult, pr.MergedAt, ct);
-                if (!isFreshSuccess)
+                var packageName = match.Groups["pkg"].Value.Trim();
+                var targetVersion = match.Groups["ver"].Success ? match.Groups["ver"].Value.Trim() : null;
+                var mergeSha = pr.MergeCommitSha;
+                if (string.IsNullOrWhiteSpace(mergeSha))
                 {
-                    _logger?.LogInformation(
-                        "OBS _result reported Succeeded for merged PR #{PrNumber} ({Package}), but build is dirty or not yet confirmed after merge; waiting for fresh job",
-                        pr.Number, packageName);
-                    handledPackages.Add(packageName);
+                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ct);
                     continue;
                 }
 
-                handledPackages.Add(packageName);
-                if (!_options.DryRun)
+                var serviceRevision = await _obsBuildService.GetPackageServiceRevisionAsync(
+                    _options.Obs.Project, packageName, ct);
+
+                if (string.IsNullOrEmpty(serviceRevision))
                 {
-                    if (pr.Labels != null && pr.Labels.Any(l => string.Equals(l.Name, GitHubLabels.AutoUpdateBlocked, StringComparison.OrdinalIgnoreCase)))
+                    _logger?.LogDebug("OBS _service not found or no revision for {Package}", packageName);
+                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ct);
+                    continue;
+                }
+
+                if (!IsServiceRevisionMatchingMergeSha(serviceRevision, mergeSha))
+                {
+                    if (!IsHexShaPrefix(serviceRevision))
                     {
-                        try
+                        var warnKey = $"{packageName}|{pr.Number}|{serviceRevision}";
+                        if (_warnedNonShaRevisions.Count >= MaxWarnedNonShaRevisions)
                         {
-                            await _gitHubService.RemoveLabelAsync(owner, repo, pr.Number, GitHubLabels.AutoUpdateBlocked, ct);
-                            _logger?.LogInformation("Removed {BlockedLabel} from merged PR #{PrNumber} after successful OBS build",
-                                GitHubLabels.AutoUpdateBlocked, pr.Number);
+                            _warnedNonShaRevisions.Clear();
                         }
-                        catch (Exception ex)
+
+                        if (_warnedNonShaRevisions.TryAdd(warnKey, 0))
                         {
-                            _logger?.LogDebug(ex, "Failed to remove blocked label from PR #{Number}", pr.Number);
+                            _logger?.LogWarning(
+                                "OBS _service revision '{ObsRev}' for {Package} (PR #{PrNumber}, merge SHA {MergeSha}) is not a commit SHA; skipping post-merge OBS attribution without applying blocked label",
+                                serviceRevision, packageName, pr.Number, mergeSha);
+                        }
+                        else
+                        {
+                            _logger?.LogDebug(
+                                "OBS _service revision '{ObsRev}' for {Package} (PR #{PrNumber}, merge SHA {MergeSha}) is not a commit SHA (warning already emitted); skipping",
+                                serviceRevision, packageName, pr.Number, mergeSha);
                         }
                     }
+                    else
+                    {
+                        _logger?.LogDebug("OBS _service revision ({ObsRev}) does not match PR merge SHA ({MergeSha}) for {Package}; pending sync",
+                            serviceRevision, mergeSha, packageName);
+                    }
 
-                    await TryReclaimMergedBranchAsync(owner, repo, pr, "after successful OBS build verification", ct);
-
-                    (loadedOpenBlockedIssues, openBlockedByPackage, isBlockedIndexTruncated) = await EnsureOpenBlockedIndexLoadedAsync(
-                        owner, repo, loadedOpenBlockedIssues, openBlockedByPackage, isBlockedIndexTruncated, ct);
-                    await CloseObsBlockedTrackingIssueIfOpenAsync(
-                        owner, repo, packageName,
-                        $"Post-merge OBS build succeeded on PR #{pr.Number} (commit `{mergeSha}`). Closing tracking issue and resuming automated updates for `{packageName}`.",
-                        openBlockedByPackage, ct);
+                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ct);
+                    continue;
                 }
-            }
-            else
-            {
-                handledPackages.Add(packageName);
-                if (_options.Obs.RequireObsSuccessAfterMerge &&
-                    (buildResult.Code == ObsStatusCode.Failed || buildResult.Code == ObsStatusCode.Unresolvable))
+
+                // Revision matches: OBS has synchronized this merged commit! Now check _result
+                var buildResult = await _obsBuildService.GetPackageBuildResultAsync(
+                    _options.Obs.Project, packageName, _options.Obs.TargetRepository, _options.Obs.TargetArch, ct);
+
+                _logger?.LogInformation("OBS build result for merged PR #{PrNumber} ({Package}): {Status} (dirty={Dirty})",
+                    pr.Number, packageName, buildResult.Code, buildResult.IsDirty);
+
+                if (buildResult.Code == ObsStatusCode.Succeeded)
                 {
-                    _logger?.LogWarning("Merged PR #{PrNumber} failed post-merge OBS gate requirement ({Status})", pr.Number, buildResult.Code);
+                    var isFreshSuccess = await VerifyObsSuccessIsFreshAsync(buildResult, pr.MergedAt, ct);
+                    if (!isFreshSuccess)
+                    {
+                        _logger?.LogInformation(
+                            "OBS _result reported Succeeded for merged PR #{PrNumber} ({Package}), but build is dirty or not yet confirmed after merge; waiting for fresh job",
+                            pr.Number, packageName);
+                        handledPackages.Add(packageName);
+                        await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ct);
+                        continue;
+                    }
+
+                    handledPackages.Add(packageName);
                     if (!_options.DryRun)
                     {
-                        try
+                        if (pr.Labels != null && pr.Labels.Any(l => string.Equals(l.Name, GitHubLabels.AutoUpdateBlocked, StringComparison.OrdinalIgnoreCase)))
                         {
-                            await _gitHubService.AddLabelsAsync(owner, repo, pr.Number, BlockedLabels, ct);
+                            try
+                            {
+                                await _gitHubService.RemoveLabelAsync(owner, repo, pr.Number, GitHubLabels.AutoUpdateBlocked, ct);
+                                _logger?.LogInformation("Removed {BlockedLabel} from merged PR #{PrNumber} after successful OBS build",
+                                    GitHubLabels.AutoUpdateBlocked, pr.Number);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger?.LogDebug(ex, "Failed to remove blocked label from PR #{Number}", pr.Number);
+                            }
                         }
-                        catch (Exception ex)
-                        {
-                            _logger?.LogDebug(ex, "Failed to apply blocked label to merged PR #{Number}", pr.Number);
-                        }
+
+                        await TryReclaimMergedBranchAsync(owner, repo, pr, "after successful OBS build verification", ct);
 
                         (loadedOpenBlockedIssues, openBlockedByPackage, isBlockedIndexTruncated) = await EnsureOpenBlockedIndexLoadedAsync(
                             owner, repo, loadedOpenBlockedIssues, openBlockedByPackage, isBlockedIndexTruncated, ct);
-                        await EnsureObsBlockedTrackingIssueAsync(
-                            owner, repo, packageName, targetVersion, pr.Number, mergeSha, buildResult,
-                            openBlockedByPackage, isBlockedIndexTruncated, ct);
+                        var hadOpenBlockedIssue = openBlockedByPackage?.ContainsKey(packageName) == true;
+                        var closedBlockedIssue = await CloseObsBlockedTrackingIssueIfOpenAsync(
+                            owner, repo, packageName,
+                            $"Post-merge OBS build succeeded on PR #{pr.Number} (commit `{mergeSha}`). Closing tracking issue and resuming automated updates for `{packageName}`.",
+                            openBlockedByPackage, ct);
+                        if (!hadOpenBlockedIssue || closedBlockedIssue)
+                        {
+                            TryClearObsBlockCooldown(owner, repo, packageName);
+                        }
                     }
                 }
-
-                // If PR has been merged past TTL, reclaim branch even if OBS build failed/remained unresolved
-                if (!_options.DryRun && pr.MergedAt.HasValue &&
-                    pr.MergedAt.Value < DateTimeOffset.UtcNow.AddDays(-_options.FailedPrTtlDays))
+                else
                 {
-                    await TryReclaimMergedBranchAsync(owner, repo, pr, "after reaching merged TTL", ct);
+                    handledPackages.Add(packageName);
+                    if (_options.Obs.RequireObsSuccessAfterMerge &&
+                        buildResult.Code is ObsStatusCode.Failed or ObsStatusCode.Unresolvable or ObsStatusCode.Broken)
+                    {
+                        _logger?.LogWarning("Merged PR #{PrNumber} failed post-merge OBS gate requirement ({Status})", pr.Number, buildResult.Code);
+                        if (!_options.DryRun)
+                        {
+                            try
+                            {
+                                await _gitHubService.AddLabelsAsync(owner, repo, pr.Number, BlockedLabels, ct);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger?.LogDebug(ex, "Failed to apply blocked label to merged PR #{Number}", pr.Number);
+                            }
+
+                            (loadedOpenBlockedIssues, openBlockedByPackage, isBlockedIndexTruncated) = await EnsureOpenBlockedIndexLoadedAsync(
+                                owner, repo, loadedOpenBlockedIssues, openBlockedByPackage, isBlockedIndexTruncated, ct);
+                            var tracked = await EnsureObsBlockedTrackingIssueAsync(
+                                owner, repo, packageName, targetVersion, pr.Number, mergeSha, buildResult,
+                                openBlockedByPackage, isBlockedIndexTruncated, ct);
+                            if (tracked)
+                            {
+                                TryClearObsBlockCooldown(owner, repo, packageName);
+                            }
+                            else
+                            {
+                                TrySetFallbackObsCooldown(owner, repo, packageName);
+                            }
+                        }
+                    }
+
+                    // If PR has been merged past TTL, reclaim branch even if OBS build failed/remained unresolved
+                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ct);
                 }
-            }
 
-            var obsEndpoint = FormatObsPublicEndpoint(_options.Obs.BaseUrl);
-            var comment = $"""
-                ### OBS Build Verification
-                - **Project**: `{buildResult.Project}`
-                - **Package**: `{buildResult.Package}`
-                - **Repository / Arch**: `{buildResult.Repository}` / `{buildResult.Arch}`
-                - **Status**: `{buildResult.Code}` (`{buildResult.RawCode}`)
-                - **Synchronized Commit**: `{mergeSha}`
+                var obsEndpoint = FormatObsPublicEndpoint(_options.Obs.BaseUrl);
+                var comment = $"""
+                    ### OBS Build Verification
+                    - **Project**: `{buildResult.Project}`
+                    - **Package**: `{buildResult.Package}`
+                    - **Repository / Arch**: `{buildResult.Repository}` / `{buildResult.Arch}`
+                    - **Status**: `{buildResult.Code}` (`{buildResult.RawCode}`)
+                    - **Synchronized Commit**: `{mergeSha}`
 
-                > Verified via `{obsEndpoint}` read-model.
-                """;
+                    > Verified via `{obsEndpoint}` read-model.
+                    """;
 
-            Octokit.IssueComment? existingComment = null;
-            try
-            {
-                var existingComments = await _gitHubService.GetIssueCommentsAsync(owner, repo, pr.Number, ct);
-                existingComment = existingComments.FirstOrDefault(c => c.Body != null && c.Body.Contains("### OBS Build Verification"));
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger?.LogDebug(ex, "Failed to check existing comments on PR #{PrNumber}", pr.Number);
-            }
-
-            if (existingComment != null)
-            {
-                // If comment already reflects current status and commit, skip
-                if (existingComment.Body != null &&
-                    existingComment.Body.Contains($"- **Status**: `{buildResult.Code}`") &&
-                    existingComment.Body.Contains($"- **Synchronized Commit**: `{mergeSha}`"))
+                Octokit.IssueComment? existingComment = null;
+                try
                 {
-                    _logger?.LogDebug("OBS build verification comment is already up-to-date on PR #{PrNumber}; skipping", pr.Number);
+                    var existingComments = await _gitHubService.GetIssueCommentsAsync(owner, repo, pr.Number, ct);
+                    existingComment = existingComments.FirstOrDefault(c => c.Body != null && c.Body.Contains("### OBS Build Verification"));
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger?.LogDebug(ex, "Failed to check existing comments on PR #{PrNumber}", pr.Number);
+                }
+
+                if (existingComment != null)
+                {
+                    // If comment already reflects current status and commit, skip
+                    if (existingComment.Body != null &&
+                        existingComment.Body.Contains($"- **Status**: `{buildResult.Code}`") &&
+                        existingComment.Body.Contains($"- **Synchronized Commit**: `{mergeSha}`"))
+                    {
+                        _logger?.LogDebug("OBS build verification comment is already up-to-date on PR #{PrNumber}; skipping", pr.Number);
+                        continue;
+                    }
+
+                    if (!_options.DryRun)
+                    {
+                        _logger?.LogInformation("Updating OBS build verification comment on PR #{PrNumber} to status {Status}", pr.Number, buildResult.Code);
+                        try
+                        {
+                            await _gitHubService.UpdateCommentAsync(owner, repo, existingComment.Id, comment, ct);
+                        }
+                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        {
+                            _logger?.LogDebug(ex, "Failed to update OBS build verification comment on PR #{PrNumber}", pr.Number);
+                        }
+                    }
                     continue;
                 }
 
                 if (!_options.DryRun)
                 {
-                    _logger?.LogInformation("Updating OBS build verification comment on PR #{PrNumber} to status {Status}", pr.Number, buildResult.Code);
                     try
                     {
-                        await _gitHubService.UpdateCommentAsync(owner, repo, existingComment.Id, comment, ct);
+                        await _gitHubService.CreateCommentAsync(owner, repo, pr.Number, comment, ct);
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
-                        _logger?.LogDebug(ex, "Failed to update OBS build verification comment on PR #{PrNumber}", pr.Number);
+                        _logger?.LogDebug(ex, "Failed to post OBS build verification comment on PR #{PrNumber}", pr.Number);
                     }
                 }
-                continue;
             }
-
-            if (!_options.DryRun)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                try
-                {
-                    await _gitHubService.CreateCommentAsync(owner, repo, pr.Number, comment, ct);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _logger?.LogDebug(ex, "Failed to post OBS build verification comment on PR #{PrNumber}", pr.Number);
-                }
+                _logger?.LogWarning(ex, "Failed to verify post-merge OBS build state for PR #{PrNumber} in {TargetRepo}; continuing sweep", pr.Number, targetRepo);
             }
         }
 
@@ -325,6 +400,7 @@ public class ObsPostMergeVerifier
                         if (await CloseObsBlockedTrackingIssueIfOpenAsync(owner, repo, packageName, upgradeComment, openBlockedByPackage, ct) &&
                             !_options.DryRun)
                         {
+                            TryClearObsBlockCooldown(owner, repo, packageName);
                             await TryReclaimBranchFromBlockedIssueAsync(owner, repo, openIssue, "after main branch upgrade past failed OBS build", ct);
                         }
                         continue;
@@ -357,6 +433,7 @@ public class ObsPostMergeVerifier
                 if (await CloseObsBlockedTrackingIssueIfOpenAsync(owner, repo, packageName, obsComment, openBlockedByPackage, ct) &&
                     !_options.DryRun)
                 {
+                    TryClearObsBlockCooldown(owner, repo, packageName);
                     await TryReclaimBranchFromBlockedIssueAsync(owner, repo, openIssue, "after delayed OBS build recovery", ct);
                 }
             }
@@ -419,6 +496,85 @@ public class ObsPostMergeVerifier
         return true;
     }
 
+    private async Task TryReclaimIfPastMergedTtlAsync(string owner, string repo, PullRequest pr, CancellationToken ct)
+    {
+        var ttlDays = Math.Clamp(_options.FailedPrTtlDays, 1, 363);
+        if (!_options.DryRun && pr.MergedAt.HasValue &&
+            pr.MergedAt.Value < DateTimeOffset.UtcNow.AddDays(-ttlDays))
+        {
+            await TryReclaimMergedBranchAsync(owner, repo, pr, "after reaching merged TTL", ct);
+        }
+    }
+
+    private void TrySetFallbackObsCooldown(string owner, string repo, string packageName)
+    {
+        if (_stateStore == null)
+        {
+            return;
+        }
+
+        try
+        {
+            var cooldownDays = _options.GiveUpIssueCooldownDays > 0 ? _options.GiveUpIssueCooldownDays : 30;
+            _stateStore.SetObsBlockCooldown(
+                owner,
+                repo,
+                packageName,
+                DateTimeOffset.UtcNow.AddDays(cooldownDays));
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Failed to persist fallback OBS block cooldown for {Package} in {Owner}/{Repo}", packageName, owner, repo);
+        }
+    }
+
+    private void TryClearObsBlockCooldown(string owner, string repo, string packageName)
+    {
+        if (_stateStore == null)
+        {
+            return;
+        }
+
+        try
+        {
+            _stateStore.ClearObsBlockCooldown(owner, repo, packageName);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Failed to clear persisted OBS block cooldown for {Package} in {Owner}/{Repo}", packageName, owner, repo);
+        }
+    }
+
+    private static bool IsHexShaPrefix(string value)
+    {
+        if (value.Length < 7 || value.Length > 64)
+        {
+            return false;
+        }
+
+        foreach (var ch in value)
+        {
+            if (!Uri.IsHexDigit(ch))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsServiceRevisionMatchingMergeSha(string serviceRevision, string mergeSha)
+    {
+        if (string.Equals(serviceRevision, mergeSha, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return IsHexShaPrefix(serviceRevision) &&
+               serviceRevision.Length <= mergeSha.Length &&
+               mergeSha.StartsWith(serviceRevision, StringComparison.OrdinalIgnoreCase);
+    }
+
     private async Task TryReclaimMergedBranchAsync(string owner, string repo, PullRequest pr, string reason, CancellationToken ct)
     {
         var branchName = pr.Head?.Ref;
@@ -428,30 +584,32 @@ public class ObsPostMergeVerifier
 
         if (isSameRepo && !string.IsNullOrWhiteSpace(branchName) && branchName.StartsWith(prefix, StringComparison.Ordinal))
         {
-            // 1. Check whether a newer open PR is already reusing this branch
-            var openPr = await _gitHubService.FindOpenPullRequestByHeadAsync(owner, repo, branchName, ct);
-            if (openPr != null)
-            {
-                _logger?.LogDebug("Skipping branch {Branch} deletion: active open PR #{OpenPr} is currently reusing it", branchName, openPr.Number);
-                return;
-            }
-
-            // 2. Check whether the branch reference has moved forward past the merged PR's head SHA
-            var currentSha = await _gitHubService.GetRefShaAsync(owner, repo, branchName, ct);
-            if (!string.IsNullOrEmpty(pr.Head?.Sha) && !string.Equals(currentSha, pr.Head.Sha, StringComparison.Ordinal))
-            {
-                _logger?.LogDebug("Skipping branch {Branch} deletion: branch head has moved (current: {CurrentSha}, merged PR: {PrSha})",
-                    branchName, currentSha, pr.Head.Sha);
-                return;
-            }
-
             try
             {
+                // 1. Check whether a newer open PR is already reusing this branch
+                var openPr = await _gitHubService.FindOpenPullRequestByHeadAsync(owner, repo, branchName, ct);
+                if (openPr != null)
+                {
+                    _logger?.LogDebug("Skipping branch {Branch} deletion: active open PR #{OpenPr} is currently reusing it", branchName, openPr.Number);
+                    return;
+                }
+
+                // 2. Check whether the branch reference has moved forward past the merged PR's head SHA (fail-closed on missing SHA)
+                var currentSha = await _gitHubService.GetRefShaAsync(owner, repo, branchName, ct);
+                if (string.IsNullOrWhiteSpace(pr.Head?.Sha) ||
+                    string.IsNullOrWhiteSpace(currentSha) ||
+                    !string.Equals(currentSha, pr.Head.Sha, StringComparison.Ordinal))
+                {
+                    _logger?.LogDebug("Skipping branch {Branch} deletion: branch head is missing or has moved (current: {CurrentSha}, merged PR: {PrSha})",
+                        branchName, currentSha ?? "<null>", pr.Head?.Sha ?? "<null>");
+                    return;
+                }
+
                 await _gitHubService.DeleteRefAsync(owner, repo, branchName, ct);
                 _logger?.LogInformation("Reclaimed merged branch {Branch} for PR #{PrNumber} {Reason}",
                     branchName, pr.Number, reason);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger?.LogDebug(ex, "Failed to reclaim merged branch {Branch} for PR #{PrNumber}", branchName, pr.Number);
             }
@@ -535,7 +693,7 @@ public class ObsPostMergeVerifier
         }
     }
 
-    private async Task EnsureObsBlockedTrackingIssueAsync(
+    private async Task<bool> EnsureObsBlockedTrackingIssueAsync(
         string owner,
         string repo,
         string packageName,
@@ -549,12 +707,12 @@ public class ObsPostMergeVerifier
     {
         if (openBlockedByPackage == null)
         {
-            return;
+            return false;
         }
 
         if (openBlockedByPackage.ContainsKey(packageName))
         {
-            return;
+            return true;
         }
 
         if (isIndexTruncated)
@@ -562,7 +720,7 @@ public class ObsPostMergeVerifier
             _logger?.LogWarning(
                 "Deferring creation of new OBS blocked tracking issue for {Package} because the open '{BlockedLabel}' issue index was truncated",
                 packageName, GitHubLabels.AutoUpdateBlocked);
-            return;
+            return false;
         }
 
         var issueTitle = BuildObsBlockedIssueTitle(packageName);
@@ -596,11 +754,15 @@ public class ObsPostMergeVerifier
             if (created != null)
             {
                 openBlockedByPackage.TryAdd(packageName, created);
+                return true;
             }
+
+            return false;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger?.LogWarning(ex, "Failed to create OBS blocked tracking issue for package {Package}", packageName);
+            return false;
         }
     }
 
@@ -670,7 +832,7 @@ public class ObsPostMergeVerifier
         }
     }
 
-    private static bool TryExtractObsBlockedPackage(Issue issue, out string packageName)
+    internal static bool TryExtractObsBlockedPackage(Issue issue, out string packageName)
     {
         if (!string.IsNullOrWhiteSpace(issue.Body))
         {

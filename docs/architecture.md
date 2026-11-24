@@ -63,6 +63,7 @@ When a module schedules a label addition, `LabelMutexEngine` automatically sched
 4. **Vulnerability Severity**: `Severity: 1`, `Severity: 2`, `Severity: 3`, `Severity: 4`
 5. **Vulnerability Lifecycle**: `Vulnerability: Detected`, `Vulnerability: Fixed-Pending`, `Vulnerability: Resolved`, `Vulnerability: Dismissed`
 6. **Rebuild Impact**: `Rebuild: 0`, `Rebuild: 1-10`, `Rebuild: 11-100`, `Rebuild: 101-500`, `Rebuild: 501-1000`, `Rebuild: 1001-2500`, `Rebuild: 2501-5000`, `Rebuild: 5001+`
+7. **Attention Freshness State**: `Status: New`, `Status: Stale` (`Status: stale-exempt` is orthogonal and intentionally excluded)
 
 ---
 

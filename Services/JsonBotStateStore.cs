@@ -18,6 +18,8 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
     private readonly string _lockFilePath;
     private readonly TimeSpan _localeRetentionMaxAge;
     private readonly ILogger<JsonBotStateStore>? _logger;
+    private readonly Func<string, string> _fileReader;
+    private readonly Action<string, string> _fileMover;
     private FileStream? _directoryLockStream;
     private PersistedBotState _state = new();
 
@@ -26,8 +28,19 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
     public JsonBotStateStore(
         IOptions<BotStateOptions> options,
         ILogger<JsonBotStateStore>? logger = null)
+        : this(options, logger, fileReader: null, fileMover: null)
+    {
+    }
+
+    internal JsonBotStateStore(
+        IOptions<BotStateOptions> options,
+        ILogger<JsonBotStateStore>? logger,
+        Func<string, string>? fileReader,
+        Action<string, string>? fileMover)
     {
         _logger = logger;
+        _fileReader = fileReader ?? File.ReadAllText;
+        _fileMover = fileMover ?? File.Move;
         var retentionDays = options.Value.LocaleRetentionDays > 0 ? options.Value.LocaleRetentionDays : 180;
         _localeRetentionMaxAge = TimeSpan.FromDays(retentionDays);
         var (resolvedDir, isEphemeral) = BotStatePathResolver.ResolveStateDirectoryWithStatus(options.Value.StateDirectory);
@@ -134,20 +147,42 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
             return;
         }
 
+        var normalizedUser = userLogin.Trim();
+        var normalizedLocale = locale.Trim();
         lock (_lock)
         {
             var cutoff = DateTimeOffset.UtcNow - _localeRetentionMaxAge;
             var expired = _state.UserLocales
                 .Where(kv => kv.Value.UpdatedAt < cutoff)
-                .Select(kv => kv.Key)
                 .ToList();
-            foreach (var key in expired)
+            foreach (var kv in expired)
             {
-                _state.UserLocales.Remove(key);
+                _state.UserLocales.Remove(kv.Key);
             }
 
-            _state.UserLocales[userLogin.Trim()] = new UserLocaleEntry(locale.Trim(), DateTimeOffset.UtcNow);
-            SaveState();
+            var hadPrevious = _state.UserLocales.TryGetValue(normalizedUser, out var previousEntry);
+            _state.UserLocales[normalizedUser] = new UserLocaleEntry(normalizedLocale, DateTimeOffset.UtcNow);
+            try
+            {
+                SaveState();
+            }
+            catch
+            {
+                if (hadPrevious && previousEntry != null)
+                {
+                    _state.UserLocales[normalizedUser] = previousEntry;
+                }
+                else
+                {
+                    _state.UserLocales.Remove(normalizedUser);
+                }
+
+                foreach (var kv in expired)
+                {
+                    _state.UserLocales.TryAdd(kv.Key, kv.Value);
+                }
+                throw;
+            }
         }
     }
 
@@ -158,15 +193,25 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
             return false;
         }
 
+        var normalizedUser = userLogin.Trim();
         lock (_lock)
         {
-            var removed = _state.UserLocales.Remove(userLogin.Trim());
-            if (removed)
+            if (!_state.UserLocales.TryGetValue(normalizedUser, out var previousEntry))
             {
-                SaveState();
+                return false;
             }
 
-            return removed;
+            _state.UserLocales.Remove(normalizedUser);
+            try
+            {
+                SaveState();
+                return true;
+            }
+            catch
+            {
+                _state.UserLocales[normalizedUser] = previousEntry;
+                throw;
+            }
         }
     }
 
@@ -182,7 +227,6 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
         {
             var expired = _state.UserLocales
                 .Where(kv => kv.Value.UpdatedAt < cutoff)
-                .Select(kv => kv.Key)
                 .ToList();
 
             if (expired.Count == 0)
@@ -190,13 +234,24 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
                 return 0;
             }
 
-            foreach (var key in expired)
+            foreach (var kv in expired)
             {
-                _state.UserLocales.Remove(key);
+                _state.UserLocales.Remove(kv.Key);
             }
 
-            SaveState();
-            return expired.Count;
+            try
+            {
+                SaveState();
+                return expired.Count;
+            }
+            catch
+            {
+                foreach (var kv in expired)
+                {
+                    _state.UserLocales[kv.Key] = kv.Value;
+                }
+                throw;
+            }
         }
     }
 
@@ -248,13 +303,34 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
         var normalizedPkg = packageName.Trim();
         lock (_lock)
         {
-            var repoState = GetOrCreateRepoState(repoKey);
+            var repoState = GetOrCreateRepoState(repoKey, out var hadRepo);
+
+            var hadPrevious = repoState.IgnoredPackages.TryGetValue(normalizedPkg, out var previousEntry);
             repoState.IgnoredPackages[normalizedPkg] = new IgnoredPackageEntry(
                 normalizedPkg,
                 string.IsNullOrWhiteSpace(reason) ? null : reason.Trim(),
                 ignoredBy,
                 DateTimeOffset.UtcNow);
-            SaveState();
+            try
+            {
+                SaveState();
+            }
+            catch
+            {
+                if (hadPrevious && previousEntry != null)
+                {
+                    repoState.IgnoredPackages[normalizedPkg] = previousEntry;
+                }
+                else
+                {
+                    repoState.IgnoredPackages.Remove(normalizedPkg);
+                    if (!hadRepo)
+                    {
+                        _state.Repositories.Remove(repoKey);
+                    }
+                }
+                throw;
+            }
         }
     }
 
@@ -266,6 +342,7 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
         }
 
         var repoKey = FormatRepoKey(owner, repo);
+        var normalizedPkg = packageName.Trim();
         lock (_lock)
         {
             if (!_state.Repositories.TryGetValue(repoKey, out var repoState))
@@ -273,13 +350,22 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
                 return false;
             }
 
-            var removed = repoState.IgnoredPackages.Remove(packageName.Trim());
-            if (removed)
+            if (!repoState.IgnoredPackages.TryGetValue(normalizedPkg, out var previousEntry))
             {
-                SaveState();
+                return false;
             }
 
-            return removed;
+            repoState.IgnoredPackages.Remove(normalizedPkg);
+            try
+            {
+                SaveState();
+                return true;
+            }
+            catch
+            {
+                repoState.IgnoredPackages[normalizedPkg] = previousEntry;
+                throw;
+            }
         }
     }
 
@@ -312,11 +398,26 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
         }
 
         var repoKey = FormatRepoKey(owner, repo);
+        var normalizedPkg = packageName.Trim();
         lock (_lock)
         {
-            var repoState = GetOrCreateRepoState(repoKey);
-            repoState.PackageFailures[packageName.Trim()] = new PackageFailureEntry(consecutiveFailures, cooldownUntil, DateTimeOffset.UtcNow);
-            SaveState();
+            var repoState = GetOrCreateRepoState(repoKey, out var hadRepo);
+
+            var hadPrevious = repoState.PackageFailures.TryGetValue(normalizedPkg, out var previousEntry);
+            repoState.PackageFailures[normalizedPkg] = new PackageFailureEntry(
+                consecutiveFailures,
+                cooldownUntil,
+                DateTimeOffset.UtcNow,
+                previousEntry?.ObsBlockedUntil);
+            try
+            {
+                SaveState();
+            }
+            catch
+            {
+                RestorePackageFailure(repoState, repoKey, hadRepo, normalizedPkg, hadPrevious, previousEntry);
+                throw;
+            }
         }
     }
 
@@ -328,20 +429,139 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
         }
 
         var repoKey = FormatRepoKey(owner, repo);
+        var normalizedPkg = packageName.Trim();
         lock (_lock)
         {
-            if (!_state.Repositories.TryGetValue(repoKey, out var repoState))
+            if (!_state.Repositories.TryGetValue(repoKey, out var repoState) ||
+                !repoState.PackageFailures.TryGetValue(normalizedPkg, out var previousEntry))
             {
                 return false;
             }
 
-            var removed = repoState.PackageFailures.Remove(packageName.Trim());
-            if (removed)
+            bool cleared;
+            if (previousEntry.ObsBlockedUntil.HasValue)
+            {
+                if (previousEntry.ConsecutiveFailures == 0 && !previousEntry.CooldownUntil.HasValue && !previousEntry.LastFailureAt.HasValue)
+                {
+                    return false;
+                }
+
+                repoState.PackageFailures[normalizedPkg] = new PackageFailureEntry(
+                    0,
+                    null,
+                    null,
+                    previousEntry.ObsBlockedUntil);
+                cleared = true;
+            }
+            else
+            {
+                cleared = repoState.PackageFailures.Remove(normalizedPkg);
+            }
+
+            if (cleared)
+            {
+                try
+                {
+                    SaveState();
+                }
+                catch
+                {
+                    repoState.PackageFailures[normalizedPkg] = previousEntry;
+                    throw;
+                }
+            }
+
+            return cleared;
+        }
+    }
+
+    public void SetObsBlockCooldown(string owner, string repo, string packageName, DateTimeOffset blockedUntil)
+    {
+        if (string.IsNullOrWhiteSpace(packageName))
+        {
+            return;
+        }
+
+        var repoKey = FormatRepoKey(owner, repo);
+        var normalizedPkg = packageName.Trim();
+        lock (_lock)
+        {
+            var repoState = GetOrCreateRepoState(repoKey, out var hadRepo);
+
+            var hadPrevious = repoState.PackageFailures.TryGetValue(normalizedPkg, out var previousEntry);
+            repoState.PackageFailures[normalizedPkg] = previousEntry != null
+                ? previousEntry with { ObsBlockedUntil = blockedUntil }
+                : new PackageFailureEntry(0, null, null, blockedUntil);
+            try
             {
                 SaveState();
             }
+            catch
+            {
+                RestorePackageFailure(repoState, repoKey, hadRepo, normalizedPkg, hadPrevious, previousEntry);
+                throw;
+            }
+        }
+    }
 
-            return removed;
+    public bool ClearObsBlockCooldown(string owner, string repo, string packageName)
+    {
+        if (string.IsNullOrWhiteSpace(packageName))
+        {
+            return false;
+        }
+
+        var repoKey = FormatRepoKey(owner, repo);
+        var normalizedPkg = packageName.Trim();
+        lock (_lock)
+        {
+            if (!_state.Repositories.TryGetValue(repoKey, out var repoState) ||
+                !repoState.PackageFailures.TryGetValue(normalizedPkg, out var previousEntry) ||
+                !previousEntry.ObsBlockedUntil.HasValue)
+            {
+                return false;
+            }
+
+            if (previousEntry.ConsecutiveFailures > 0 || previousEntry.CooldownUntil.HasValue || previousEntry.LastFailureAt.HasValue)
+            {
+                repoState.PackageFailures[normalizedPkg] = previousEntry with { ObsBlockedUntil = null };
+            }
+            else
+            {
+                repoState.PackageFailures.Remove(normalizedPkg);
+            }
+
+            try
+            {
+                SaveState();
+                return true;
+            }
+            catch
+            {
+                repoState.PackageFailures[normalizedPkg] = previousEntry;
+                throw;
+            }
+        }
+    }
+
+    private void RestorePackageFailure(
+        RepoState repoState,
+        string repoKey,
+        bool hadRepo,
+        string normalizedPkg,
+        bool hadPrevious,
+        PackageFailureEntry? previousEntry)
+    {
+        if (hadPrevious && previousEntry != null)
+        {
+            repoState.PackageFailures[normalizedPkg] = previousEntry;
+            return;
+        }
+
+        repoState.PackageFailures.Remove(normalizedPkg);
+        if (!hadRepo)
+        {
+            _state.Repositories.Remove(repoKey);
         }
     }
 
@@ -356,20 +576,40 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
         var repoKey = FormatRepoKey(owner, repo);
         lock (_lock)
         {
-            var repoState = GetOrCreateRepoState(repoKey);
+            var repoState = GetOrCreateRepoState(repoKey, out var hadRepo);
+
             if (!repoState.RecordedFailedPrs.Add(prNumber))
             {
                 return false;
             }
 
+            int? evictedOldest = null;
             if (repoState.RecordedFailedPrs.Count > maxTrackedPrsPerRepo)
             {
                 var oldest = repoState.RecordedFailedPrs.Min();
                 repoState.RecordedFailedPrs.Remove(oldest);
+                evictedOldest = oldest;
             }
 
-            SaveState();
-            return true;
+            try
+            {
+                SaveState();
+                return true;
+            }
+            catch
+            {
+                repoState.RecordedFailedPrs.Remove(prNumber);
+                if (evictedOldest.HasValue)
+                {
+                    repoState.RecordedFailedPrs.Add(evictedOldest.Value);
+                }
+
+                if (!hadRepo)
+                {
+                    _state.Repositories.Remove(repoKey);
+                }
+                throw;
+            }
         }
     }
 
@@ -382,12 +622,29 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
 
         lock (_lock)
         {
+            var previousEntries = _state.PendingEphemeralComments.Where(e =>
+                e.CommentId == entry.CommentId &&
+                string.Equals(e.Owner, entry.Owner, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(e.Repo, entry.Repo, StringComparison.OrdinalIgnoreCase)).ToList();
+
             _state.PendingEphemeralComments.RemoveAll(e =>
                 e.CommentId == entry.CommentId &&
                 string.Equals(e.Owner, entry.Owner, StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(e.Repo, entry.Repo, StringComparison.OrdinalIgnoreCase));
             _state.PendingEphemeralComments.Add(entry);
-            SaveState();
+            try
+            {
+                SaveState();
+            }
+            catch
+            {
+                _state.PendingEphemeralComments.RemoveAt(_state.PendingEphemeralComments.Count - 1);
+                if (previousEntries.Count > 0)
+                {
+                    _state.PendingEphemeralComments.AddRange(previousEntries);
+                }
+                throw;
+            }
         }
     }
 
@@ -405,13 +662,27 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
     {
         lock (_lock)
         {
-            var removed = _state.PendingEphemeralComments.RemoveAll(e =>
+            var removedEntries = _state.PendingEphemeralComments.Where(e =>
+                e.CommentId == commentId &&
+                string.Equals(e.Owner, owner, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(e.Repo, repo, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (removedEntries.Count == 0)
+            {
+                return;
+            }
+
+            _state.PendingEphemeralComments.RemoveAll(e =>
                 e.CommentId == commentId &&
                 string.Equals(e.Owner, owner, StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(e.Repo, repo, StringComparison.OrdinalIgnoreCase));
-            if (removed > 0)
+            try
             {
                 SaveState();
+            }
+            catch
+            {
+                _state.PendingEphemeralComments.AddRange(removedEntries);
+                throw;
             }
         }
     }
@@ -434,13 +705,29 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
             if (nextRetry >= maxRetries)
             {
                 _state.PendingEphemeralComments.RemoveAt(idx);
-                SaveState();
-                return false;
+                try
+                {
+                    SaveState();
+                    return false;
+                }
+                catch
+                {
+                    _state.PendingEphemeralComments.Insert(idx, current);
+                    throw;
+                }
             }
 
             _state.PendingEphemeralComments[idx] = current with { DeleteAt = nextAttemptAt, RetryCount = nextRetry };
-            SaveState();
-            return true;
+            try
+            {
+                SaveState();
+                return true;
+            }
+            catch
+            {
+                _state.PendingEphemeralComments[idx] = current;
+                throw;
+            }
         }
     }
 
@@ -472,78 +759,119 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
         {
             if (string.IsNullOrWhiteSpace(watermark))
             {
-                if (_state.Cursors.Remove(normalizedKey))
+                if (!_state.Cursors.TryGetValue(normalizedKey, out var previousWatermark))
+                {
+                    return;
+                }
+
+                _state.Cursors.Remove(normalizedKey);
+                try
                 {
                     SaveState();
+                }
+                catch
+                {
+                    _state.Cursors[normalizedKey] = previousWatermark;
+                    throw;
                 }
                 return;
             }
 
             var normalizedWatermark = watermark.Trim();
-            if (_state.Cursors.TryGetValue(normalizedKey, out var existing) &&
-                string.Equals(existing, normalizedWatermark, StringComparison.Ordinal))
+            var hadExisting = _state.Cursors.TryGetValue(normalizedKey, out var existing);
+            if (hadExisting && string.Equals(existing, normalizedWatermark, StringComparison.Ordinal))
             {
                 return;
             }
 
             _state.Cursors[normalizedKey] = normalizedWatermark;
-            SaveState();
+            try
+            {
+                SaveState();
+            }
+            catch
+            {
+                if (hadExisting && existing != null)
+                {
+                    _state.Cursors[normalizedKey] = existing;
+                }
+                else
+                {
+                    _state.Cursors.Remove(normalizedKey);
+                }
+                throw;
+            }
         }
     }
 
-    private RepoState GetOrCreateRepoState(string repoKey)
+    private RepoState GetOrCreateRepoState(string repoKey, out bool existedBefore)
     {
-        if (!_state.Repositories.TryGetValue(repoKey, out var repoState))
+        existedBefore = _state.Repositories.TryGetValue(repoKey, out var repoState) && repoState != null;
+        if (!existedBefore)
         {
             repoState = new RepoState();
             _state.Repositories[repoKey] = repoState;
         }
 
-        return repoState;
+        return repoState!;
     }
 
     private static string FormatRepoKey(string owner, string repo) => $"{owner}/{repo}";
 
     private void LoadState()
     {
+        string json;
         try
         {
-            if (!File.Exists(_stateFilePath))
-            {
-                return;
-            }
+            json = _fileReader(_stateFilePath);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger?.LogError(
+                ex,
+                "Failed to read bot state file {Path} due to filesystem I/O or permission error; refusing to overwrite or start with empty state",
+                _stateFilePath);
+            throw new InvalidOperationException(
+                $"Failed to read bot state file '{_stateFilePath}'. Refusing to back up or start with empty state on I/O error.",
+                ex);
+        }
 
-            var json = File.ReadAllText(_stateFilePath);
+        try
+        {
             var loaded = JsonSerializer.Deserialize<PersistedBotState>(json);
             if (loaded == null)
             {
+                _logger?.LogError("Bot state file {Path} deserialized to null; backing up corrupt file and starting with empty state", _stateFilePath);
+                BackupCorruptStateFile();
+                _state = new PersistedBotState();
                 return;
             }
 
             _state = new PersistedBotState
             {
-                UserLocales = new Dictionary<string, UserLocaleEntry>(
-                    loaded.UserLocales ?? new Dictionary<string, UserLocaleEntry>(),
-                    StringComparer.OrdinalIgnoreCase),
+                UserLocales = CopyNonNullMap(loaded.UserLocales),
                 Repositories = new Dictionary<string, RepoState>(StringComparer.OrdinalIgnoreCase),
-                PendingEphemeralComments = loaded.PendingEphemeralComments ?? new List<PendingEphemeralComment>(),
-                Cursors = new Dictionary<string, string>(
-                    loaded.Cursors ?? new Dictionary<string, string>(),
-                    StringComparer.OrdinalIgnoreCase)
+                PendingEphemeralComments = loaded.PendingEphemeralComments?.Where(c => c is not null).ToList() ?? new List<PendingEphemeralComment>(),
+                Cursors = CopyNonNullMap(loaded.Cursors)
             };
 
             if (loaded.Repositories != null)
             {
                 foreach (var (repoKey, repoVal) in loaded.Repositories)
                 {
+                    if (string.IsNullOrWhiteSpace(repoKey) || repoVal is null)
+                    {
+                        continue;
+                    }
+
                     _state.Repositories[repoKey] = new RepoState
                     {
-                        IgnoredPackages = new Dictionary<string, IgnoredPackageEntry>(
-                            repoVal.IgnoredPackages ?? new Dictionary<string, IgnoredPackageEntry>(),
-                            StringComparer.OrdinalIgnoreCase),
-                        PackageFailures = new Dictionary<string, PackageFailureEntry>(
-                            repoVal.PackageFailures ?? new Dictionary<string, PackageFailureEntry>(),
-                            StringComparer.OrdinalIgnoreCase),
+                        IgnoredPackages = CopyNonNullMap(repoVal.IgnoredPackages),
+                        PackageFailures = CopyNonNullMap(repoVal.PackageFailures),
                         RecordedFailedPrs = repoVal.RecordedFailedPrs != null
                             ? new HashSet<int>(repoVal.RecordedFailedPrs)
                             : new HashSet<int>()
@@ -551,10 +879,58 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
                 }
             }
         }
-        catch (Exception ex)
+        catch (JsonException ex)
         {
-            _logger?.LogWarning(ex, "Failed to load bot state from {Path}; starting with empty state", _stateFilePath);
+            _logger?.LogError(ex, "Failed to deserialize corrupt bot state JSON from {Path}; backing up corrupt file and starting with empty state", _stateFilePath);
+            BackupCorruptStateFile();
             _state = new PersistedBotState();
+        }
+    }
+
+    private static Dictionary<string, TValue> CopyNonNullMap<TValue>(IDictionary<string, TValue>? source)
+        where TValue : class
+    {
+        var result = new Dictionary<string, TValue>(StringComparer.OrdinalIgnoreCase);
+        if (source == null)
+        {
+            return result;
+        }
+
+        foreach (var (key, value) in source)
+        {
+            if (!string.IsNullOrWhiteSpace(key) && value is not null)
+            {
+                result[key] = value;
+            }
+        }
+
+        return result;
+    }
+
+    private void BackupCorruptStateFile()
+    {
+        if (!File.Exists(_stateFilePath))
+        {
+            return;
+        }
+
+        try
+        {
+            var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMddHHmmss", System.Globalization.CultureInfo.InvariantCulture);
+            var backupPath = $"{_stateFilePath}.corrupt.{timestamp}";
+            if (File.Exists(backupPath))
+            {
+                backupPath = $"{_stateFilePath}.corrupt.{timestamp}.{Guid.NewGuid():N}";
+            }
+
+            _fileMover(_stateFilePath, backupPath);
+        }
+        catch (Exception backupEx)
+        {
+            _logger?.LogError(backupEx, "Failed to preserve corrupt bot state file at {Path}; refusing to start with empty state", _stateFilePath);
+            throw new InvalidOperationException(
+                $"Failed to back up corrupt bot state file '{_stateFilePath}'. Refusing to start with empty state that would overwrite corrupt evidence.",
+                backupEx);
         }
     }
 
@@ -570,7 +946,8 @@ public sealed class JsonBotStateStore : IBotStateStore, IDisposable
         }
         catch (Exception ex)
         {
-            _logger?.LogWarning(ex, "Failed to persist bot state to {Path}", _stateFilePath);
+            _logger?.LogError(ex, "Failed to persist bot state to {Path}", _stateFilePath);
+            throw;
         }
     }
 

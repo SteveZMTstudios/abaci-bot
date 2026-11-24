@@ -16,6 +16,19 @@ public record CveReport(
 }
 
 /// <summary>
+/// Narrow companion gateway implemented by <see cref="CveSecurityService"/> that reports
+/// whether an NVD HTTP request was actually dispatched during a CVE query (so callers
+/// avoid burning daily NVD quota on in-memory cache hits or OSV-satisfied queries).
+/// </summary>
+public interface ICveNvdAttemptGateway
+{
+    Task<(CveReport Report, bool NvdAttempted)> QueryCveWithStatusAsync(
+        string cveId,
+        bool skipOsv = false,
+        CancellationToken ct = default);
+}
+
+/// <summary>
 /// Service abstraction for retrieving vulnerability metadata and CVSS scores from external security databases.
 /// </summary>
 public interface ICveSecurityService

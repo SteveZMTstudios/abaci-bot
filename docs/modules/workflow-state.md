@@ -53,7 +53,7 @@ flowchart TD
 
 ## 4. Configuration Options
 
-`WorkflowStateModule` operates using core repository metadata and `GitHubApp:TeamName`. `ShinyNewPrModule` uses `BotDetectionOptions`.
+`WorkflowStateModule` operates using core repository metadata and `GitHubApp:TeamName`. `ShinyNewPrModule` uses `BotDetectionOptions`, `IBotIdentityProvider` (live App/PAT identity), and `PackageUpdate:BotLogin` (fallback when live identity is absent) to exclude automated bot activity from first-response triage removal.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

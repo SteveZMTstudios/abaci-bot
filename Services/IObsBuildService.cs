@@ -10,6 +10,8 @@ public enum ObsStatusCode
     Building,
     Scheduled,
     Unresolvable,
+    Broken,
+    Blocked,
     Disabled,
     Excluded,
     Unknown

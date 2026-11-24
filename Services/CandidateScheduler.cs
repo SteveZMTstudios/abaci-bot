@@ -19,7 +19,8 @@ public sealed record CandidateScheduleResult(
     int TotalPublished,
     int NextOriginOffset,
     IReadOnlyDictionary<CandidateOrigin, CandidateOriginStats> ByOrigin,
-    IReadOnlySet<string> ProcessedPackageNames);
+    IReadOnlySet<string> ProcessedPackageNames,
+    IReadOnlySet<string>? FailedPackageNames = null);
 
 /// <summary>
 /// Deep module encapsulating cross-source fair candidate scheduling, per-candidate error isolation,
@@ -67,10 +68,11 @@ public static class CandidateScheduler
         int totalPublished = 0;
         var nextOffset = unchecked(startOriginOffset + 1) & int.MaxValue;
         var processedPackageNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var failedPackageNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         if (candidates.Count == 0 || maxPublishes <= 0)
         {
-            return new CandidateScheduleResult(totalPublished, nextOffset, FreezeStats(statsByOrigin), processedPackageNames);
+            return new CandidateScheduleResult(totalPublished, nextOffset, FreezeStats(statsByOrigin), processedPackageNames, failedPackageNames);
         }
 
         var hasSecurity = candidates.Any(c => c.IsSecurityAdvisory);
@@ -87,6 +89,7 @@ public static class CandidateScheduler
             startOriginOffset,
             statsByOrigin,
             processedPackageNames,
+            failedPackageNames,
             canAttempt,
             tryPublishAsync,
             onPublishedAsync,
@@ -103,6 +106,7 @@ public static class CandidateScheduler
                 startOriginOffset,
                 statsByOrigin,
                 processedPackageNames,
+                failedPackageNames,
                 canAttempt,
                 tryPublishAsync,
                 onPublishedAsync,
@@ -110,7 +114,7 @@ public static class CandidateScheduler
                 ct);
         }
 
-        return new CandidateScheduleResult(totalPublished, nextOffset, FreezeStats(statsByOrigin), processedPackageNames);
+        return new CandidateScheduleResult(totalPublished, nextOffset, FreezeStats(statsByOrigin), processedPackageNames, failedPackageNames);
     }
 
     private static int ResolveSecurityQuota(int maxPublishes, bool hasSecurity, bool hasRoutine, int startOriginOffset)
@@ -137,6 +141,7 @@ public static class CandidateScheduler
         int startOriginOffset,
         Dictionary<CandidateOrigin, MutableOriginStats> statsByOrigin,
         HashSet<string> processedPackageNames,
+        HashSet<string> failedPackageNames,
         Func<UpdateCandidate, int, bool> canAttempt,
         Func<UpdateCandidate, CancellationToken, Task<bool>> tryPublishAsync,
         Func<UpdateCandidate, CancellationToken, Task>? onPublishedAsync,
@@ -182,7 +187,6 @@ public static class CandidateScheduler
                 }
 
                 queue.Dequeue();
-                processedPackageNames.Add(candidate.PackageName);
                 var originStats = statsByOrigin[candidate.Origin];
                 originStats.Attempted++;
 
@@ -194,9 +198,12 @@ public static class CandidateScheduler
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     originStats.Failed++;
+                    failedPackageNames.Add(candidate.PackageName);
                     onCandidateError?.Invoke(candidate, ex);
                     continue;
                 }
+
+                processedPackageNames.Add(candidate.PackageName);
 
                 if (published)
                 {

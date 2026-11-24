@@ -25,9 +25,10 @@ public class ConversationGuardOptions
     public List<string> RepositoryAllowList { get; set; } = new();
 
     /// <summary>
-    /// Independent safety switch for pull request level archiving/unarchiving (<c>@&lt;bot&gt; archive</c>).
+    /// Independent safety switch for pull request level archiving (<c>@&lt;bot&gt; archive</c>).
     /// GitHub's <c>archivePullRequest</c> GraphQL mutation requires a <c>triage</c>+ user PAT (<c>PackageUpdate:BotPat</c>) and
     /// always returns FORBIDDEN for GitHub App installation tokens, so enabling this in App-only mode fails fast on startup.
+    /// Archived pull requests are strictly read-only and reject all new comments; unarchiving must be performed out-of-band via the GitHub Web UI or <c>gh api graphql</c>.
     /// Default: false.
     /// </summary>
     public bool ArchiveEnabled { get; set; }

@@ -285,4 +285,46 @@ public class ShinyNewPrModuleTests
 
         Assert.DoesNotContain(GitHubLabels.StatusNew, context.LabelsToRemove);
     }
+
+    [Fact]
+    public async Task ProcessAsync_WhenOwnBotPatLoginCommentsOnNewPr_PreservesNewLabel()
+    {
+        var botIdentity = Substitute.For<IBotIdentityProvider>();
+        botIdentity.GetBotLoginAsync(Arg.Any<CancellationToken>()).Returns("custom-pat-account");
+        var module = new ShinyNewPrModule(_botOptions, botIdentity);
+
+        var context = CreateContext(
+            PullRequestEventType.IssueComment,
+            senderLogin: "custom-pat-account",
+            authorLogin: "contributor",
+            senderType: "User",
+            commentAction: IssueCommentAction.Created,
+            existingLabels: new[] { GitHubLabels.StatusNew });
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.DoesNotContain(GitHubLabels.StatusNew, context.LabelsToRemove);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_WhenGetBotLoginThrows_FallsBackToConfiguredBotLogin()
+    {
+        var botIdentity = Substitute.For<IBotIdentityProvider>();
+        botIdentity.GetBotLoginAsync(Arg.Any<CancellationToken>())
+            .Returns<Task<string>>(_ => throw new HttpRequestException("API timeout"));
+        var pkgOpts = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions { BotLogin = "aqua-rium" });
+        var module = new ShinyNewPrModule(_botOptions, botIdentity, pkgOpts);
+
+        var context = CreateContext(
+            PullRequestEventType.IssueComment,
+            senderLogin: "aqua-rium",
+            authorLogin: "contributor",
+            senderType: "User",
+            commentAction: IssueCommentAction.Created,
+            existingLabels: new[] { GitHubLabels.StatusNew });
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.DoesNotContain(GitHubLabels.StatusNew, context.LabelsToRemove);
+    }
 }

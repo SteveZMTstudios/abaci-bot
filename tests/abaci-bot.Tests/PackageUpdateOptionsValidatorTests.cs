@@ -68,4 +68,21 @@ public class PackageUpdateOptionsValidatorTests
             Assert.Contains(result.Failures!, f => f.Contains(nameof(options.MaxArchiveBytes)));
         }
     }
+
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, true)]
+    [InlineData(363, true)]
+    [InlineData(364, false)]
+    public void Validate_FailedPrTtlDays_EnforcesBoundedRange1To363(int days, bool expectedSuccess)
+    {
+        var options = new PackageUpdateOptions { FailedPrTtlDays = days };
+        var result = _validator.Validate(null, options);
+
+        Assert.Equal(expectedSuccess, result.Succeeded);
+        if (!expectedSuccess)
+        {
+            Assert.Contains(result.Failures!, f => f.Contains(nameof(options.FailedPrTtlDays)));
+        }
+    }
 }

@@ -6,7 +6,7 @@ Runs background evaluation sweeps across monitored repositories to mark and auto
 
 ## 1. Purpose and Trigger Events
 
-Prevents issue trackers and PR queues from accumulating inactive or abandoned items. Operates as an independent scheduled background daemon (`IHostedService`).
+Prevents issue trackers and PR queues from accumulating inactive or abandoned items. Operates as an independent scheduled background daemon (`IHostedService`), paired with the `StaleUnstaleModule` webhook handler (Priority: 12), which uses `BotDetectionOptions`, `IBotIdentityProvider` (live App/PAT identity), and `PackageUpdate:BotLogin` (fallback when live identity is absent) to exclude bot activity when automatically un-staling active PRs.
 
 ### Trigger Mechanism
 - Periodic timer configured by `CheckIntervalHours` (default: every 24 hours).
@@ -63,7 +63,7 @@ Configured under the `StaleLifecycle` JSON section:
 
 ## 5. Failure Handling and Fallback Semantics
 
-- **Secondary Rate Limit Handling**: If GitHub returns HTTP 403 secondary rate limit headers, the service aborts the current sweep and waits its fixed retry delay (60 s internal). It does not use exponential backoff.
+- **Primary Quota Backoff & Secondary Rate Limit Handling**: Before scanning each repository, if Core or Search remaining quota is below watermark, `StaleLifecycleService` waits until GitHub's `reset` timestamp plus a 1-second skew buffer (up to a 30-minute `MaxResetWaitThreshold`; if `serverDelay > 30 minutes`, the service aborts the repository sweep immediately rather than waiting; if GitHub omits the reset timestamp, it falls back to the 60-second `RetryDelay`, max 3 retries). If GitHub returns HTTP 403 secondary/abuse rate limit exceptions or HTTP 429 during a sweep, the service aborts the current sweep immediately and logs the server `Retry-After` (or 60 s minimum).
 - **Fail-Safe Dry Run**: Starts in `DryRun = true` and `Enabled = false` by default to prevent unintended bulk mutations upon initial deployment.
 
 ---

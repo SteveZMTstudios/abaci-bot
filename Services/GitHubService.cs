@@ -989,7 +989,10 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
     public async Task EnsureLabelsExistAsync(
         string owner, string repo, IEnumerable<(string Name, string Color, string Description)> labels, CancellationToken ct = default)
     {
-        _ = await EnsureLabelsInternalAsync(owner, repo, labels, ct);
+        if (!await EnsureLabelsInternalAsync(owner, repo, labels, ct))
+        {
+            throw new InvalidOperationException($"Failed to ensure required labels exist in '{owner}/{repo}'.");
+        }
     }
 
     public Task<bool> EnsureRequiredLabelsVerifiedAsync(
@@ -1427,13 +1430,31 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
         await EnsureAuthenticatedAsync(ct);
         ct.ThrowIfCancellationRequested();
 
+        if (!string.IsNullOrWhiteSpace(_botPat))
+        {
+            // Verify repository visibility and push+ access directly before ReviewPermission so a
+            // read-only/triage PAT on a public repo or an invisible private repo fails immediately.
+            var repoInfo = await _client.Repository.Get(owner, repo);
+            ct.ThrowIfCancellationRequested();
+            if (repoInfo?.Permissions != null &&
+                !(repoInfo.Permissions.Push || repoInfo.Permissions.Maintain || repoInfo.Permissions.Admin))
+            {
+                throw new InvalidOperationException(
+                    $"Configured BotPat lacks push/maintain/admin permission on '{owner}/{repo}' required to query collaborator permissions.");
+            }
+        }
+
         var probeUser = owner;
         try
         {
             var resolved = await GetBotLoginAsync(ct);
             if (!string.IsNullOrWhiteSpace(resolved))
             {
-                probeUser = resolved.Trim();
+                var trimmedResolved = resolved.Trim();
+                // In PAT mode, always probe a distinct login so a triage-only PAT cannot pass by checking itself.
+                probeUser = !string.IsNullOrWhiteSpace(_botPat)
+                    ? (string.Equals(owner, trimmedResolved, StringComparison.OrdinalIgnoreCase) ? "ghost" : owner)
+                    : trimmedResolved;
             }
         }
         catch (OperationCanceledException)

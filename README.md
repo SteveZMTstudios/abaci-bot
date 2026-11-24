@@ -6,16 +6,18 @@
 
 ## Getting Started
 
+> **Prerequisites:** An existing GitHub organization you administer (`<your-org>`) containing your target package repository and host access to expose an HTTPS webhook endpoint.
+
 1. **Create and install the GitHub App.** Configure the webhook URL
    (`https://<your-host>/api/webhook`), the webhook secret, the repository and
    organization permissions, the private key, and the event subscriptions. Install
-   the App on the organization and note the installation ID.
+   the App on your organization (`<your-org>`) and note the installation ID.
    Follow [GitHub App Setup from Scratch](docs/deployment.md#5-github-app-setup-from-scratch).
 
-2. **Create the maintainer team.** Create an organization team named `captains`
-   (or set `GitHubApp:TeamName` to your own slug) and add the maintainers who should
-   move pull requests into review. The team must be visible to the App's `Members`
-   permission.
+2. **Create the maintainer team.** Create an organization team under `<your-org>`
+   (for example slug `<team-slug>` such as `captains`, matching `GitHubApp:TeamName`)
+   and add the maintainers who should move pull requests into review. The team must
+   be visible to the App's `Members` permission.
 
 3. **Create the managed labels.** Every label the bot writes must exist before the
    first webhook arrives; a missing label fails the pipeline for that event.
@@ -33,9 +35,13 @@
    See [docs/configuration.md](docs/configuration.md) for precedence, secrets, and
    the full option reference.
 
-5. **Start the service.**
+5. **Prepare persistent state and config permissions (`uid 1654`) and start the service.** Ensure the
+   non-root container user (`uid 1654`) owns the persistent `state/` volume (`bot-state.json`, locks,
+   and Lookout first-seen timestamps) and can read the mounted `appsettings.json`:
 
    ```bash
+   mkdir -p state && sudo chown 1654:1654 state
+   sudo chown 1654:1654 appsettings.json && chmod 600 appsettings.json
    docker compose up -d
    ```
 
@@ -82,9 +88,9 @@ curl -f "http://localhost:3456/health?verbose=true"
 
 `/health` returns liveness and immutable build/artifact metadata (`status`, `timestamp`, `version`, `commit`, `imageDigest`, `buildTime`, `deployment`).
 Passing `?verbose=true` additionally returns `startedAt`, `uptimeSeconds`, `capabilities` (`abiEngine`, `conversationGuardPermission`), `modules` (non-secret enabled/dryRun flags), and `runtime` (`lastError`, `lastErrorAt`).
-When native Libabigail or RPM extraction tools (`abipkgdiff`, `rpm2cpio`, `cpio`) are
-missing at startup, the process aborts unless `AbiCompliance:AllowManagedFallback`
-is explicitly enabled. See [docs/modules/abi-compliance.md](docs/modules/abi-compliance.md).
+When the native Libabigail tool (`abipkgdiff`) is missing at startup (from which
+RPM extraction support is also inferred), the process aborts unless
+`AbiCompliance:AllowManagedFallback` is explicitly enabled. See [docs/modules/abi-compliance.md](docs/modules/abi-compliance.md).
 
 ---
 

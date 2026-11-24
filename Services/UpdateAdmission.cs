@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.RegularExpressions;
 using abaci_bot.Options;
 
@@ -11,7 +12,7 @@ namespace abaci_bot.Services;
 public static class UpdateAdmission
 {
     private static readonly Regex FullVersionRegex = new(
-        @"^%global\s+full_version\s+(?<ver>\S+)",
+        @"^\s*%global\s+full_version\s+(?<ver>\S+)",
         RegexOptions.Compiled | RegexOptions.Multiline);
 
     private static readonly Regex VersionRegex = new(
@@ -288,9 +289,20 @@ public static class UpdateAdmission
         return (0, input);
     }
 
+    private enum MajorTokenKind
+    {
+        Numeric,
+        DelimitedAlpha
+    }
+
+    private readonly record struct MajorToken(MajorTokenKind Kind, long NumericValue, string? AlphaValue);
+
     /// <summary>
     /// Checks whether an upgrade crosses a major version boundary.
-    /// Parses the leading numeric component before the first dot.
+    /// Compares RPM epochs first, then structured major tokens (leading numeric runs with
+    /// CalVer <c>YYYYMMDD</c>/<c>YYYYMM</c> normalization such as <c>2026c</c> or <c>3_508</c>,
+    /// or delimited alpha tokens like <c>B.02.20</c>), failing closed (<c>true</c>) whenever
+    /// token kinds differ or either version is opaque and the stripped versions differ.
     /// </summary>
     public static bool IsCrossMajorVersion(string currentVersion, string targetVersion)
     {
@@ -298,50 +310,89 @@ public static class UpdateAdmission
         var cleanTarget = StripVersionSuffix(targetVersion);
 
         if (string.IsNullOrWhiteSpace(cleanCurrent) || string.IsNullOrWhiteSpace(cleanTarget))
-            return false;
+        {
+            return !string.Equals(cleanCurrent, cleanTarget, StringComparison.OrdinalIgnoreCase);
+        }
 
         var (currentEpoch, currentBody) = SplitEpoch(cleanCurrent);
         var (targetEpoch, targetBody) = SplitEpoch(cleanTarget);
         if (currentEpoch != targetEpoch)
             return true;
 
-        var currentMajor = ExtractMajorComponent(currentBody);
-        var targetMajor = ExtractMajorComponent(targetBody);
-
-        if (currentMajor != null && targetMajor != null)
+        if (TryExtractMajorToken(currentBody, out var currentMajor) &&
+            TryExtractMajorToken(targetBody, out var targetMajor))
         {
-            return currentMajor != targetMajor;
+            if (currentMajor.Kind != targetMajor.Kind)
+                return true;
+
+            return currentMajor.Kind == MajorTokenKind.Numeric
+                ? currentMajor.NumericValue != targetMajor.NumericValue
+                : !string.Equals(currentMajor.AlphaValue, targetMajor.AlphaValue, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return !string.Equals(cleanCurrent, cleanTarget, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryExtractMajorToken(string version, out MajorToken token)
+    {
+        token = default;
+        var span = version.AsSpan().Trim();
+        if (span.IsEmpty)
+        {
+            return false;
+        }
+
+        // Strip a single leading 'v'/'V' only when immediately followed by an ASCII digit (e.g. v1.2.3 -> 1.2.3)
+        if (span.Length >= 2 && (span[0] == 'v' || span[0] == 'V') && char.IsAsciiDigit(span[1]))
+        {
+            span = span[1..];
+        }
+
+        if (char.IsAsciiDigit(span[0]))
+        {
+            int digitLen = 0;
+            while (digitLen < span.Length && char.IsAsciiDigit(span[digitLen]))
+            {
+                digitLen++;
+            }
+
+            if (!long.TryParse(span[..digitLen], NumberStyles.None, CultureInfo.InvariantCulture, out var major))
+            {
+                return false;
+            }
+
+            // CalVer support: 8-digit date (YYYYMMDD, e.g. 20260526 -> 2026) and 6-digit date (YYYYMM, e.g. 202602 -> 2026)
+            if (major >= 19900000 && major <= 21001231)
+            {
+                major /= 10000;
+            }
+            else if (major >= 199000 && major <= 210012)
+            {
+                major /= 100;
+            }
+
+            token = new MajorToken(MajorTokenKind.Numeric, major, null);
+            return true;
+        }
+
+        if (char.IsAsciiLetter(span[0]))
+        {
+            int letterLen = 0;
+            while (letterLen < span.Length && char.IsAsciiLetter(span[letterLen]))
+            {
+                letterLen++;
+            }
+
+            if (letterLen < span.Length && (span[letterLen] == '.' || span[letterLen] == '_'))
+            {
+                token = new MajorToken(MajorTokenKind.DelimitedAlpha, 0, span[..letterLen].ToString());
+                return true;
+            }
+
+            return false;
         }
 
         return false;
-    }
-
-    private static int? ExtractMajorComponent(string version)
-    {
-        var dotIdx = version.IndexOf('.');
-        var majorStr = dotIdx >= 0 ? version.Substring(0, dotIdx) : version;
-
-        // Trim leading non-digits if any (e.g. v1.2.3 -> 1)
-        var span = majorStr.AsSpan().TrimStart("vV");
-        if (int.TryParse(span, out var major))
-        {
-            // CalVer support:
-            // 8-digit date (YYYYMMDD, e.g. 20260526 -> 2026)
-            if (major >= 19900000 && major <= 21000000)
-            {
-                return major / 10000;
-            }
-
-            // 6-digit date (YYYYMM, e.g. 202602, 202608 -> 2026)
-            if (major >= 199000 && major <= 210012)
-            {
-                return major / 100;
-            }
-
-            return major;
-        }
-
-        return null;
     }
 }
 

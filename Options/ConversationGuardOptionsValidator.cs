@@ -26,8 +26,8 @@ public class ConversationGuardOptionsValidator : IValidateOptions<ConversationGu
         {
             failures.Add(
                 $"{nameof(options.ArchiveEnabled)} cannot be enabled in GitHub App-only mode because GitHub's " +
-                "archivePullRequest/unarchivePullRequest GraphQL mutations require a user role (triage or higher) " +
-                "and always return FORBIDDEN for GitHub App installation tokens. Set ConversationGuard:ArchiveEnabled=false " +
+                "archivePullRequest GraphQL mutation requires a user role (triage or higher) " +
+                "and always returns FORBIDDEN for GitHub App installation tokens. Set ConversationGuard:ArchiveEnabled=false " +
                 "(recommended) or configure a triage+ user PAT via PackageUpdate:BotPat.");
         }
 

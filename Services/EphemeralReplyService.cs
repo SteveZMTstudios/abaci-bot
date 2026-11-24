@@ -71,8 +71,16 @@ public sealed class EphemeralReplyService : BackgroundService, IEphemeralReplySe
         if (commentId > 0 && effectiveTtl > TimeSpan.Zero)
         {
             var deleteAt = _timeProvider.GetUtcNow().Add(effectiveTtl);
-            _stateStore.AddPendingEphemeralComment(
-                new PendingEphemeralComment(owner, repo, prNumber, commentId, deleteAt, RetryCount: 0, CommentNodeId: commentNodeId));
+            try
+            {
+                _stateStore.AddPendingEphemeralComment(
+                    new PendingEphemeralComment(owner, repo, prNumber, commentId, deleteAt, RetryCount: 0, CommentNodeId: commentNodeId));
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Failed to persist scheduled cleanup for ephemeral comment {CommentId} on {Owner}/{Repo}#{PrNumber}",
+                    commentId, owner, repo, prNumber);
+            }
         }
     }
 
@@ -128,13 +136,13 @@ public sealed class EphemeralReplyService : BackgroundService, IEphemeralReplySe
                     if (!minimized)
                     {
                         var nextAttemptAt = now.AddMinutes(1);
-                        var willRetry = _stateStore.RecordEphemeralRetry(entry.Owner, entry.Repo, entry.CommentId, nextAttemptAt);
-                        if (willRetry)
+                        var outcome = TryPersistEphemeralRetry(entry, nextAttemptAt);
+                        if (outcome == RetryPersistenceOutcome.Scheduled)
                         {
                             _logger?.LogDebug("Minimize returned false for ephemeral comment {CommentId} on {Owner}/{Repo}#{PrNumber}; will retry",
                                 entry.CommentId, entry.Owner, entry.Repo, entry.PrNumber);
                         }
-                        else
+                        else if (outcome == RetryPersistenceOutcome.Exhausted)
                         {
                             _logger?.LogWarning("Exhausted retries minimizing ephemeral comment {CommentId} on {Owner}/{Repo}#{PrNumber}; dropping entry",
                                 entry.CommentId, entry.Owner, entry.Repo, entry.PrNumber);
@@ -148,19 +156,26 @@ public sealed class EphemeralReplyService : BackgroundService, IEphemeralReplySe
                     await _commentGateway!.DeleteCommentAsync(entry.Owner, entry.Repo, entry.CommentId, cancellationToken);
                 }
 
-                _stateStore.RemovePendingEphemeralComment(entry.Owner, entry.Repo, entry.CommentId);
+                try
+                {
+                    _stateStore.RemovePendingEphemeralComment(entry.Owner, entry.Repo, entry.CommentId);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError(ex, "Failed to remove completed ephemeral comment {CommentId} from state store", entry.CommentId);
+                }
                 processedCount++;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 var nextAttemptAt = now.AddMinutes(1);
-                var willRetry = _stateStore.RecordEphemeralRetry(entry.Owner, entry.Repo, entry.CommentId, nextAttemptAt);
-                if (willRetry)
+                var outcome = TryPersistEphemeralRetry(entry, nextAttemptAt);
+                if (outcome == RetryPersistenceOutcome.Scheduled)
                 {
                     _logger?.LogDebug(ex, "Transient error cleaning up ephemeral comment {CommentId} on {Owner}/{Repo}#{PrNumber}; will retry",
                         entry.CommentId, entry.Owner, entry.Repo, entry.PrNumber);
                 }
-                else
+                else if (outcome == RetryPersistenceOutcome.Exhausted)
                 {
                     _logger?.LogWarning(ex, "Exhausted retries cleaning up ephemeral comment {CommentId} on {Owner}/{Repo}#{PrNumber}; dropping entry",
                         entry.CommentId, entry.Owner, entry.Repo, entry.PrNumber);
@@ -169,5 +184,28 @@ public sealed class EphemeralReplyService : BackgroundService, IEphemeralReplySe
         }
 
         return processedCount;
+    }
+
+    private enum RetryPersistenceOutcome
+    {
+        Scheduled,
+        Exhausted,
+        PersistenceFailed
+    }
+
+    private RetryPersistenceOutcome TryPersistEphemeralRetry(PendingEphemeralComment entry, DateTimeOffset nextAttemptAt)
+    {
+        try
+        {
+            return _stateStore.RecordEphemeralRetry(entry.Owner, entry.Repo, entry.CommentId, nextAttemptAt)
+                ? RetryPersistenceOutcome.Scheduled
+                : RetryPersistenceOutcome.Exhausted;
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Failed to persist retry schedule for ephemeral comment {CommentId} on {Owner}/{Repo}#{PrNumber}",
+                entry.CommentId, entry.Owner, entry.Repo, entry.PrNumber);
+            return RetryPersistenceOutcome.PersistenceFailed;
+        }
     }
 }

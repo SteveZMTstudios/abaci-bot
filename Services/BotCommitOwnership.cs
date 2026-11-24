@@ -6,12 +6,50 @@ namespace abaci_bot.Services;
 /// </summary>
 internal static class BotCommitOwnership
 {
-    public static HashSet<string> BuildOwnBotLoginSet(string? liveBotLogin, string? configuredBotLogin)
+    public static HashSet<string> BuildOwnBotLoginSet(
+        string? liveBotLogin,
+        string? configuredBotLogin,
+        bool requireLive = false)
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        AddIdentityVariants(set, liveBotLogin);
+        if (!string.IsNullOrWhiteSpace(liveBotLogin))
+        {
+            AddIdentityVariants(set, liveBotLogin);
+            return set;
+        }
+
+        if (requireLive)
+        {
+            return set;
+        }
+
         AddIdentityVariants(set, configuredBotLogin);
         return set;
+    }
+
+    public static async Task<HashSet<string>> ResolveOwnBotLoginsAsync(
+        IBotIdentityProvider? botIdentity,
+        string? configuredBotLogin,
+        bool requireLiveWhenProviderPresent,
+        CancellationToken ct = default)
+    {
+        string? liveBotLogin = null;
+        if (botIdentity != null)
+        {
+            try
+            {
+                liveBotLogin = await botIdentity.GetBotLoginAsync(ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                liveBotLogin = null;
+            }
+        }
+
+        return BuildOwnBotLoginSet(
+            liveBotLogin,
+            configuredBotLogin,
+            requireLive: requireLiveWhenProviderPresent && botIdentity != null);
     }
 
     public static bool IsOwnBotLogin(string? login, IReadOnlySet<string> ownLogins)
@@ -22,6 +60,25 @@ internal static class BotCommitOwnership
         }
 
         return ownLogins.Contains(login.Trim());
+    }
+
+    public static async Task<bool> IsOwnBotLoginAsync(
+        IBotIdentityProvider? botIdentity,
+        string? senderLogin,
+        string? configuredBotLogin = null,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(senderLogin))
+        {
+            return false;
+        }
+
+        var ownLogins = await ResolveOwnBotLoginsAsync(
+            botIdentity,
+            configuredBotLogin,
+            requireLiveWhenProviderPresent: false,
+            ct);
+        return IsOwnBotLogin(senderLogin, ownLogins);
     }
 
     public static bool IsOwnBotCommit(BranchCommitInfo? commit, IReadOnlySet<string> ownLogins)

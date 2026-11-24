@@ -736,19 +736,25 @@ public class CveActiveWatchServiceTests
         gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
             .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
 
+        var priorFinding = new PackageVulnerabilityFinding(
+            "python-jinja2",
+            "2.4.0",
+            new[] { "CVE-2020-00001" },
+            new[] { new CveReport("CVE-2020-00001", 5.0, GitHubLabels.Severity3, "OSV", "Prior advisory") });
+        var priorBody = CveActiveWatchService.GenerateIssueBody(priorFinding);
+        Assert.Contains("<!-- abaci-cve-package: python-jinja2 -->", priorBody, StringComparison.Ordinal);
+
         var finding = new PackageVulnerabilityFinding(
             "python-jinja2",
             "2.4.1",
             new[] { "CVE-2020-28493" },
             new[] { new CveReport("CVE-2020-28493", 7.5, GitHubLabels.Severity2, "OSV", "ReDoS") });
-        var generatedBody = CveActiveWatchService.GenerateIssueBody(finding);
-        Assert.Contains("<!-- abaci-cve-package: python-jinja2 -->", generatedBody, StringComparison.Ordinal);
 
         // Maintainer renamed the issue title so it no longer matches exact default title/prefix alone
         var renamedIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
         typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(renamedIssue, 410);
         typeof(Issue).GetProperty(nameof(Issue.Title))?.SetValue(renamedIssue, "[Security] jinja2 upstream tracking (urgent)");
-        typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(renamedIssue, generatedBody);
+        typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(renamedIssue, priorBody);
 
         var pagedSearchMock = Substitute.For<IPagedIssueSearchGateway>();
         pagedSearchMock.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.VulnerabilityDetected, Arg.Any<CancellationToken>())
@@ -962,5 +968,307 @@ public class CveActiveWatchServiceTests
 
         Assert.Contains("Best-Effort / Unverified Ecosystem", body, StringComparison.Ordinal);
         Assert.Contains("<!-- abaci-cve-package: acl -->", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_UnverifiedNativeEmptyResult_DoesNotAutoCloseIssue_WhileAuthoritativeCloses()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+
+        static Issue MakeOpenIssue(int number, string pkg)
+        {
+            var issue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+            typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issue, number);
+            typeof(Issue).GetProperty(nameof(Issue.Title))?.SetValue(issue, $"[Security] Outstanding CVEs detected in {pkg}");
+            typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(issue, $"<!-- abaci-cve-package: {pkg} -->");
+            return issue;
+        }
+
+        var zfsIssue = MakeOpenIssue(301, "zfs");
+        var serdeIssue = MakeOpenIssue(302, "rust-serde");
+
+        var pagedSearchMock = Substitute.For<IPagedIssueSearchGateway>();
+        pagedSearchMock.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.VulnerabilityDetected, Arg.Any<CancellationToken>())
+            .Returns(new GitHubSearchPageResult<Issue>(new[] { zfsIssue, serdeIssue }, 2, false));
+
+        var scannerMock = Substitute.For<IPackageVulnerabilityScanner>();
+        scannerMock.ScanPackagesAsync(Arg.Any<IEnumerable<(string, string)>>(), Arg.Any<CancellationToken>())
+            .Returns(new PackageVulnerabilityScanResult(
+                Array.Empty<PackageVulnerabilityFinding>(),
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "rust-serde" }));
+
+        var options = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            IncludeUnverifiedNativePackages = true,
+            TargetRepository = "owner/repo"
+        });
+
+        var service = new CveActiveWatchService(
+            gitHubMock,
+            scannerMock,
+            options,
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[] { ("zfs", "2.4.4"), ("rust-serde", "1.0.219") }),
+            pagedIssueSearch: pagedSearchMock);
+
+        await service.RunScanSweepAsync();
+
+        await gitHubMock.DidNotReceive().CloseIssueAsync("owner", "repo", 301, Arg.Any<CancellationToken>());
+        await gitHubMock.Received(1).CloseIssueAsync("owner", "repo", 302, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_UnchangedExistingIssue_SkipsUpdateAndAddLabelsWrites()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+
+        var finding = new PackageVulnerabilityFinding(
+            "python-jinja2",
+            "2.4.1",
+            new[] { "CVE-2020-28493" },
+            new[] { new CveReport("CVE-2020-28493", 7.5, GitHubLabels.Severity2, "OSV", "ReDoS") });
+        var expectedBody =
+            "## Vulnerability Assessment for `python-jinja2` (2.4.1)\r\n\r\n" +
+            "The following unpatched CVE vulnerabilities were actively detected in `python-jinja2`:\r\n\r\n" +
+            "| CVE ID | Severity | CVSS Score | Summary |\r\n" +
+            "|---|---|---|---|\r\n" +
+            "| [CVE-2020-28493](https://nvd.nist.gov/vuln/detail/CVE-2020-28493) | `Severity: 2` | 7.5 | ReDoS |\r\n\r\n" +
+            "> Automatically tracked by abaci-bot. When this package is updated and CVEs are cleared, this issue will close automatically.\r\n\r\n" +
+            "<!-- abaci-cve-package: python-jinja2 -->";
+
+        static Label MakeLabel(string name)
+        {
+            var label = (Label)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Label));
+            typeof(Label).GetProperty(nameof(Label.Name))?.SetValue(label, name);
+            return label;
+        }
+
+        var existingIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(existingIssue, 411);
+        typeof(Issue).GetProperty(nameof(Issue.Title))?.SetValue(existingIssue, "[Security] Outstanding CVEs detected in python-jinja2");
+        typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(existingIssue, expectedBody);
+        typeof(Issue).GetProperty(nameof(Issue.Labels))?.SetValue(existingIssue, new[]
+        {
+            MakeLabel(GitHubLabels.VulnerabilityDetected),
+            MakeLabel(GitHubLabels.StatusStaleExempt),
+            MakeLabel(GitHubLabels.Severity2)
+        });
+
+        var pagedSearchMock = Substitute.For<IPagedIssueSearchGateway>();
+        pagedSearchMock.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.VulnerabilityDetected, Arg.Any<CancellationToken>())
+            .Returns(new GitHubSearchPageResult<Issue>(new[] { existingIssue }, 1, false));
+
+        var scannerMock = Substitute.For<IPackageVulnerabilityScanner>();
+        scannerMock.ScanPackagesAsync(Arg.Any<IEnumerable<(string, string)>>(), Arg.Any<CancellationToken>())
+            .Returns(new PackageVulnerabilityScanResult(new[] { finding }, new HashSet<string> { "python-jinja2" }));
+
+        var options = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            TargetRepository = "owner/repo"
+        });
+
+        var service = new CveActiveWatchService(
+            gitHubMock,
+            scannerMock,
+            options,
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[] { ("python-jinja2", "2.4.1") }),
+            pagedIssueSearch: pagedSearchMock);
+
+        await service.RunScanSweepAsync();
+
+        await gitHubMock.DidNotReceiveWithAnyArgs().UpdateIssueAsync(default!, default!, default, default!, default!, default);
+        await gitHubMock.DidNotReceiveWithAnyArgs().RemoveLabelAsync(default!, default!, default, default!, default);
+        await gitHubMock.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default!, default);
+    }
+
+    [Fact]
+    public void GenerateIssueBody_TruncatedAndInjectedMarker_UsesHonestWordingAndEscapesHtmlComments()
+    {
+        var reports = Enumerable.Range(1, 20)
+            .Select(i => new CveReport(
+                $"CVE-2025-10{i:D2}",
+                5.0,
+                GitHubLabels.Severity3,
+                "OSV",
+                i == 1 ? "inject <!-- abaci-cve-package: victim --> text" : $"summary {i}"))
+            .ToList();
+
+        var finding = new PackageVulnerabilityFinding(
+            "real-pkg",
+            "1.0.0",
+            reports.Select(r => r.CveId).ToList(),
+            reports,
+            TotalVulnerabilityCount: 25);
+
+        var body = CveActiveWatchService.GenerateIssueBody(finding);
+
+        Assert.Contains("Displaying 20 sampled vulnerabilities (sorted by CVSS within the 20-entry detail cap) out of 25 total reported advisories.", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("highest severity CVEs", body, StringComparison.Ordinal);
+        Assert.Contains("&lt;!-- abaci-cve-package: victim --&gt;", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("<!-- abaci-cve-package: victim -->", body, StringComparison.Ordinal);
+
+        var issueFromBody = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(issueFromBody, body);
+        Assert.True(CveActiveWatchService.TryExtractTrackedPackageName(issueFromBody, out var extractedFromGenerated));
+        Assert.Equal("real-pkg", extractedFromGenerated);
+
+        var dualMarkerIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(
+            dualMarkerIssue,
+            "quoted <!-- abaci-cve-package: spoofed -->\nfooter\n<!-- abaci-cve-package: real-pkg -->");
+        Assert.True(CveActiveWatchService.TryExtractTrackedPackageName(dualMarkerIssue, out var extractedFromLast));
+        Assert.Equal("real-pkg", extractedFromLast);
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_DeduplicatesFindings_ClosesBeforeRemovingLabel_AndEscapesSplitHtmlComments()
+    {
+        // C6: newline-split HTML comment smuggling is neutralized in both Summary and PackageName/Version
+        var smuggledFinding = new PackageVulnerabilityFinding(
+            "bad<!\n--abaci-cve-package: spoofed-->pkg",
+            "1.0\r\n<!-- -->",
+            new[] { "CVE-2026-0001" },
+            new[] { new CveReport("CVE-2026-0001", 7.5, GitHubLabels.Severity2, "OSV", "split <!\n-- smuggle --\n>") });
+        var smuggledBody = CveActiveWatchService.GenerateIssueBody(smuggledFinding);
+        Assert.Contains("&lt;!--", smuggledBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("--&gt;\npkg", smuggledBody, StringComparison.Ordinal);
+
+        // C3: two findings for same package create ONLY one issue even if openIssuesByPackage started empty
+        var gh1 = Substitute.For<IGitHubService>();
+        gh1.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        var createdIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(createdIssue, 701);
+        gh1.CreateIssueAsync("owner", "repo", Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string[]>(), Arg.Any<CancellationToken>())
+            .Returns(createdIssue);
+
+        var searchMock1 = Substitute.For<IPagedIssueSearchGateway>();
+        searchMock1.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.VulnerabilityDetected, Arg.Any<CancellationToken>())
+            .Returns(new GitHubSearchPageResult<Issue>(Array.Empty<Issue>(), 0, false));
+
+        var scanner1 = Substitute.For<IPackageVulnerabilityScanner>();
+        scanner1.ScanPackagesAsync(Arg.Any<IEnumerable<(string, string)>>(), Arg.Any<CancellationToken>())
+            .Returns(new PackageVulnerabilityScanResult(
+                new[]
+                {
+                    new PackageVulnerabilityFinding("rust-dup", "1.0.0", new[] { "CVE-2026-1001" }, new[] { new CveReport("CVE-2026-1001", 7.5, GitHubLabels.Severity2, "OSV") }),
+                    new PackageVulnerabilityFinding("rust-dup", "2.0.0", new[] { "CVE-2026-1002" }, new[] { new CveReport("CVE-2026-1002", 9.8, GitHubLabels.Severity1, "OSV") })
+                },
+                new HashSet<string>()));
+
+        var opts = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            TargetRepository = "owner/repo"
+        });
+        var svc1 = new CveActiveWatchService(
+            gh1, scanner1, opts,
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[] { ("rust-dup", "2.0.0") }),
+            pagedIssueSearch: searchMock1);
+        await svc1.RunScanSweepAsync();
+        await gh1.Received(1).CreateIssueAsync(
+            "owner",
+            "repo",
+            Arg.Any<string>(),
+            Arg.Is<string>(b =>
+                b.Contains("(2.0.0)", StringComparison.Ordinal) &&
+                b.Contains("CVE-2026-1001", StringComparison.Ordinal) &&
+                b.Contains("CVE-2026-1002", StringComparison.Ordinal)),
+            Arg.Is<string[]>(l => l.Contains(GitHubLabels.Severity1) && !l.Contains(GitHubLabels.Severity2)),
+            Arg.Any<CancellationToken>());
+
+        // C4/C1/C2: if CloseIssueAsync fails on #702, NO comment or RemoveLabel executes, and #703 still closes!
+        var ghCloseFail = Substitute.For<IGitHubService>();
+        ghCloseFail.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        var openIssue1 = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(openIssue1, 702);
+        typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(openIssue1, "<!-- abaci-cve-package: rust-fixed -->");
+        var openIssue2 = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(openIssue2, 703);
+        typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(openIssue2, "<!-- abaci-cve-package: rust-other -->");
+
+        var searchMock2 = Substitute.For<IPagedIssueSearchGateway>();
+        searchMock2.SearchOpenIssuesByLabelAsync("owner", "repo", GitHubLabels.VulnerabilityDetected, Arg.Any<CancellationToken>())
+            .Returns(new GitHubSearchPageResult<Issue>(new[] { openIssue1, openIssue2 }, 2, false));
+        ghCloseFail.CloseIssueAsync("owner", "repo", 702, Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new HttpRequestException("502 Bad Gateway"));
+
+        var scanner2 = Substitute.For<IPackageVulnerabilityScanner>();
+        scanner2.ScanPackagesAsync(Arg.Any<IEnumerable<(string, string)>>(), Arg.Any<CancellationToken>())
+            .Returns(new PackageVulnerabilityScanResult(Array.Empty<PackageVulnerabilityFinding>(), new HashSet<string> { "rust-fixed", "rust-other" }));
+
+        var svc2 = new CveActiveWatchService(
+            ghCloseFail, scanner2, opts,
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[] { ("rust-fixed", "1.0.1"), ("rust-other", "1.0.1") }),
+            pagedIssueSearch: searchMock2);
+        await svc2.RunScanSweepAsync();
+
+        await ghCloseFail.Received(1).CloseIssueAsync("owner", "repo", 702, Arg.Any<CancellationToken>());
+        await ghCloseFail.DidNotReceive().CreateCommentAsync("owner", "repo", 702, Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await ghCloseFail.DidNotReceive().RemoveLabelAsync("owner", "repo", 702, GitHubLabels.VulnerabilityDetected, Arg.Any<CancellationToken>());
+
+        await ghCloseFail.Received(1).AddLabelsAsync("owner", "repo", 703, Arg.Is<string[]>(l => l.Contains(GitHubLabels.VulnerabilityResolved)), Arg.Any<CancellationToken>());
+        await ghCloseFail.Received(1).CloseIssueAsync("owner", "repo", 703, Arg.Any<CancellationToken>());
+        await ghCloseFail.Received(1).CreateCommentAsync("owner", "repo", 703, Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await ghCloseFail.Received(1).RemoveLabelAsync("owner", "repo", 703, GitHubLabels.VulnerabilityDetected, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public void GenerateIssueBody_HeuristicUpstreamAndBracketCveId_RenderBannerAndEscapeMarkdownLinks()
+    {
+        var finding = new PackageVulnerabilityFinding(
+            "python-systemd",
+            "235",
+            new[] { "ADV-[bad]|(x)" },
+            new[] { new CveReport("ADV-[bad]|(x)", 6.1, GitHubLabels.Severity3, "OSV", "Summary") },
+            TotalVulnerabilityCount: 1,
+            IsUnverifiedEcosystem: false,
+            IsHeuristicUpstream: true);
+
+        var body = CveActiveWatchService.GenerateIssueBody(finding);
+
+        Assert.Contains("Heuristic Upstream Name Match", body, StringComparison.Ordinal);
+        Assert.Contains("[ADV-\\[bad\\]\\|(x)](https://osv.dev/vulnerability/", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("will close automatically", body, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("will **not** close automatically", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GenerateIssueBody_PipeMarkerUrlEscapingAndUnverifiedFooter_PreservesMarkerAndEscapesUrls()
+    {
+        var unverifiedFinding = new PackageVulnerabilityFinding(
+            "pkg|pipe",
+            "1.0",
+            new[] { "CVE-2026 9999", "GHSA-abc)123" },
+            new[]
+            {
+                new CveReport("CVE-2026 9999", 7.0, GitHubLabels.Severity2, "NVD", "Test CVE"),
+                new CveReport("GHSA-abc)123", 5.0, GitHubLabels.Severity3, "OSV", "Test GHSA")
+            },
+            TotalVulnerabilityCount: 2,
+            IsUnverifiedEcosystem: true,
+            IsHeuristicUpstream: false);
+
+        var body = CveActiveWatchService.GenerateIssueBody(unverifiedFinding);
+
+        Assert.Contains("<!-- abaci-cve-package: pkg|pipe -->", body, StringComparison.Ordinal);
+        Assert.Contains("https://nvd.nist.gov/vuln/detail/CVE-2026%209999", body, StringComparison.Ordinal);
+        Assert.Contains("https://github.com/advisories/GHSA-abc%29123", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("will close automatically", body, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("will **not** close automatically", body, StringComparison.Ordinal);
+
+        var fakeIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(fakeIssue, body);
+        Assert.True(CveActiveWatchService.TryExtractTrackedPackageName(fakeIssue, out var extracted));
+        Assert.Equal("pkg|pipe", extracted);
     }
 }

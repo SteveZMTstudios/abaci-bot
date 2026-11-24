@@ -582,5 +582,139 @@ public class RustCrateVersionSourceTests
             }
         }
     }
+
+    [Fact]
+    public async Task CompleteSweep_BoundedRewinds_AdvancesPastPoisonCandidateAfterThreeConsecutiveRewinds()
+    {
+        var requestedPaths = new List<string>();
+        var crates = new[] { "rust-a-poison", "rust-b-next" };
+        var specCatalog = Substitute.For<ISpecCatalog>();
+        specCatalog.GetAllPackageNamesAsync(Arg.Any<CancellationToken>()).Returns(crates);
+        specCatalog.GetSpecAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var pkg = call.Arg<string>();
+                return new SpecContext(pkg, pkg, $"%global crate_name {pkg}\nVersion: 1.0.0\n", $"SPECS/{pkg}/{pkg}.spec");
+            });
+
+        var handler = new FakeHttpMessageHandler(req =>
+        {
+            requestedPaths.Add(req.RequestUri!.AbsolutePath);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("""{"name":"crate","vers":"1.0.1","yanked":false}""")
+            };
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            RustCratePoller = new RustCratePollerOptions
+            {
+                Enabled = true,
+                IndexBaseUrl = "https://index.crates.io",
+                MaxCratesPerSweep = 1,
+                RequestDelayMilliseconds = 0
+            }
+        });
+
+        var source = new RustCrateVersionSource(new HttpClient(handler), options, specCatalog: specCatalog);
+        var cursor = (ICandidateSweepCursor)source;
+
+        // Sweep 1 & 2: rust-a-poison fails execution -> rewinds before rust-a-poison
+        var failedPoisonSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "rust-a-poison" };
+        for (int attempt = 1; attempt <= 2; attempt++)
+        {
+            var cands = await source.GetCandidatesAsync();
+            Assert.Single(cands);
+            Assert.Equal("rust-a-poison", cands[0].PackageName);
+            cursor.CompleteSweep(new HashSet<string>(StringComparer.OrdinalIgnoreCase), failedPoisonSet);
+        }
+
+        // Sweep 3: still failing -> reaches bounded rewind limit (3), advances past rust-a-poison to rust-b-next!
+        var third = await source.GetCandidatesAsync();
+        Assert.Single(third);
+        Assert.Equal("rust-a-poison", third[0].PackageName);
+        cursor.CompleteSweep(new HashSet<string>(StringComparer.OrdinalIgnoreCase), failedPoisonSet);
+
+        requestedPaths.Clear();
+        var afterPoison = await source.GetCandidatesAsync();
+        Assert.Single(afterPoison);
+        Assert.Equal("rust-b-next", afterPoison[0].PackageName);
+        Assert.DoesNotContain(requestedPaths, p => p.Contains("rust-a-poison", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CandidateScheduler_WithRustCursor_DoesNotSkipCapacityDeferredCandidate_WhileSkippingPersistentFailure()
+    {
+        var crates = new[] { "rust-a", "rust-b" };
+        var specCatalog = Substitute.For<ISpecCatalog>();
+        specCatalog.GetAllPackageNamesAsync(Arg.Any<CancellationToken>()).Returns(crates);
+        specCatalog.GetSpecAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var pkg = call.Arg<string>();
+                return new SpecContext(pkg, pkg, $"%global crate_name {pkg}\nVersion: 1.0.0\n", $"SPECS/{pkg}/{pkg}.spec");
+            });
+
+        var handler = new FakeHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent("""{"name":"crate","vers":"1.0.1","yanked":false}""")
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            RustCratePoller = new RustCratePollerOptions
+            {
+                Enabled = true,
+                IndexBaseUrl = "https://index.crates.io",
+                MaxCratesPerSweep = 1,
+                RequestDelayMilliseconds = 0
+            }
+        });
+
+        var source = new RustCrateVersionSource(new HttpClient(handler), options, specCatalog: specCatalog);
+        var cursor = (ICandidateSweepCursor)source;
+
+        // 1. Concurrency cap blocks 5 sweeps -> rust-a MUST NOT be skipped across any of them (B4)
+        for (int sweep = 0; sweep < 5; sweep++)
+        {
+            var cands = await source.GetCandidatesAsync();
+            Assert.Single(cands);
+            Assert.Equal("rust-a", cands[0].PackageName);
+
+            var sched = await CandidateScheduler.ScheduleAndExecuteAsync(
+                cands,
+                maxPublishes: 5,
+                startOriginOffset: 0,
+                canAttempt: (_, _) => false,
+                tryPublishAsync: (_, _) => Task.FromResult(true));
+
+            Assert.Empty(sched.FailedPackageNames!);
+            cursor.CompleteSweep(sched.ProcessedPackageNames, sched.FailedPackageNames);
+        }
+
+        // Still starts at rust-a on sweep 6; now simulate 3 consecutive real publish exceptions on rust-a -> poison skip engages
+        for (int fail = 0; fail < 3; fail++)
+        {
+            var cands = await source.GetCandidatesAsync();
+            Assert.Single(cands);
+            Assert.Equal("rust-a", cands[0].PackageName);
+
+            var sched = await CandidateScheduler.ScheduleAndExecuteAsync(
+                cands,
+                maxPublishes: 5,
+                startOriginOffset: 0,
+                canAttempt: (_, _) => true,
+                tryPublishAsync: (_, _) => throw new HttpRequestException("502 Bad Gateway"));
+
+            Assert.Contains("rust-a", sched.FailedPackageNames!);
+            cursor.CompleteSweep(sched.ProcessedPackageNames, sched.FailedPackageNames);
+        }
+
+        // 4th discovery advances past poison rust-a to rust-b
+        var next = await source.GetCandidatesAsync();
+        Assert.Single(next);
+        Assert.Equal("rust-b", next[0].PackageName);
+    }
 }
 

@@ -70,7 +70,7 @@ Before launching `abaci-bot`, the following settings **must** be populated:
 | `GitHubApp:InstallationId` | `int` | GitHub App Installation ID on target organization/repo. | Environment variable `GitHubApp__InstallationId` |
 | `GitHubApp:PrivateKey` | `string` | RSA Private Key in PEM format. | Secret mount / environment variable `GitHubApp__PrivateKey` |
 | `GitHubApp:WebhookSecret` | `string` | Webhook verification secret. | Environment variable `GitHubApp__WebhookSecret` |
-| `GitHubApp:TeamName` | `string` | Team slug used for review transitions (required; no code default; example: `captains`). | `appsettings.json` or environment variable |
+| `GitHubApp:TeamName` | `string` | Team slug inside an existing GitHub organization you administer, used for review transitions (required; no code default; example: `captains`). | `appsettings.json` or environment variable |
 
 If any of these required values are missing or zero, the service terminates immediately on startup.
 
@@ -106,7 +106,7 @@ Any setting in `appsettings.json` can be overridden using environment variables 
 Do not commit private keys or webhook secrets to version control.
 
 ### Recommended Approaches:
-1. **Mounted Configuration File**: Mount a production `appsettings.json` with restricted permissions (`chmod 600 appsettings.json`):
+1. **Mounted Configuration File & Persistent State Directory**: Ensure both the mounted production `appsettings.json` and the persistent `state/` directory are readable/writable by container `uid 1654` (`sudo chown 1654:1654 appsettings.json && chmod 600 appsettings.json`, and `mkdir -p state && sudo chown 1654:1654 state`):
    ```yaml
    volumes:
      - ./appsettings.json:/app/appsettings.json:ro
@@ -122,16 +122,25 @@ Do not commit private keys or webhook secrets to version control.
 
 ## 7. Verifying Effective Configuration
 
-Verify active runtime settings through the health endpoint:
+Verify service liveness and build identity through the default health endpoint:
 ```bash
 curl http://localhost:3456/health
 ```
 
-The response confirms:
-- Service operational status (`Healthy`)
-- Active ABI engine tier (`native` vs `managed`)
-- RPM v6 extraction capability (`true` / `false`)
-- Count of loaded governance modules
+The default response returns:
+- `status` (`"healthy"`), `timestamp` (UTC)
+- Immutable build identity (`version`, `commit`, `imageDigest`, `buildTime`, `deployment`)
+
+Pass `?verbose=true` to inspect active capabilities, module states, and recent runtime errors:
+```bash
+curl "http://localhost:3456/health?verbose=true"
+```
+
+The verbose response adds:
+- `startedAt` and `uptimeSeconds`
+- `capabilities.abiEngine` (`native` / `managed` / `unavailable` / `disabled`) and `capabilities.conversationGuardPermission` (`verified` / `disabled` / `no-repositories` / `failed`)
+- `modules.*` per-module `enabled` and `dryRun` status flags
+- `runtime.lastError` / `runtime.lastErrorAt` (populated automatically from host `LogError` events with secrets redacted) and `sources` feed health
 
 ---
 

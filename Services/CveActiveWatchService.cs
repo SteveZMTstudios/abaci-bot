@@ -33,8 +33,16 @@ public class CveActiveWatchService : BackgroundService
 
     internal const string UnverifiedNoticeMarker = "<!-- abaci-cve-unverified-notice -->";
 
+    private static readonly HashSet<string> ManagedSeverityLabels = new(StringComparer.OrdinalIgnoreCase)
+    {
+        GitHubLabels.Severity1,
+        GitHubLabels.Severity2,
+        GitHubLabels.Severity3,
+        GitHubLabels.Severity4
+    };
+
     private static readonly Regex FullVersionRegex = new(
-        @"^%global\s+full_version\s+(?<ver>\S+)",
+        @"^\s*%global\s+full_version\s+(?<ver>\S+)",
         RegexOptions.Compiled | RegexOptions.Multiline);
 
     private static readonly Regex VersionRegex = new(
@@ -247,7 +255,7 @@ public class CveActiveWatchService : BackgroundService
         }
 
         // 1. Process new or existing findings (Rollup Issue per package) without per-finding Search API calls
-        foreach (var finding in findings)
+        foreach (var finding in vulnerablePackages.Values)
         {
             if (ct.IsCancellationRequested)
                 break;
@@ -294,12 +302,18 @@ public class CveActiveWatchService : BackgroundService
             var mergedTotal = Math.Max(
                 Math.Max(existing.TotalVulnerabilityCount, finding.TotalVulnerabilityCount),
                 mergedCveIds.Count);
+            var selectedVersion = UpdateAdmission.CompareRpmVersions(finding.Version, existing.Version) > 0
+                ? finding.Version
+                : existing.Version;
+
             map[finding.PackageName] = existing with
             {
+                Version = selectedVersion,
                 CveIds = mergedCveIds,
                 DetailedReports = mergedReports,
                 TotalVulnerabilityCount = mergedTotal,
-                IsUnverifiedEcosystem = existing.IsUnverifiedEcosystem && finding.IsUnverifiedEcosystem
+                IsUnverifiedEcosystem = existing.IsUnverifiedEcosystem && finding.IsUnverifiedEcosystem,
+                IsHeuristicUpstream = existing.IsHeuristicUpstream && finding.IsHeuristicUpstream
             };
         }
 
@@ -365,7 +379,7 @@ public class CveActiveWatchService : BackgroundService
         string repo,
         PackageVulnerabilityFinding finding,
         string issueLabel,
-        IReadOnlyDictionary<string, Issue> openIssuesByPackage,
+        IDictionary<string, Issue> openIssuesByPackage,
         bool isIndexTruncated,
         CancellationToken ct)
     {
@@ -389,34 +403,60 @@ public class CveActiveWatchService : BackgroundService
 
             if (existingIssue != null)
             {
+                var updateTitle = !string.IsNullOrWhiteSpace(existingIssue.Title) ? existingIssue.Title : issueTitle;
+                var bodyChanged = !string.Equals(
+                    NormalizeLineEndings(existingIssue.Body),
+                    NormalizeLineEndings(body),
+                    StringComparison.Ordinal);
+                var titleChanged = !string.Equals(
+                    existingIssue.Title ?? string.Empty,
+                    updateTitle,
+                    StringComparison.Ordinal);
+
+                var currentLabels = existingIssue.Labels ?? Array.Empty<Label>();
+                var obsoleteSeverityLabels = currentLabels
+                    .Where(l => l.Name != null && ManagedSeverityLabels.Contains(l.Name))
+                    .Select(l => l.Name!)
+                    .Where(oldLabel => !string.Equals(oldLabel, maxSeverity, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                var existingLabelSet = new HashSet<string>(
+                    currentLabels.Where(l => !string.IsNullOrWhiteSpace(l.Name)).Select(l => l.Name!),
+                    StringComparer.OrdinalIgnoreCase);
+                var missingLabels = labels.Where(l => !existingLabelSet.Contains(l)).ToArray();
+
+                if (!bodyChanged && !titleChanged && obsoleteSeverityLabels.Count == 0 && missingLabels.Length == 0)
+                {
+                    _logger?.LogDebug("Existing vulnerability issue #{Number} for {Package} is already up to date; skipping writes",
+                        existingIssue.Number, finding.PackageName);
+                    return;
+                }
+
                 _logger?.LogInformation("Updating existing vulnerability issue #{Number} for {Package}", existingIssue.Number, finding.PackageName);
                 if (!_options.DryRun)
                 {
-                    var updateTitle = !string.IsNullOrWhiteSpace(existingIssue.Title) ? existingIssue.Title : issueTitle;
-                    await _gitHubService.UpdateIssueAsync(owner, repo, existingIssue.Number, updateTitle, body, ct);
+                    if (bodyChanged || titleChanged)
+                    {
+                        await _gitHubService.UpdateIssueAsync(owner, repo, existingIssue.Number, updateTitle, body, ct);
+                    }
 
                     // Reconcile severity labels: remove obsolete Severity:* labels
-                    var currentSeverityLabels = (existingIssue.Labels ?? Array.Empty<Label>())
-                        .Where(l => l.Name != null && l.Name.StartsWith("Severity:", StringComparison.OrdinalIgnoreCase))
-                        .Select(l => l.Name)
-                        .ToList();
-
-                    foreach (var oldLabel in currentSeverityLabels)
+                    foreach (var oldLabel in obsoleteSeverityLabels)
                     {
-                        if (!string.Equals(oldLabel, maxSeverity, StringComparison.OrdinalIgnoreCase))
+                        try
                         {
-                            try
-                            {
-                                await _gitHubService.RemoveLabelAsync(owner, repo, existingIssue.Number, oldLabel, ct);
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger?.LogDebug(ex, "Failed to remove obsolete severity label {Label} from issue #{Number}", oldLabel, existingIssue.Number);
-                            }
+                            await _gitHubService.RemoveLabelAsync(owner, repo, existingIssue.Number, oldLabel, ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger?.LogDebug(ex, "Failed to remove obsolete severity label {Label} from issue #{Number}", oldLabel, existingIssue.Number);
                         }
                     }
 
-                    await _gitHubService.AddLabelsAsync(owner, repo, existingIssue.Number, labels.ToArray(), ct);
+                    if (missingLabels.Length > 0)
+                    {
+                        await _gitHubService.AddLabelsAsync(owner, repo, existingIssue.Number, missingLabels, ct);
+                    }
                 }
             }
             else if (isIndexTruncated)
@@ -432,7 +472,11 @@ public class CveActiveWatchService : BackgroundService
 
                 if (!_options.DryRun)
                 {
-                    await _gitHubService.CreateIssueAsync(owner, repo, issueTitle, body, labels.ToArray(), ct);
+                    var created = await _gitHubService.CreateIssueAsync(owner, repo, issueTitle, body, labels.ToArray(), ct);
+                    if (created != null)
+                    {
+                        openIssuesByPackage[finding.PackageName] = created;
+                    }
                 }
             }
         }
@@ -451,39 +495,54 @@ public class CveActiveWatchService : BackgroundService
         Dictionary<string, PackageVulnerabilityFinding> currentVulnerabilities,
         CancellationToken ct)
     {
-        try
+        foreach (var issue in openVulnerabilityIssues)
         {
-            foreach (var issue in openVulnerabilityIssues)
+            if (ct.IsCancellationRequested)
+                break;
+
+            if (issue == null || !TryExtractTrackedPackageName(issue, out var packageName))
+                continue;
+
+            // Only auto-close if this package was verified in a successful authoritative scan batch without outstanding CVEs
+            if (!successfullyScannedPackages.Contains(packageName))
+                continue;
+
+            if (!currentVulnerabilities.ContainsKey(packageName))
             {
-                if (ct.IsCancellationRequested)
-                    break;
+                // Vulnerabilities for this package were cleared!
+                _logger?.LogInformation("All CVEs resolved for {Package}; closing issue #{Number}", packageName, issue.Number);
 
-                if (issue == null || !TryExtractTrackedPackageName(issue, out var packageName))
-                    continue;
-
-                // Only auto-close if this package was verified in a successful authoritative scan batch without outstanding CVEs
-                if (!successfullyScannedPackages.Contains(packageName))
-                    continue;
-
-                if (!currentVulnerabilities.ContainsKey(packageName))
+                if (!_options.DryRun)
                 {
-                    // Vulnerabilities for this package were cleared!
-                    _logger?.LogInformation("All CVEs resolved for {Package}; closing issue #{Number}", packageName, issue.Number);
-
-                    if (!_options.DryRun)
+                    try
                     {
-                        var resolutionComment = "All previously detected CVE vulnerabilities have been resolved in the current package version. Closing issue.";
-                        await _gitHubService.CreateCommentAsync(owner, repo, issue.Number, resolutionComment, ct);
-                        await _gitHubService.RemoveLabelAsync(owner, repo, issue.Number, issueLabel, ct);
+                        // Apply Resolved label and close before commenting so transient Close errors
+                        // never post duplicate closing comments and retry cleanly on the next sweep.
                         await _gitHubService.AddLabelsAsync(owner, repo, issue.Number, new[] { GitHubLabels.VulnerabilityResolved }, ct);
                         await _gitHubService.CloseIssueAsync(owner, repo, issue.Number, ct);
+
+                        var resolutionComment = "All previously detected CVE vulnerabilities have been resolved in the current package version. Closing issue.";
+                        await _gitHubService.CreateCommentAsync(owner, repo, issue.Number, resolutionComment, ct);
+
+                        try
+                        {
+                            await _gitHubService.RemoveLabelAsync(owner, repo, issue.Number, issueLabel, ct);
+                        }
+                        catch (Exception removeEx) when (removeEx is not OperationCanceledException)
+                        {
+                            _logger?.LogWarning(removeEx,
+                                "Closed resolved vulnerability issue #{Number} for {Package} but failed to remove label '{Label}'",
+                                issue.Number, packageName, issueLabel);
+                        }
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _logger?.LogWarning(ex,
+                            "Failed to verify and close resolved vulnerability issue #{Number} for {Package}",
+                            issue.Number, packageName);
                     }
                 }
             }
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _logger?.LogWarning(ex, "Failed to verify and close resolved vulnerability issues");
         }
     }
 
@@ -491,10 +550,10 @@ public class CveActiveWatchService : BackgroundService
     {
         if (!string.IsNullOrWhiteSpace(issue.Body))
         {
-            var markerMatch = PackageIssueBodyMarkerRegex.Match(issue.Body);
-            if (markerMatch.Success)
+            var markerMatches = PackageIssueBodyMarkerRegex.Matches(issue.Body);
+            if (markerMatches.Count > 0)
             {
-                packageName = markerMatch.Groups["pkg"].Value.Trim();
+                packageName = markerMatches[^1].Groups["pkg"].Value.Trim();
                 if (!string.IsNullOrEmpty(packageName))
                 {
                     return true;
@@ -539,13 +598,14 @@ public class CveActiveWatchService : BackgroundService
             return null;
 
         var trimmed = id.Trim();
+        var escaped = Uri.EscapeDataString(trimmed);
         if (trimmed.StartsWith("CVE-", StringComparison.OrdinalIgnoreCase))
-            return $"https://nvd.nist.gov/vuln/detail/{trimmed}";
+            return $"https://nvd.nist.gov/vuln/detail/{escaped}";
 
         if (trimmed.StartsWith("GHSA-", StringComparison.OrdinalIgnoreCase))
-            return $"https://github.com/advisories/{trimmed}";
+            return $"https://github.com/advisories/{escaped}";
 
-        return $"https://osv.dev/vulnerability/{Uri.EscapeDataString(trimmed)}";
+        return $"https://osv.dev/vulnerability/{escaped}";
     }
 
     public static string GenerateIssueBody(PackageVulnerabilityFinding finding)
@@ -560,29 +620,40 @@ public class CveActiveWatchService : BackgroundService
         var rows = string.Join("\n", displayReports.Select(r =>
         {
             var linkUrl = FormatVulnerabilityUrl(r.CveId);
-            var idCell = linkUrl != null ? $"[{r.CveId}]({linkUrl})" : $"`{r.CveId}`";
+            var safeCveId = EscapeMarkdownLinkText(r.CveId);
+            var idCell = linkUrl != null ? $"[{safeCveId}]({linkUrl})" : $"`{EscapeMarkdown(r.CveId)}`";
             return $"| {idCell} | `{r.SeverityLabel ?? "Unknown"}` | {r.CvssScore?.ToString("F1", System.Globalization.CultureInfo.InvariantCulture) ?? "N/A"} | {EscapeMarkdown(r.Summary ?? "Vulnerability details unavailable")} |";
         }));
 
         var truncationNotice = totalCount > displayReports.Count
-            ? $"\n\n> ⚠️ **Notice**: Truncated. Displaying top {displayReports.Count} highest severity CVEs out of {totalCount} total vulnerabilities."
+            ? $"\n\n> ⚠️ **Notice**: Truncated. Displaying {displayReports.Count} sampled vulnerabilities (sorted by CVSS within the {displayReports.Count}-entry detail cap) out of {totalCount} total reported advisories."
             : string.Empty;
 
         var bestEffortBanner = finding.IsUnverifiedEcosystem
             ? "\n\n> ⚠️ **Best-Effort / Unverified Ecosystem**: This native RPM package has no authoritative openRuyi OSV ecosystem feed; results are matched by package name across upstream distributions and may contain false positives."
             : string.Empty;
 
-        var marker = $"\n\n<!-- abaci-cve-package: {finding.PackageName} -->";
-        var body = $"""
-            ## Vulnerability Assessment for `{finding.PackageName}` ({finding.Version}){bestEffortBanner}
+        var heuristicBanner = !finding.IsUnverifiedEcosystem && finding.IsHeuristicUpstream
+            ? "\n\n> ⚠️ **Heuristic Upstream Name Match**: This package lacks an explicit `%global pypi_name`, `srcname`, or `crate_name` macro and was matched using a package-name prefix heuristic. Because OSV empty responses cannot reliably prove resolution for heuristic names, this issue will **not** auto-close and requires manual maintainer triage."
+            : string.Empty;
 
-            The following unpatched CVE vulnerabilities were actively detected in `{finding.PackageName}`:
+        var markerPackage = EscapeHtmlCommentMarker(finding.PackageName);
+        var safePackage = EscapeMarkdown(finding.PackageName);
+        var safeVersion = EscapeMarkdown(finding.Version);
+        var marker = $"\n\n<!-- abaci-cve-package: {markerPackage} -->";
+        var footerNote = (finding.IsUnverifiedEcosystem || finding.IsHeuristicUpstream)
+            ? "> Automatically tracked by abaci-bot. Because upstream resolution cannot be proven automatically for unverified or heuristic-matched packages, this issue requires manual triage and will **not** close automatically."
+            : "> Automatically tracked by abaci-bot. When this package is updated and CVEs are cleared, this issue will close automatically.";
+        var body = $"""
+            ## Vulnerability Assessment for `{safePackage}` ({safeVersion}){bestEffortBanner}{heuristicBanner}
+
+            The following unpatched CVE vulnerabilities were actively detected in `{safePackage}`:
 
             | CVE ID | Severity | CVSS Score | Summary |
             |---|---|---|---|
             {rows}{truncationNotice}
 
-            > Automatically tracked by abaci-bot. When this package is updated and CVEs are cleared, this issue will close automatically.
+            {footerNote}
             """;
 
         // Hard cap at 60,000 characters to prevent GitHub 422 limit (65536 max) while keeping identity marker intact
@@ -596,10 +667,31 @@ public class CveActiveWatchService : BackgroundService
         return body + marker;
     }
 
-    private static string EscapeMarkdown(string text)
+    private static string EscapeMarkdownLinkText(string text)
     {
-        return text.Replace("|", "\\|").Replace("\r\n", " ").Replace("\n", " ").Trim();
+        return EscapeMarkdown(text)
+            .Replace("[", "\\[")
+            .Replace("]", "\\]");
     }
+
+    private static string EscapeHtmlCommentMarker(string text)
+    {
+        return text
+            .Replace("\r\n", " ")
+            .Replace("\r", " ")
+            .Replace("\n", " ")
+            .Replace("<!--", "&lt;!--")
+            .Replace("-->", "--&gt;")
+            .Trim();
+    }
+
+    private static string EscapeMarkdown(string text)
+        => EscapeHtmlCommentMarker(text).Replace("|", "\\|");
+
+    private static string NormalizeLineEndings(string? value)
+        => string.IsNullOrEmpty(value)
+            ? string.Empty
+            : value.Replace("\r\n", "\n", StringComparison.Ordinal).Trim();
 
     internal static PackageScanTarget? TryExtractScanTargetFromSpec(string packageName, string? specContent)
     {

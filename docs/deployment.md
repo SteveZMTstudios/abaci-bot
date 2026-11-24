@@ -14,6 +14,7 @@ This guide covers production deployment options, host prerequisites, containeriz
 | **ABI Tools** | Libabigail 2.6+ | `abipkgdiff`, `libabigail` | Executes binary shared library comparison. |
 | **Package Tools** | RPM 4.20+ / 6.0+ | `rpm`, `rpm2cpio`, `cpio` | Required to unpack payload archives from RPM packages. |
 | **Runtime** | .NET 10 LTS | `libicu`, `tzdata`, `libssl`, `libz` | Required for .NET 10 execution and IANA timezone resolution (`MilestoneSync:TimeZoneId`). |
+| **GitHub Organization** | Existing org | Organization admin access | Required to register/install the GitHub App on `<your-org>` and create the maintainer team matching `GitHubApp:TeamName`. |
 
 ---
 
@@ -198,8 +199,7 @@ server {
 
 ## 5. GitHub App Setup from Scratch
 
-The bot authenticates as a GitHub App, not as a personal account. Complete these steps
-once per organization.
+**Prerequisite:** You must already own or administer an existing GitHub organization (`<your-org>`) hosting your repositories. The bot authenticates as a GitHub App installed on that organization, not as a personal account. Complete these steps once per organization.
 
 ### 5.1 Create the App
 
@@ -223,7 +223,7 @@ once per organization.
 | Repository | **Issues: Read & write** | Apply labels, post comments, file CVE/update issues. |
 | Repository | **Pull requests: Read & write** | Apply labels, post comments, read review state. |
 | Repository | **Metadata: Read-only** | Mandatory for every GitHub App. |
-| Organization | **Members: Read-only** | Resolve the `captains` team for review transitions. |
+| Organization | **Members: Read-only** | Resolve the configured maintainer team (`GitHubApp:TeamName`, e.g. `captains`) for review transitions. |
 
 `Contents: write` is only needed if you want the App itself to merge pull requests; the
 bot does not. No `Workflows` or `Checks` permission is required while community
@@ -233,15 +233,21 @@ governance (`ConversationGuard`) remains disabled.
 > **Elevated permissions for `ConversationGuard`:** When `ConversationGuard:Enabled`
 > is set to `true`, authorizing `@<bot> lock`, `@<bot> unlock`, and `@<bot> hide` against
 > authoritative repository collaborator roles (`triage`/`write`+) requires granting the
-> GitHub App **Repository -> Administration: Read-only** (or **Contents: Read & write**).
-> Additionally enabling `ConversationGuard:ArchiveEnabled=true` (`@<bot> archive`) requires a
-> **`triage`+ user PAT** configured via `PackageUpdate:BotPat` (note: configuring `BotPat` shifts
-> all bot GitHub API writes to that user account), because GitHub's `archivePullRequest` and
-> `unarchivePullRequest` GraphQL mutations require a user role and always return `FORBIDDEN` for
-> GitHub App installation tokens even when **Administration: Read & write** is granted.
+> GitHub App **Repository -> Administration: Read-only** (or **Contents: Read & write**);
+> if `PackageUpdate:BotPat` is configured, GitHub's collaborator permissions endpoint routes
+> through the PAT and `VerifyCollaboratorPermissionProbeAsync` requires **`push`+** access on
+> that PAT.
+> Additionally enabling `ConversationGuard:ArchiveEnabled=true` (`@<bot> archive`) requires
+> `PackageUpdate:BotPat` (note: configuring `BotPat` shifts all bot GitHub API writes to that
+> user account) because GitHub's `archivePullRequest` GraphQL mutation requires a user role
+> (`triage` or higher) and always returns `FORBIDDEN` for GitHub App installation tokens even
+> when **Administration: Read & write** is granted; while `VerifyArchivePermissionProbeAsync`
+> checks `triage`+, combining `ArchiveEnabled=true` with `ConversationGuard:Enabled=true`
+> means the shared PAT must hold **`push`+** access for collaborator probing (once archived, PRs
+> are strictly read-only and reject all new comments with HTTP 403).
 > On startup (including when `DryRun` is `true`, and before webhooks or background sweeps run),
 > `ConversationGuardOptionsValidator` and `ConversationGuardPermissionProbe` verify collaborator
-> endpoint access (and require a `triage`+ `BotPat` when `ArchiveEnabled=true`) across
+> endpoint access (and require `PackageUpdate:BotPat` when `ArchiveEnabled=true`) across
 > `ConversationGuard:RepositoryAllowList`, aborting startup if requirements are missing. Keep
 > `ConversationGuard:ArchiveEnabled` set to `false` for App-only deployments, and keep
 > `ConversationGuard:Enabled` set to `false` to preserve the baseline minimal permission set.
@@ -268,16 +274,16 @@ sequences in a JSON string are converted to newlines at startup.
 
 ### 5.5 Install the App and get the installation ID
 
-1. Click **Install App** and select the target organization.
+1. Click **Install App** and select your target organization (`<your-org>`).
 2. Choose **All repositories** or a selected repository list.
 3. After installation, the browser URL ends with `/settings/installations/<number>`.
    That number is `GitHubApp:InstallationId`.
 
 If the App is reinstalled, the installation ID can change; update the configuration.
 
-### 5.6 Create the captain team
+### 5.6 Create the maintainer team
 
-Create an organization team named `captains` (or set `GitHubApp:TeamName` to your slug)
+Create an organization team inside `<your-org>` using your configured team slug (example: `captains`, matching `GitHubApp:TeamName` / `<team-slug>`)
 and add the maintainers who should move pull requests into review. The team must be
 visible to the App's `Members` permission; keep it non-secret.
 

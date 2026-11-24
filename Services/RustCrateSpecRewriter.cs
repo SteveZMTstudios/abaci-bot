@@ -15,7 +15,7 @@ public class RustCrateSpecRewriter : ISpecVersionRewriter
         RegexOptions.Compiled | RegexOptions.Multiline);
 
     private static readonly Regex FullVersionRegex = new(
-        @"^(?<prefix>%global\s+full_version\s+)(?<ver>\S+)(?<suffix>.*)$",
+        @"^\s*(?<prefix>%global\s+full_version\s+)(?<ver>\S+)(?<suffix>.*)$",
         RegexOptions.Compiled | RegexOptions.Multiline);
 
     private static readonly Regex VersionLineRegex = new(
@@ -28,6 +28,9 @@ public class RustCrateSpecRewriter : ISpecVersionRewriter
             return false;
 
         if (!CrateNameRegex.IsMatch(context.Content))
+            return false;
+
+        if (FullVersionRegex.Count(context.Content) > 1)
             return false;
 
         var verMatches = VersionLineRegex.Matches(context.Content);
@@ -71,7 +74,11 @@ public class RustCrateSpecRewriter : ISpecVersionRewriter
             }
         }
 
-        var fullVerMatch = FullVersionRegex.Match(context.Content);
+        var fullVerMatches = FullVersionRegex.Matches(context.Content);
+        if (fullVerMatches.Count > 1)
+            return new SpecRewriteResult(false, context.Content, "Multiple '%global full_version' directives found in SPEC; refusing ambiguous rewrite");
+
+        var fullVerMatch = fullVerMatches.Count == 1 ? fullVerMatches[0] : Match.Empty;
         var verMatches = VersionLineRegex.Matches(context.Content);
 
         if (verMatches.Count == 0)

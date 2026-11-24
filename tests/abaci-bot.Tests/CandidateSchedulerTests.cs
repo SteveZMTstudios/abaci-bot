@@ -326,4 +326,34 @@ public class CandidateSchedulerTests
         Assert.Single(published);
         Assert.True(result.NextOriginOffset >= 0);
     }
+
+    [Fact]
+    public async Task ScheduleAndExecuteAsync_WhenTryPublishThrows_ExcludesCandidateFromProcessedPackageNames()
+    {
+        var candidates = new List<UpdateCandidate>
+        {
+            new("rust-a", "0.1", "0.2", CandidateOrigin.RustCrate, string.Empty),
+            new("rust-b", "0.1", "0.2", CandidateOrigin.RustCrate, string.Empty)
+        };
+
+        var result = await CandidateScheduler.ScheduleAndExecuteAsync(
+            candidates,
+            maxPublishes: 2,
+            startOriginOffset: 0,
+            canAttempt: (_, _) => true,
+            tryPublishAsync: (c, _) =>
+            {
+                if (c.PackageName == "rust-a")
+                {
+                    throw new HttpRequestException("Transient GitHub 502");
+                }
+                return Task.FromResult(true);
+            });
+
+        Assert.Equal(1, result.TotalPublished);
+        Assert.DoesNotContain("rust-a", result.ProcessedPackageNames);
+        Assert.Contains("rust-b", result.ProcessedPackageNames);
+        Assert.Equal(1, result.ByOrigin[CandidateOrigin.RustCrate].Failed);
+        Assert.Equal(1, result.ByOrigin[CandidateOrigin.RustCrate].Published);
+    }
 }

@@ -284,6 +284,8 @@ public class ObsBuildService : IObsBuildService, IObsBuildFreshnessGateway
             "building" => ObsStatusCode.Building,
             "scheduled" => ObsStatusCode.Scheduled,
             "unresolvable" => ObsStatusCode.Unresolvable,
+            "broken" => ObsStatusCode.Broken,
+            "blocked" => ObsStatusCode.Blocked,
             "disabled" => ObsStatusCode.Disabled,
             "excluded" => ObsStatusCode.Excluded,
             _ => ObsStatusCode.Unknown

@@ -287,23 +287,50 @@ public class RustCrateVersionSource : IUpdateCandidateSource, ICandidateSweepCur
         return candidates;
     }
 
-    public void CompleteSweep(IReadOnlySet<string> processedPackageNames)
+    private const int MaxConsecutiveRewindsPerCandidate = 3;
+    private readonly Dictionary<string, int> _consecutiveRewinds = new(StringComparer.OrdinalIgnoreCase);
+
+    public void CompleteSweep(
+        IReadOnlySet<string> processedPackageNames,
+        IReadOnlySet<string>? failedPackageNames = null)
     {
         if (_lastCandidateNames.Count > 0 && _allSortedNames.Count > 0)
         {
-            var earliestUnprocessedIndex = -1;
-            foreach (var candidateName in _lastCandidateNames)
+            foreach (var processed in processedPackageNames)
             {
-                if (processedPackageNames.Contains(candidateName))
+                _consecutiveRewinds.Remove(processed);
+            }
+
+            var earliestUnprocessedIndex = -1;
+            var unprocessedByOrder = _lastCandidateNames
+                .Where(name => !processedPackageNames.Contains(name))
+                .Select(name => (Name: name, Index: IndexOfName(_allSortedNames, name)))
+                .Where(x => x.Index >= 0)
+                .OrderBy(x => x.Index)
+                .ToList();
+
+            foreach (var item in unprocessedByOrder)
+            {
+                // Capacity/budget deferrals (not present in failedPackageNames) rewind without penalty.
+                // Only attempted candidates whose publish threw an error accrue poison-pill rewind attempts.
+                if (failedPackageNames == null || !failedPackageNames.Contains(item.Name))
                 {
-                    continue;
+                    earliestUnprocessedIndex = item.Index;
+                    break;
                 }
 
-                var index = IndexOfName(_allSortedNames, candidateName);
-                if (index >= 0 && (earliestUnprocessedIndex < 0 || index < earliestUnprocessedIndex))
+                var attempts = _consecutiveRewinds.GetValueOrDefault(item.Name) + 1;
+                _consecutiveRewinds[item.Name] = attempts;
+                if (attempts < MaxConsecutiveRewindsPerCandidate)
                 {
-                    earliestUnprocessedIndex = index;
+                    earliestUnprocessedIndex = item.Index;
+                    break;
                 }
+
+                _consecutiveRewinds.Remove(item.Name);
+                _logger?.LogWarning(
+                    "Rust crates poller skipped poison candidate {Package} after {Attempts} consecutive failed publish attempts to prevent cursor starvation",
+                    item.Name, attempts);
             }
 
             if (earliestUnprocessedIndex >= 0)
@@ -312,7 +339,7 @@ public class RustCrateVersionSource : IUpdateCandidateSource, ICandidateSweepCur
                     ? _allSortedNames[earliestUnprocessedIndex - 1]
                     : null;
                 _lastWatermark = previous;
-                _stateStore?.SetCursorWatermark(_cursorStateKey, previous);
+                TryPersistWatermark(previous);
                 _pendingSweepWatermark = null;
                 _hasPendingSweepCommit = false;
                 _logger?.LogInformation(
@@ -325,7 +352,7 @@ public class RustCrateVersionSource : IUpdateCandidateSource, ICandidateSweepCur
         if (_hasPendingSweepCommit)
         {
             _lastWatermark = _pendingSweepWatermark;
-            _stateStore?.SetCursorWatermark(_cursorStateKey, _pendingSweepWatermark);
+            TryPersistWatermark(_pendingSweepWatermark);
             _logger?.LogInformation(
                 "Rust crates poller committed sweep watermark={Watermark}",
                 _pendingSweepWatermark ?? "<start>");
@@ -333,6 +360,18 @@ public class RustCrateVersionSource : IUpdateCandidateSource, ICandidateSweepCur
 
         _pendingSweepWatermark = null;
         _hasPendingSweepCommit = false;
+    }
+
+    private void TryPersistWatermark(string? watermark)
+    {
+        try
+        {
+            _stateStore?.SetCursorWatermark(_cursorStateKey, watermark);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Failed to persist Rust crates cursor watermark '{Watermark}'", watermark ?? "<start>");
+        }
     }
 
     private static int IndexOfName(IReadOnlyList<string> names, string name)

@@ -35,10 +35,12 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
     private readonly ILogger<GitHubWebhookProcessor>? _logger;
     private readonly BotDetectionOptions _botOptions;
     private readonly AbiComplianceOptions _abiOptions;
+    private readonly PackageUpdateOptions _packageUpdateOptions;
     private readonly IArtifactService? _artifactService;
     private readonly IAbiDiffService? _abiDiffService;
     private readonly IFileContentCache? _fileCache;
     private readonly TimeProvider _timeProvider;
+    private readonly IBotIdentityProvider? _botIdentity;
     private readonly object _deliveryLock = new();
     private readonly Dictionary<string, DateTimeOffset> _seenDeliveries = new(StringComparer.OrdinalIgnoreCase);
 
@@ -54,7 +56,9 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         IAbiDiffService? abiDiffService = null,
         IFileContentCache? fileCache = null,
         IOptions<AbiComplianceOptions>? abiOptions = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IBotIdentityProvider? botIdentity = null,
+        IOptions<PackageUpdateOptions>? packageUpdateOptions = null)
     {
         _github = github;
         _config = config;
@@ -68,10 +72,14 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         _abiOptions = abiOptions?.Value
             ?? config.GetSection("AbiCompliance").Get<AbiComplianceOptions>()
             ?? new AbiComplianceOptions();
+        _packageUpdateOptions = packageUpdateOptions?.Value
+            ?? config.GetSection("PackageUpdate").Get<PackageUpdateOptions>()
+            ?? new PackageUpdateOptions();
         _artifactService = artifactService;
         _abiDiffService = abiDiffService;
         _fileCache = fileCache;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _botIdentity = botIdentity ?? github as IBotIdentityProvider;
     }
 
     /// <summary>
@@ -202,7 +210,8 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
                     var senderLogin = issueCommentEvent.Sender!.Login ?? string.Empty;
                     var senderType = issueCommentEvent.Sender.Type?.ToString();
 
-                    if (!BotDetectionHelper.IsBot(senderLogin, senderType, _botOptions.Whitelist))
+                    if (!BotDetectionHelper.IsBot(senderLogin, senderType, _botOptions.Whitelist) &&
+                        !await BotCommitOwnership.IsOwnBotLoginAsync(_botIdentity, senderLogin, _packageUpdateOptions.BotLogin, cancellationToken))
                     {
                         using (await _lockManager.AcquireLockAsync(issueOwner, issueRepo, (int)issueCommentEvent.Issue.Number, cancellationToken))
                         {
