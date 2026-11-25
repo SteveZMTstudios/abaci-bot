@@ -209,8 +209,8 @@ public class GitHubSpecCatalogTests
 
         var gitHubMock = Substitute.For<IGitHubService>();
         var archiveGateway = Substitute.For<IRepositoryArchiveGateway>();
-        archiveGateway.GetRepositoryTarballAsync("5teve2NT", "openRuyi", "main", Arg.Any<CancellationToken>())
-            .Returns(tarballBytes);
+        archiveGateway.OpenRepositoryTarballStreamAsync("5teve2NT", "openRuyi", "main", Arg.Any<long>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult<Stream?>(new MemoryStream(tarballBytes, writable: false)));
 
         var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
         {
@@ -228,7 +228,7 @@ public class GitHubSpecCatalogTests
         Assert.NotNull(sampledSpec);
         Assert.Contains("Name: pkg-5810", sampledSpec!.Content, StringComparison.Ordinal);
 
-        await archiveGateway.Received(1).GetRepositoryTarballAsync("5teve2NT", "openRuyi", "main", Arg.Any<CancellationToken>());
+        await archiveGateway.Received(1).OpenRepositoryTarballStreamAsync("5teve2NT", "openRuyi", "main", Arg.Any<long>(), Arg.Any<CancellationToken>());
         await gitHubMock.DidNotReceive().GetTreeRecursiveAsync(
             Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
         await gitHubMock.DidNotReceive().GetFileContentAsync(
@@ -240,8 +240,8 @@ public class GitHubSpecCatalogTests
     {
         var gitHubMock = Substitute.For<IGitHubService>();
         var archiveGateway = Substitute.For<IRepositoryArchiveGateway>();
-        archiveGateway.GetRepositoryTarballAsync("owner", "repo", "main", Arg.Any<CancellationToken>())
-            .Returns<Task<byte[]?>>(_ => throw new HttpRequestException("tarball download failed"));
+        archiveGateway.OpenRepositoryTarballStreamAsync("owner", "repo", "main", Arg.Any<long>(), Arg.Any<CancellationToken>())
+            .Returns<Task<Stream?>>(_ => throw new HttpRequestException("tarball download failed"));
 
         var treeItem = (TreeItem)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TreeItem));
         typeof(TreeItem).GetProperty(nameof(TreeItem.Type))?.SetValue(treeItem, new StringEnum<TreeType>(TreeType.Blob));
@@ -271,18 +271,23 @@ public class GitHubSpecCatalogTests
     }
 
     [Fact]
-    public async Task TarballCatalog_WhenArchiveExceedsMaxArchiveBytes_FallsBackToGitTree()
+    public async Task TarballCatalog_WhenArchiveExceedsMaxArchiveBytes_AbortsStreamAndFallsBackToGitTree()
     {
+        var rng = new Random(42);
+        var incompressible = new byte[128 * 1024];
+        rng.NextBytes(incompressible);
         var oversizedTarball = BuildTarGz(new[]
         {
-            ("owner-repo-sha/SPECS/zlib/zlib.spec", "Name: zlib\nVersion: 1.3.1\n")
+            ("owner-repo-sha/SPECS/zlib/zlib.spec", $"Name: zlib\nVersion: 1.3.1\n# {Convert.ToBase64String(incompressible)}\n")
         });
-        Assert.True(oversizedTarball.Length > 10);
+        Assert.True(oversizedTarball.Length > 100_000);
+
+        using var trackingStream = new TrackingMemoryStream(oversizedTarball);
 
         var gitHubMock = Substitute.For<IGitHubService>();
         var archiveGateway = Substitute.For<IRepositoryArchiveGateway>();
-        archiveGateway.GetRepositoryTarballAsync("owner", "repo", "main", Arg.Any<CancellationToken>())
-            .Returns(oversizedTarball);
+        archiveGateway.OpenRepositoryTarballStreamAsync("owner", "repo", "main", 1024L, Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult<Stream?>(trackingStream));
 
         var treeItem = (TreeItem)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TreeItem));
         typeof(TreeItem).GetProperty(nameof(TreeItem.Type))?.SetValue(treeItem, new StringEnum<TreeType>(TreeType.Blob));
@@ -299,7 +304,7 @@ public class GitHubSpecCatalogTests
         var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
         {
             TargetRepository = "owner/repo",
-            MaxArchiveBytes = 10
+            MaxArchiveBytes = 1024
         });
 
         using var catalog = new GitHubSpecCatalog(gitHubMock, options, archiveGateway: archiveGateway);
@@ -307,9 +312,73 @@ public class GitHubSpecCatalogTests
 
         Assert.NotNull(spec);
         Assert.Contains("1.3.1", spec!.Content, StringComparison.Ordinal);
-        await archiveGateway.Received(1).GetRepositoryTarballAsync("owner", "repo", "main", Arg.Any<CancellationToken>());
+        Assert.InRange(trackingStream.TotalRead, 1025, 4096);
+        await archiveGateway.Received(1).OpenRepositoryTarballStreamAsync("owner", "repo", "main", 1024L, Arg.Any<CancellationToken>());
         await gitHubMock.Received(1).GetTreeRecursiveAsync("owner", "repo", "main", Arg.Any<CancellationToken>());
         await gitHubMock.Received(1).GetFileContentAsync("owner", "repo", "SPECS/zlib/zlib.spec", "main", Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task TarballCatalog_WhenDecompressedSpecExceedsSingleOrTotalCaps_FallsBackToGitTree()
+    {
+        var treeItem = (TreeItem)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TreeItem));
+        typeof(TreeItem).GetProperty(nameof(TreeItem.Type))?.SetValue(treeItem, new StringEnum<TreeType>(TreeType.Blob));
+        typeof(TreeItem).GetProperty(nameof(TreeItem.Path))?.SetValue(treeItem, "SPECS/zlib/zlib.spec");
+
+        var treeResponse = (TreeResponse)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TreeResponse));
+        typeof(TreeResponse).GetProperty(nameof(TreeResponse.Tree))?.SetValue(treeResponse, new List<TreeItem> { treeItem });
+
+        // 1. Highly compressible single spec exceeding per-entry cap (compressed bytes stay tiny)
+        var bombSpec = "Name: huge\nVersion: 1.0.0\n" + new string('#', 8192);
+        var singleBombTarGz = BuildTarGz(new[]
+        {
+            ("owner-repo-sha/SPECS/huge/huge.spec", bombSpec)
+        });
+        Assert.True(singleBombTarGz.Length < 1024);
+
+        var gitHub1 = Substitute.For<IGitHubService>();
+        gitHub1.GetTreeRecursiveAsync("owner", "repo", "main", Arg.Any<CancellationToken>()).Returns(treeResponse);
+        gitHub1.GetFileContentAsync("owner", "repo", "SPECS/zlib/zlib.spec", "main", Arg.Any<CancellationToken>())
+            .Returns("Name: zlib\nVersion: 1.3.1\n");
+        var gw1 = Substitute.For<IRepositoryArchiveGateway>();
+        gw1.OpenRepositoryTarballStreamAsync("owner", "repo", "main", Arg.Any<long>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult<Stream?>(new MemoryStream(singleBombTarGz, writable: false)));
+
+        var opts = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            TargetRepository = "owner/repo",
+            MaxArchiveBytes = 1024 * 1024
+        });
+
+        using (var catalog1 = new GitHubSpecCatalog(gitHub1, opts, null, null, gw1, maxSpecEntryBytes: 2048, maxTotalSpecBytes: 1024 * 1024))
+        {
+            var fallbackSpec = await catalog1.GetSpecAsync("zlib");
+            Assert.NotNull(fallbackSpec);
+            await gitHub1.Received(1).GetTreeRecursiveAsync("owner", "repo", "main", Arg.Any<CancellationToken>());
+        }
+
+        // 2. Cumulative specs exceeding total cap across small compliant entries
+        var pad1k = "Name: p\nVersion: 1.0\n" + new string('#', 1000);
+        var cumulativeTarGz = BuildTarGz(new[]
+        {
+            ("owner-repo-sha/SPECS/p1/p1.spec", pad1k),
+            ("owner-repo-sha/SPECS/p2/p2.spec", pad1k),
+            ("owner-repo-sha/SPECS/p3/p3.spec", pad1k),
+            ("owner-repo-sha/SPECS/p4/p4.spec", pad1k)
+        });
+
+        var gitHub2 = Substitute.For<IGitHubService>();
+        gitHub2.GetTreeRecursiveAsync("owner", "repo", "main", Arg.Any<CancellationToken>()).Returns(treeResponse);
+        gitHub2.GetFileContentAsync("owner", "repo", "SPECS/zlib/zlib.spec", "main", Arg.Any<CancellationToken>())
+            .Returns("Name: zlib\nVersion: 1.3.1\n");
+        var gw2 = Substitute.For<IRepositoryArchiveGateway>();
+        gw2.OpenRepositoryTarballStreamAsync("owner", "repo", "main", Arg.Any<long>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult<Stream?>(new MemoryStream(cumulativeTarGz, writable: false)));
+
+        using var catalog2 = new GitHubSpecCatalog(gitHub2, opts, null, null, gw2, maxSpecEntryBytes: 2048, maxTotalSpecBytes: 3000);
+        var fallbackSpec2 = await catalog2.GetSpecAsync("zlib");
+        Assert.NotNull(fallbackSpec2);
+        await gitHub2.Received(1).GetTreeRecursiveAsync("owner", "repo", "main", Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -317,8 +386,8 @@ public class GitHubSpecCatalogTests
     {
         var gitHubMock = Substitute.For<IGitHubService>();
         var archiveGateway = Substitute.For<IRepositoryArchiveGateway>();
-        archiveGateway.GetRepositoryTarballAsync("owner", "repo", "main", Arg.Any<CancellationToken>())
-            .Returns<Task<byte[]?>>(_ => throw new HttpRequestException("tarball unavailable"));
+        archiveGateway.OpenRepositoryTarballStreamAsync("owner", "repo", "main", Arg.Any<long>(), Arg.Any<CancellationToken>())
+            .Returns<Task<Stream?>>(_ => throw new HttpRequestException("tarball unavailable"));
         gitHubMock.GetTreeRecursiveAsync("owner", "repo", "main", Arg.Any<CancellationToken>())
             .Returns<Task<TreeResponse?>>(_ => throw new HttpRequestException("tree API unavailable"));
 
@@ -335,8 +404,39 @@ public class GitHubSpecCatalogTests
         }
 
         // Backoff prevents 5 consecutive failed refreshes from hammering tarball/tree endpoints
-        await archiveGateway.Received(1).GetRepositoryTarballAsync("owner", "repo", "main", Arg.Any<CancellationToken>());
+        await archiveGateway.Received(1).OpenRepositoryTarballStreamAsync("owner", "repo", "main", Arg.Any<long>(), Arg.Any<CancellationToken>());
         await gitHubMock.Received(1).GetTreeRecursiveAsync("owner", "repo", "main", Arg.Any<CancellationToken>());
+    }
+
+    private sealed class TrackingMemoryStream : MemoryStream
+    {
+        public long TotalRead { get; private set; }
+
+        public TrackingMemoryStream(byte[] buffer)
+            : base(buffer, writable: false)
+        {
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var n = base.Read(buffer, offset, count);
+            TotalRead += n;
+            return n;
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            var n = base.Read(buffer);
+            TotalRead += n;
+            return n;
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var n = await base.ReadAsync(buffer, cancellationToken);
+            TotalRead += n;
+            return n;
+        }
     }
 
     private static byte[] BuildTarGz(IEnumerable<(string Path, string Content)> entries)

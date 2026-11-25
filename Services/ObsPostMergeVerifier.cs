@@ -118,14 +118,13 @@ public class ObsPostMergeVerifier
             if (ct.IsCancellationRequested)
                 break;
 
-            if (!string.IsNullOrWhiteSpace(pr.User?.Login) &&
-                (ownBotLogins == null ||
-                 ownBotLogins.Count == 0 ||
-                 !BotCommitOwnership.IsOwnBotLogin(pr.User.Login, ownBotLogins)))
+            if (ownBotLogins == null ||
+                ownBotLogins.Count == 0 ||
+                !BotCommitOwnership.IsOwnBotLogin(pr.User?.Login, ownBotLogins))
             {
                 _logger?.LogDebug(
                     "Ignoring merged PR #{PrNumber} authored by '{Author}' (own bot logins resolved={ResolvedCount}) during post-merge OBS verification",
-                    pr.Number, pr.User.Login, ownBotLogins?.Count ?? 0);
+                    pr.Number, pr.User?.Login ?? "unknown", ownBotLogins?.Count ?? 0);
                 continue;
             }
 
@@ -140,7 +139,7 @@ public class ObsPostMergeVerifier
                 var mergeSha = pr.MergeCommitSha;
                 if (string.IsNullOrWhiteSpace(mergeSha))
                 {
-                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ct);
+                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ownBotLogins, ct);
                     continue;
                 }
 
@@ -150,7 +149,7 @@ public class ObsPostMergeVerifier
                 if (string.IsNullOrEmpty(serviceRevision))
                 {
                     _logger?.LogDebug("OBS _service not found or no revision for {Package}", packageName);
-                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ct);
+                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ownBotLogins, ct);
                     continue;
                 }
 
@@ -183,7 +182,7 @@ public class ObsPostMergeVerifier
                             serviceRevision, mergeSha, packageName);
                     }
 
-                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ct);
+                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ownBotLogins, ct);
                     continue;
                 }
 
@@ -196,14 +195,14 @@ public class ObsPostMergeVerifier
 
                 if (buildResult.Code == ObsStatusCode.Succeeded)
                 {
-                    var isFreshSuccess = await VerifyObsSuccessIsFreshAsync(buildResult, pr.MergedAt, ct);
+                    var isFreshSuccess = await VerifyObsTerminalResultIsFreshAsync(buildResult, pr.MergedAt, ct);
                     if (!isFreshSuccess)
                     {
                         _logger?.LogInformation(
                             "OBS _result reported Succeeded for merged PR #{PrNumber} ({Package}), but build is dirty or not yet confirmed after merge; waiting for fresh job",
                             pr.Number, packageName);
                         handledPackages.Add(packageName);
-                        await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ct);
+                        await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ownBotLogins, ct);
                         continue;
                     }
 
@@ -224,7 +223,7 @@ public class ObsPostMergeVerifier
                             }
                         }
 
-                        await TryReclaimMergedBranchAsync(owner, repo, pr, "after successful OBS build verification", ct);
+                        await TryReclaimMergedBranchAsync(owner, repo, pr, "after successful OBS build verification", ownBotLogins, ct);
 
                         (loadedOpenBlockedIssues, openBlockedByPackage, isBlockedIndexTruncated) = await EnsureOpenBlockedIndexLoadedAsync(
                             owner, repo, loadedOpenBlockedIssues, openBlockedByPackage, isBlockedIndexTruncated, ct);
@@ -241,6 +240,20 @@ public class ObsPostMergeVerifier
                 }
                 else
                 {
+                    if (buildResult.Code is ObsStatusCode.Failed or ObsStatusCode.Unresolvable or ObsStatusCode.Broken)
+                    {
+                        var isFreshFailure = await VerifyObsTerminalResultIsFreshAsync(buildResult, pr.MergedAt, ct);
+                        if (!isFreshFailure)
+                        {
+                            _logger?.LogInformation(
+                                "OBS _result reported {Status} for merged PR #{PrNumber} ({Package}), but result is dirty or not yet confirmed fresh after merge; deferring decision",
+                                buildResult.Code, pr.Number, packageName);
+                            handledPackages.Add(packageName);
+                            await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ownBotLogins, ct);
+                            continue;
+                        }
+                    }
+
                     handledPackages.Add(packageName);
                     if (_options.Obs.RequireObsSuccessAfterMerge &&
                         buildResult.Code is ObsStatusCode.Failed or ObsStatusCode.Unresolvable or ObsStatusCode.Broken)
@@ -274,7 +287,7 @@ public class ObsPostMergeVerifier
                     }
 
                     // If PR has been merged past TTL, reclaim branch even if OBS build failed/remained unresolved
-                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ct);
+                    await TryReclaimIfPastMergedTtlAsync(owner, repo, pr, ownBotLogins, ct);
                 }
 
                 var obsEndpoint = FormatObsPublicEndpoint(_options.Obs.BaseUrl);
@@ -353,6 +366,7 @@ public class ObsPostMergeVerifier
                 loadedOpenBlockedIssues,
                 openBlockedByPackage,
                 isBlockedIndexTruncated,
+                ownBotLogins,
                 ct);
         }
     }
@@ -364,6 +378,7 @@ public class ObsPostMergeVerifier
         bool loadedOpenBlockedIssues,
         Dictionary<string, Issue>? openBlockedByPackage,
         bool isBlockedIndexTruncated,
+        IReadOnlySet<string>? ownBotLogins,
         CancellationToken ct)
     {
         if (!_options.DryRun)
@@ -401,7 +416,7 @@ public class ObsPostMergeVerifier
                             !_options.DryRun)
                         {
                             TryClearObsBlockCooldown(owner, repo, packageName);
-                            await TryReclaimBranchFromBlockedIssueAsync(owner, repo, openIssue, "after main branch upgrade past failed OBS build", ct);
+                            await TryReclaimBranchFromBlockedIssueAsync(owner, repo, openIssue, "after main branch upgrade past failed OBS build", ownBotLogins, ct);
                         }
                         continue;
                     }
@@ -426,7 +441,8 @@ public class ObsPostMergeVerifier
             }
 
             DateTimeOffset? blockedSince = openIssue.CreatedAt != default ? openIssue.CreatedAt : null;
-            if (await VerifyObsSuccessIsFreshAsync(buildResult, blockedSince, ct))
+            if (buildResult.Code == ObsStatusCode.Succeeded &&
+                await VerifyObsTerminalResultIsFreshAsync(buildResult, blockedSince, ct))
             {
                 var obsComment = $"OBS build verification succeeded on subsequent check (`{buildResult.Project}` {buildResult.Repository}/{buildResult.Arch}). " +
                                  $"Closing tracking issue and resuming automated updates for `{packageName}`.";
@@ -434,18 +450,25 @@ public class ObsPostMergeVerifier
                     !_options.DryRun)
                 {
                     TryClearObsBlockCooldown(owner, repo, packageName);
-                    await TryReclaimBranchFromBlockedIssueAsync(owner, repo, openIssue, "after delayed OBS build recovery", ct);
+                    await TryReclaimBranchFromBlockedIssueAsync(owner, repo, openIssue, "after delayed OBS build recovery", ownBotLogins, ct);
                 }
             }
         }
     }
 
-    private async Task<bool> VerifyObsSuccessIsFreshAsync(
+    private async Task<bool> VerifyObsTerminalResultIsFreshAsync(
         ObsPackageBuildResult buildResult,
         DateTimeOffset? referenceTime,
         CancellationToken ct)
     {
-        if (buildResult.Code != ObsStatusCode.Succeeded || buildResult.IsDirty)
+        if (buildResult.IsDirty)
+        {
+            return false;
+        }
+
+        var isJobBacked = buildResult.Code is ObsStatusCode.Succeeded or ObsStatusCode.Failed;
+        var isPreJobFailure = buildResult.Code is ObsStatusCode.Unresolvable or ObsStatusCode.Broken;
+        if (!isJobBacked && !isPreJobFailure)
         {
             return false;
         }
@@ -471,38 +494,82 @@ public class ObsPostMergeVerifier
             return false;
         }
 
-        if (freshness == null || !freshness.IsServiceReady)
+        if (freshness == null)
         {
             return false;
         }
 
-        if (string.IsNullOrWhiteSpace(freshness.SourceMd5) ||
-            string.IsNullOrWhiteSpace(freshness.LatestJobSrcMd5) ||
-            !string.Equals(freshness.SourceMd5, freshness.LatestJobSrcMd5, StringComparison.OrdinalIgnoreCase) ||
-            freshness.LatestJobCode != ObsStatusCode.Succeeded)
+        if (isJobBacked)
         {
-            return false;
+            if (!freshness.IsServiceReady ||
+                string.IsNullOrWhiteSpace(freshness.SourceMd5) ||
+                string.IsNullOrWhiteSpace(freshness.LatestJobSrcMd5) ||
+                !string.Equals(freshness.SourceMd5, freshness.LatestJobSrcMd5, StringComparison.OrdinalIgnoreCase) ||
+                freshness.LatestJobCode != buildResult.Code)
+            {
+                return false;
+            }
+
+            if (referenceTime.HasValue &&
+                (!freshness.LatestJobStartTime.HasValue ||
+                 freshness.LatestJobStartTime.Value < referenceTime.Value.AddMinutes(-2)))
+            {
+                return false;
+            }
+
+            return true;
         }
 
-        if (referenceTime.HasValue)
+        // Pre-job terminal failure states (Unresolvable / Broken) do not dispatch worker jobs to _jobhistory.
+        var isBrokenServiceFailure = buildResult.Code == ObsStatusCode.Broken &&
+                                     string.Equals(freshness.ServiceCode, "failed", StringComparison.OrdinalIgnoreCase);
+        if (!isBrokenServiceFailure)
         {
-            if (!freshness.LatestJobStartTime.HasValue ||
+            if (!freshness.IsServiceReady || string.IsNullOrWhiteSpace(freshness.SourceMd5))
+            {
+                return false;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(freshness.SourceMd5) &&
+            !string.IsNullOrWhiteSpace(freshness.LatestJobSrcMd5) &&
+            string.Equals(freshness.SourceMd5, freshness.LatestJobSrcMd5, StringComparison.OrdinalIgnoreCase))
+        {
+            if (freshness.LatestJobCode == ObsStatusCode.Succeeded)
+            {
+                return false;
+            }
+
+            if (referenceTime.HasValue &&
+                freshness.LatestJobStartTime.HasValue &&
                 freshness.LatestJobStartTime.Value < referenceTime.Value.AddMinutes(-2))
             {
                 return false;
             }
         }
 
+        if (referenceTime.HasValue &&
+            (!freshness.LatestSourceMtime.HasValue ||
+             freshness.LatestSourceMtime.Value < referenceTime.Value.AddMinutes(-2)))
+        {
+            return false;
+        }
+
         return true;
     }
 
-    private async Task TryReclaimIfPastMergedTtlAsync(string owner, string repo, PullRequest pr, CancellationToken ct)
+    private async Task TryReclaimIfPastMergedTtlAsync(
+        string owner,
+        string repo,
+        PullRequest pr,
+        IReadOnlySet<string>? ownBotLogins,
+        CancellationToken ct)
     {
         var ttlDays = Math.Clamp(_options.FailedPrTtlDays, 1, 363);
         if (!_options.DryRun && pr.MergedAt.HasValue &&
             pr.MergedAt.Value < DateTimeOffset.UtcNow.AddDays(-ttlDays))
         {
-            await TryReclaimMergedBranchAsync(owner, repo, pr, "after reaching merged TTL", ct);
+            await TryReclaimMergedBranchAsync(owner, repo, pr, "after reaching merged TTL", ownBotLogins, ct);
         }
     }
 
@@ -575,44 +642,78 @@ public class ObsPostMergeVerifier
                mergeSha.StartsWith(serviceRevision, StringComparison.OrdinalIgnoreCase);
     }
 
-    private async Task TryReclaimMergedBranchAsync(string owner, string repo, PullRequest pr, string reason, CancellationToken ct)
+    private async Task TryReclaimMergedBranchAsync(
+        string owner,
+        string repo,
+        PullRequest pr,
+        string reason,
+        IReadOnlySet<string>? ownBotLogins,
+        CancellationToken ct)
     {
         var branchName = pr.Head?.Ref;
         var headRepo = pr.Head?.Repository?.FullName;
         var isSameRepo = headRepo != null && string.Equals(headRepo, $"{owner}/{repo}", StringComparison.OrdinalIgnoreCase);
         var prefix = !string.IsNullOrEmpty(_options.BranchPrefix) ? _options.BranchPrefix : "autoupdate/";
 
-        if (isSameRepo && !string.IsNullOrWhiteSpace(branchName) && branchName.StartsWith(prefix, StringComparison.Ordinal))
+        if (!isSameRepo || string.IsNullOrWhiteSpace(branchName) || !branchName.StartsWith(prefix, StringComparison.Ordinal))
         {
-            try
-            {
-                // 1. Check whether a newer open PR is already reusing this branch
-                var openPr = await _gitHubService.FindOpenPullRequestByHeadAsync(owner, repo, branchName, ct);
-                if (openPr != null)
-                {
-                    _logger?.LogDebug("Skipping branch {Branch} deletion: active open PR #{OpenPr} is currently reusing it", branchName, openPr.Number);
-                    return;
-                }
+            return;
+        }
 
-                // 2. Check whether the branch reference has moved forward past the merged PR's head SHA (fail-closed on missing SHA)
-                var currentSha = await _gitHubService.GetRefShaAsync(owner, repo, branchName, ct);
-                if (string.IsNullOrWhiteSpace(pr.Head?.Sha) ||
-                    string.IsNullOrWhiteSpace(currentSha) ||
-                    !string.Equals(currentSha, pr.Head.Sha, StringComparison.Ordinal))
-                {
-                    _logger?.LogDebug("Skipping branch {Branch} deletion: branch head is missing or has moved (current: {CurrentSha}, merged PR: {PrSha})",
-                        branchName, currentSha ?? "<null>", pr.Head?.Sha ?? "<null>");
-                    return;
-                }
+        try
+        {
+            ownBotLogins ??= await BotCommitOwnership.ResolveOwnBotLoginsAsync(
+                _botIdentity,
+                _options.BotLogin,
+                requireLiveWhenProviderPresent: true,
+                ct);
 
-                await _gitHubService.DeleteRefAsync(owner, repo, branchName, ct);
-                _logger?.LogInformation("Reclaimed merged branch {Branch} for PR #{PrNumber} {Reason}",
-                    branchName, pr.Number, reason);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            if (ownBotLogins.Count == 0 || !BotCommitOwnership.IsOwnBotLogin(pr.User?.Login, ownBotLogins))
             {
-                _logger?.LogDebug(ex, "Failed to reclaim merged branch {Branch} for PR #{PrNumber}", branchName, pr.Number);
+                _logger?.LogWarning(
+                    "Skipping branch {Branch} deletion for PR #{PrNumber}: PR author '{Author}' failed bot ownership check",
+                    branchName, pr.Number, pr.User?.Login ?? "unknown");
+                return;
             }
+
+            // 1. Check whether a newer open PR is already reusing this branch
+            var openPr = await _gitHubService.FindOpenPullRequestByHeadAsync(owner, repo, branchName, ct);
+            if (openPr != null)
+            {
+                _logger?.LogDebug("Skipping branch {Branch} deletion: active open PR #{OpenPr} is currently reusing it", branchName, openPr.Number);
+                return;
+            }
+
+            // 2. Check whether the branch reference has moved forward past the merged PR's head SHA (fail-closed on missing SHA)
+            var currentSha = await _gitHubService.GetRefShaAsync(owner, repo, branchName, ct);
+            if (string.IsNullOrWhiteSpace(pr.Head?.Sha) ||
+                string.IsNullOrWhiteSpace(currentSha) ||
+                !string.Equals(currentSha, pr.Head.Sha, StringComparison.Ordinal))
+            {
+                _logger?.LogDebug("Skipping branch {Branch} deletion: branch head is missing or has moved (current: {CurrentSha}, merged PR: {PrSha})",
+                    branchName, currentSha ?? "<null>", pr.Head?.Sha ?? "<null>");
+                return;
+            }
+
+            // 3. Defense-in-depth AND check: verify branch tip commit itself belongs to the bot (protects bot PRs carrying human commits)
+            var latestCommit = await _gitHubService.GetBranchLatestCommitAsync(owner, repo, branchName, ct);
+            if (latestCommit == null ||
+                !string.Equals(latestCommit.Sha, pr.Head.Sha, StringComparison.OrdinalIgnoreCase) ||
+                !BotCommitOwnership.IsOwnBotCommit(latestCommit, ownBotLogins))
+            {
+                _logger?.LogWarning(
+                    "Skipping branch {Branch} deletion for PR #{PrNumber}: latest commit ownership verification failed (author={Author}, committer={Committer})",
+                    branchName, pr.Number, latestCommit?.AuthorLogin ?? "unknown", latestCommit?.CommitterLogin ?? "unknown");
+                return;
+            }
+
+            await _gitHubService.DeleteRefAsync(owner, repo, branchName, ct);
+            _logger?.LogInformation("Reclaimed merged branch {Branch} for PR #{PrNumber} {Reason}",
+                branchName, pr.Number, reason);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogDebug(ex, "Failed to reclaim merged branch {Branch} for PR #{PrNumber}", branchName, pr.Number);
         }
     }
 
@@ -798,6 +899,7 @@ public class ObsPostMergeVerifier
         string repo,
         Issue blockedIssue,
         string reason,
+        IReadOnlySet<string>? ownBotLogins,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(blockedIssue.Body))
@@ -822,7 +924,7 @@ public class ObsPostMergeVerifier
             var mergedPr = await _gitHubService.GetPullRequestAsync(owner, repo, prNumber, ct);
             if (mergedPr != null)
             {
-                await TryReclaimMergedBranchAsync(owner, repo, mergedPr, reason, ct);
+                await TryReclaimMergedBranchAsync(owner, repo, mergedPr, reason, ownBotLogins, ct);
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

@@ -7,8 +7,14 @@ namespace abaci_bot.Services;
 public interface IRepositoryArchiveGateway
 {
     /// <summary>
-    /// Downloads the gzipped tarball snapshot for <paramref name="owner"/>/<paramref name="repo"/> at <paramref name="reference"/>.
-    /// Returns <see langword="null"/> if the archive cannot be retrieved.
+    /// Opens a streaming gzipped tarball snapshot for <paramref name="owner"/>/<paramref name="repo"/> at <paramref name="reference"/>.
+    /// Enforces <paramref name="maxArchiveBytes"/> during download when positive, rejecting oversized responses before full buffering.
+    /// Returns <see langword="null"/> if the archive cannot be retrieved or violates size limits prior to body consumption.
     /// </summary>
-    Task<byte[]?> GetRepositoryTarballAsync(string owner, string repo, string reference, CancellationToken ct = default);
+    Task<Stream?> OpenRepositoryTarballStreamAsync(
+        string owner,
+        string repo,
+        string reference,
+        long maxArchiveBytes = 0,
+        CancellationToken ct = default);
 }

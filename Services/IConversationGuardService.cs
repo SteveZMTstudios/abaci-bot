@@ -8,7 +8,7 @@ namespace abaci_bot.Services;
 public interface IConversationGuardService
 {
     /// <summary>
-    /// Processes a conversation guard command (/lock, /unlock, /hide, /archive) from an issue comment.
+    /// Processes a conversation guard command (<c>@&lt;bot&gt; lock</c>, <c>@&lt;bot&gt; unlock</c>, <c>@&lt;bot&gt; hide @user</c>, <c>@&lt;bot&gt; archive</c>) from an issue comment.
     /// </summary>
     Task HandleCommandAsync(
         PullRequestContext context,

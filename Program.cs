@@ -69,6 +69,7 @@ builder.Services.AddSingleton(sp => new GitHubService(
 ));
 builder.Services.AddSingleton<IGitHubService>(sp => sp.GetRequiredService<GitHubService>());
 builder.Services.AddSingleton<IRepositoryPermissionService>(sp => sp.GetRequiredService<GitHubService>());
+builder.Services.AddSingleton<IPackageUpdatePermissionProbeGateway>(sp => sp.GetRequiredService<GitHubService>());
 builder.Services.AddSingleton<IBotIdentityProvider>(sp => sp.GetRequiredService<GitHubService>());
 builder.Services.AddSingleton<IEphemeralCommentGateway>(sp => sp.GetRequiredService<GitHubService>());
 builder.Services.AddSingleton<IRepositoryArchiveGateway>(sp => sp.GetRequiredService<GitHubService>());
@@ -184,6 +185,7 @@ builder.Services.AddSingleton<IPullRequestModule, BotControlPlaneModule>();
 // Register background lifecycle services
 builder.Services.AddHostedService<AbiEngineProbe>();
 builder.Services.AddHostedService<ConversationGuardPermissionProbe>();
+builder.Services.AddHostedService<PackageUpdatePermissionProbe>();
 builder.Services.AddHostedService<StaleLifecycleService>();
 builder.Services.AddHostedService<RebuildMetadataRefreshService>();
 builder.Services.AddHostedService<SpdxMetadataRefreshService>();

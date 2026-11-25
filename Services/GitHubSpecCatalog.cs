@@ -16,10 +16,15 @@ namespace abaci_bot.Services;
 /// </summary>
 public class GitHubSpecCatalog : ISpecCatalog, IDisposable
 {
+    internal const long DefaultMaxSpecEntryBytes = 4L * 1024 * 1024;
+    internal const long DefaultMaxTotalSpecBytes = 256L * 1024 * 1024;
+
     private readonly IGitHubService _gitHubService;
     private readonly IRepositoryArchiveGateway? _archiveGateway;
     private readonly IOptions<PackageUpdateOptions> _options;
     private readonly ILogger<GitHubSpecCatalog>? _logger;
+    private readonly long _maxSpecEntryBytes;
+    private readonly long _maxTotalSpecBytes;
 
     private readonly ConcurrentDictionary<string, (SpecContext Context, DateTimeOffset Expiry)> _specCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _specPathMap = new(StringComparer.OrdinalIgnoreCase);
@@ -37,12 +42,33 @@ public class GitHubSpecCatalog : ISpecCatalog, IDisposable
         ILogger<GitHubSpecCatalog>? logger = null,
         IFileContentCache? fileCache = null,
         IRepositoryArchiveGateway? archiveGateway = null)
+        : this(
+            gitHubService,
+            options,
+            logger,
+            fileCache,
+            archiveGateway,
+            DefaultMaxSpecEntryBytes,
+            DefaultMaxTotalSpecBytes)
+    {
+    }
+
+    internal GitHubSpecCatalog(
+        IGitHubService gitHubService,
+        IOptions<PackageUpdateOptions> options,
+        ILogger<GitHubSpecCatalog>? logger,
+        IFileContentCache? fileCache,
+        IRepositoryArchiveGateway? archiveGateway,
+        long maxSpecEntryBytes,
+        long maxTotalSpecBytes)
     {
         _gitHubService = gitHubService;
         _options = options;
         _logger = logger;
         _fileCache = fileCache;
         _archiveGateway = archiveGateway ?? gitHubService as IRepositoryArchiveGateway;
+        _maxSpecEntryBytes = maxSpecEntryBytes > 0 ? maxSpecEntryBytes : DefaultMaxSpecEntryBytes;
+        _maxTotalSpecBytes = maxTotalSpecBytes > 0 ? maxTotalSpecBytes : DefaultMaxTotalSpecBytes;
     }
 
     private (string Owner, string Repo) GetTargetOwnerRepo()
@@ -272,27 +298,25 @@ public class GitHubSpecCatalog : ISpecCatalog, IDisposable
 
         try
         {
-            var tarballBytes = await _archiveGateway.GetRepositoryTarballAsync(owner, repo, baseBranch, ct);
-            if (tarballBytes == null || tarballBytes.Length == 0)
+            var maxArchiveBytes = _options.Value.MaxArchiveBytes;
+            await using var rawTarballStream = await _archiveGateway.OpenRepositoryTarballStreamAsync(
+                owner, repo, baseBranch, maxArchiveBytes, ct);
+            if (rawTarballStream == null)
             {
                 return false;
             }
 
-            var maxArchiveBytes = _options.Value.MaxArchiveBytes;
-            if (maxArchiveBytes > 0 && tarballBytes.LongLength > maxArchiveBytes)
-            {
-                _logger?.LogWarning(
-                    "Repository tarball for {Owner}/{Repo}@{Branch} ({SizeBytes} bytes) exceeds MaxArchiveBytes ({LimitBytes}); falling back to Git Tree API",
-                    owner, repo, baseBranch, tarballBytes.LongLength, maxArchiveBytes);
-                return false;
-            }
+            await using var defensiveBounded = maxArchiveBytes > 0 && rawTarballStream is not BoundedReadStream
+                ? new BoundedReadStream(rawTarballStream, maxArchiveBytes, leaveOpen: true)
+                : null;
+            var compressedStream = (Stream?)defensiveBounded ?? rawTarballStream;
 
             var staged = new Dictionary<string, (string Path, SpecContext Context)>(StringComparer.OrdinalIgnoreCase);
 
-            await using var memoryStream = new MemoryStream(tarballBytes, writable: false);
-            await using var gzipStream = new GZipStream(memoryStream, CompressionMode.Decompress);
+            await using var gzipStream = new GZipStream(compressedStream, CompressionMode.Decompress);
             await using var tarReader = new TarReader(gzipStream, leaveOpen: false);
 
+            long totalSpecBytes = 0;
             while (await tarReader.GetNextEntryAsync(copyData: false, ct) is { } entry)
             {
                 if (entry.EntryType is not (TarEntryType.RegularFile or TarEntryType.V7RegularFile) ||
@@ -314,9 +338,25 @@ public class GitHubSpecCatalog : ISpecCatalog, IDisposable
                     continue;
                 }
 
+                if (entry.Length > _maxSpecEntryBytes)
+                {
+                    throw new ArchiveSizeLimitExceededException(
+                        _maxSpecEntryBytes,
+                        $"Tarball spec entry '{relativePath}' declared length {entry.Length} bytes exceeds per-spec limit {_maxSpecEntryBytes} bytes.");
+                }
+
                 var pkgName = parts[1];
-                using var reader = new StreamReader(entry.DataStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, leaveOpen: true);
+                await using var boundedEntryStream = new BoundedReadStream(entry.DataStream, _maxSpecEntryBytes, leaveOpen: true);
+                using var reader = new StreamReader(boundedEntryStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, leaveOpen: true);
                 var content = await reader.ReadToEndAsync(ct);
+
+                totalSpecBytes += boundedEntryStream.TotalBytesRead;
+                if (totalSpecBytes > _maxTotalSpecBytes)
+                {
+                    throw new ArchiveSizeLimitExceededException(
+                        _maxTotalSpecBytes,
+                        $"Total decompressed .spec content ({totalSpecBytes} bytes) exceeded limit of {_maxTotalSpecBytes} bytes.");
+                }
 
                 var fileName = parts[^1];
                 if (staged.ContainsKey(pkgName) &&
@@ -354,6 +394,14 @@ public class GitHubSpecCatalog : ISpecCatalog, IDisposable
                 "Loaded {Count} specs from single repository tarball snapshot for {Owner}/{Repo}@{Branch}",
                 staged.Count, owner, repo, baseBranch);
             return true;
+        }
+        catch (ArchiveSizeLimitExceededException ex)
+        {
+            _logger?.LogWarning(
+                ex,
+                "Repository tarball for {Owner}/{Repo}@{Branch} exceeded size limit; falling back to Git Tree API",
+                owner, repo, baseBranch);
+            return false;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {

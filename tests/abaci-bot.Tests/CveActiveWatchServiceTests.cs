@@ -812,9 +812,18 @@ public class CveActiveWatchServiceTests
         Assert.Equal("requests", pythonTarget.UpstreamName);
 
         var rpmTarget = CveActiveWatchService.TryExtractScanTargetFromSpec("curl", "Name: curl\nVersion: %{version}\n");
-        Assert.NotNull(rpmTarget);
-        Assert.Null(rpmTarget.Ecosystem);
-        Assert.Equal("%{version}", rpmTarget.Version);
+        Assert.Null(rpmTarget);
+
+        var macroFullVersionFallbackSpec = """
+            %global crate_name serde
+            %global full_version %{version}
+            Version: 1.2.3
+            """;
+        var fallbackTarget = CveActiveWatchService.TryExtractScanTargetFromSpec("rust-serde", macroFullVersionFallbackSpec);
+        Assert.NotNull(fallbackTarget);
+        Assert.Equal("1.2.3", fallbackTarget.Version);
+        Assert.Equal("crates.io", fallbackTarget.Ecosystem);
+        Assert.Equal("serde", fallbackTarget.UpstreamName);
     }
 
     [Fact]
@@ -1270,5 +1279,877 @@ public class CveActiveWatchServiceTests
         typeof(Issue).GetProperty(nameof(Issue.Body))?.SetValue(fakeIssue, body);
         Assert.True(CveActiveWatchService.TryExtractTrackedPackageName(fakeIssue, out var extracted));
         Assert.Equal("pkg|pipe", extracted);
+    }
+
+    private static bool ContainsEmoji(string text)
+    {
+        foreach (var rune in text.EnumerateRunes())
+        {
+            var cp = rune.Value;
+            if ((cp >= 0x1F300 && cp <= 0x1FAFF) ||
+                (cp >= 0x2600 && cp <= 0x27BF) ||
+                cp == 0x2139 || // U+2139 information source often paired with FE0F
+                cp == 0xFE0F)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_WhenScannerThrows_DoesNotAdvanceWatermarkAndRetriesSameSlice()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        gitHubMock.SearchStaleCandidatesAsync(
+                "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<Issue>());
+
+        var specCatalog = Substitute.For<ISpecCatalog>();
+        specCatalog.GetAllPackageNamesAsync(Arg.Any<CancellationToken>()).Returns(new[] { "pkg-a", "pkg-b", "pkg-c", "pkg-d" });
+        specCatalog.GetSpecAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(call => new SpecContext(call.Arg<string>(), call.Arg<string>(), "Version: 1.0.0\n", $"SPECS/{call.Arg<string>()}/x.spec"));
+
+        var stateStoreMock = Substitute.For<IBotStateStore>();
+        var scannedBatches = new List<List<string>>();
+        var scannerCall = 0;
+        var scannerMock = Substitute.For<IPackageVulnerabilityScanner>();
+        scannerMock.ScanPackagesAsync(Arg.Do<IEnumerable<(string Name, string Version)>>(pkgs =>
+                scannedBatches.Add(pkgs.Select(p => p.Name).ToList())), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                scannerCall++;
+                if (scannerCall == 1)
+                {
+                    throw new HttpRequestException("OSV outage");
+                }
+                return new PackageVulnerabilityScanResult(Array.Empty<PackageVulnerabilityFinding>(), new HashSet<string>());
+            });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            TargetRepository = "owner/repo",
+            PackagesPerSweep = 2
+        });
+
+        var service = new CveActiveWatchService(gitHubMock, scannerMock, options, specCatalog: specCatalog, stateStore: stateStoreMock);
+
+        await service.RunScanSweepAsync();
+        stateStoreMock.DidNotReceiveWithAnyArgs().SetCursorWatermark(default!, default);
+
+        await service.RunScanSweepAsync();
+        Assert.Equal(2, scannedBatches.Count);
+        Assert.Equal(new[] { "pkg-a", "pkg-b" }, scannedBatches[0]);
+        Assert.Equal(new[] { "pkg-a", "pkg-b" }, scannedBatches[1]);
+        stateStoreMock.Received(1).SetCursorWatermark("cve-active-watch:owner/repo", "pkg-b");
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_WhenPartialOsvFailureOccurs_RewindsWatermarkBeforeFirstFailedPackage()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        gitHubMock.SearchStaleCandidatesAsync(
+                "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<Issue>());
+
+        var stateStoreMock = Substitute.For<IBotStateStore>();
+        var scannedBatches = new List<List<string>>();
+        var sweep = 0;
+        var scannerMock = Substitute.For<ITargetedPackageVulnerabilityScanner>();
+        scannerMock.ScanTargetsAsync(Arg.Do<IEnumerable<PackageScanTarget>>(targets =>
+                scannedBatches.Add(targets.Select(t => t.PackageName).ToList())), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                sweep++;
+                if (sweep == 1)
+                {
+                    return new PackageVulnerabilityScanResult(
+                        Array.Empty<PackageVulnerabilityFinding>(),
+                        new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "pkg-a" },
+                        FailedPackages: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "pkg-b" });
+                }
+
+                return new PackageVulnerabilityScanResult(
+                    Array.Empty<PackageVulnerabilityFinding>(),
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "pkg-b", "pkg-c" });
+            });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            TargetRepository = "owner/repo",
+            PackagesPerSweep = 3
+        });
+
+        var catalog = (CancellationToken _) => Task.FromResult<IReadOnlyList<(string, string)>>(new[]
+        {
+            ("pkg-a", "1.0.0"),
+            ("pkg-b", "1.0.0"),
+            ("pkg-c", "1.0.0"),
+            ("pkg-d", "1.0.0")
+        });
+
+        var service = new CveActiveWatchService(gitHubMock, scannerMock, options, catalogProvider: catalog, stateStore: stateStoreMock);
+
+        await service.RunScanSweepAsync();
+        stateStoreMock.Received(1).SetCursorWatermark("cve-active-watch:owner/repo", "pkg-a");
+
+        await service.RunScanSweepAsync();
+        Assert.Equal(new[] { "pkg-a", "pkg-b", "pkg-c" }, scannedBatches[0]);
+        Assert.Equal(new[] { "pkg-b", "pkg-c", "pkg-d" }, scannedBatches[1]);
+        stateStoreMock.Received(1).SetCursorWatermark("cve-active-watch:owner/repo", "pkg-d");
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_AllNativeAndAllMacroSlices_AdvanceCursorCleanlyWithoutFreezing()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        gitHubMock.SearchStaleCandidatesAsync(
+                "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<Issue>());
+
+        var specCatalog = Substitute.For<ISpecCatalog>();
+        specCatalog.GetAllPackageNamesAsync(Arg.Any<CancellationToken>())
+            .Returns(new[] { "a-macro-1", "a-macro-2", "b-native-1", "b-native-2", "c-crate-1", "c-crate-2" });
+        specCatalog.GetSpecAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var name = call.Arg<string>();
+                if (name.StartsWith("a-macro", StringComparison.Ordinal))
+                {
+                    return new SpecContext(name, name, $"Name: {name}\nVersion: %{{version}}\n", $"SPECS/{name}/{name}.spec");
+                }
+                if (name.StartsWith("b-native", StringComparison.Ordinal))
+                {
+                    return new SpecContext(name, name, $"Name: {name}\nVersion: 1.2.0\n", $"SPECS/{name}/{name}.spec");
+                }
+                return new SpecContext(name, name, $"%global crate_name {name}\nVersion: 2.0.0\n", $"SPECS/{name}/{name}.spec");
+            });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            IncludeUnverifiedNativePackages = false,
+            TargetRepository = "owner/repo",
+            PackagesPerSweep = 2
+        });
+
+        // Use real PackageVulnerabilityScanner so b-native-* returns empty SuccessfullyScannedPackages + SkippedUnverified=2.
+        var httpHandler = new NopQueryBatchHandler();
+        using var scanner = new PackageVulnerabilityScanner(new HttpClient(httpHandler), Substitute.For<ICveSecurityService>(), options);
+        var stateStoreMock = Substitute.For<IBotStateStore>();
+
+        var service = new CveActiveWatchService(gitHubMock, scanner, options, specCatalog: specCatalog, stateStore: stateStoreMock);
+
+        // Sweep 1: all-macro slice -> targets empty -> still advances to a-macro-2
+        await service.RunScanSweepAsync();
+        stateStoreMock.Received(1).SetCursorWatermark("cve-active-watch:owner/repo", "a-macro-2");
+
+        // Sweep 2: all-native slice -> zero SuccessfullyScannedPackages -> still advances to b-native-2
+        await service.RunScanSweepAsync();
+        stateStoreMock.Received(1).SetCursorWatermark("cve-active-watch:owner/repo", "b-native-2");
+
+        // Sweep 3: reaches c-crate-1 and c-crate-2 cleanly
+        await service.RunScanSweepAsync();
+        stateStoreMock.Received(1).SetCursorWatermark("cve-active-watch:owner/repo", "c-crate-2");
+    }
+
+    private sealed class NopQueryBatchHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent("""{"results":[{},{"vulns":[]}]}""", System.Text.Encoding.UTF8, "application/json")
+            });
+        }
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_WhenGitHubSearchFails_BlocksCursorCommit()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        gitHubMock.SearchStaleCandidatesAsync(
+                "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns<Task<IReadOnlyList<Issue>>>(_ => throw new HttpRequestException("GitHub 502"));
+
+        var scannerMock = Substitute.For<IPackageVulnerabilityScanner>();
+        scannerMock.ScanPackagesAsync(Arg.Any<IEnumerable<(string, string)>>(), Arg.Any<CancellationToken>())
+            .Returns(new PackageVulnerabilityScanResult(
+                Array.Empty<PackageVulnerabilityFinding>(),
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "pkg-a" }));
+
+        var stateStoreMock = Substitute.For<IBotStateStore>();
+        var options = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            TargetRepository = "owner/repo",
+            PackagesPerSweep = 1
+        });
+
+        var catalog = (CancellationToken _) => Task.FromResult<IReadOnlyList<(string, string)>>(new[]
+        {
+            ("pkg-a", "1.0.0"),
+            ("pkg-b", "1.0.0")
+        });
+
+        var service = new CveActiveWatchService(gitHubMock, scannerMock, options, catalogProvider: catalog, stateStore: stateStoreMock);
+        await service.RunScanSweepAsync();
+
+        stateStoreMock.DidNotReceiveWithAnyArgs().SetCursorWatermark(default!, default);
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_RestartPersistenceAndDryRunNonPersistence_WithJsonBotStateStore()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"abaci-cve-cursor-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var botStateOptions = Microsoft.Extensions.Options.Options.Create(new BotStateOptions
+            {
+                StateDirectory = tempDir
+            });
+
+            var gitHubMock = Substitute.For<IGitHubService>();
+            gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+                .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+            gitHubMock.SearchStaleCandidatesAsync(
+                    "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(Array.Empty<Issue>());
+
+            var catalog = (CancellationToken _) => Task.FromResult<IReadOnlyList<(string, string)>>(new[]
+            {
+                ("pkg-1", "1.0"),
+                ("pkg-2", "1.0"),
+                ("pkg-3", "1.0"),
+                ("pkg-4", "1.0")
+            });
+
+            // 1. DryRun run must not persist cursor to disk
+            using (var storeDryRun = new JsonBotStateStore(botStateOptions))
+            {
+                var scannerDry = Substitute.For<IPackageVulnerabilityScanner>();
+                scannerDry.ScanPackagesAsync(Arg.Any<IEnumerable<(string, string)>>(), Arg.Any<CancellationToken>())
+                    .Returns(new PackageVulnerabilityScanResult(Array.Empty<PackageVulnerabilityFinding>(), new HashSet<string>()));
+                var optsDry = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+                {
+                    Enabled = true,
+                    DryRun = true,
+                    TargetRepository = "owner/repo",
+                    PackagesPerSweep = 2
+                });
+
+                var dryService = new CveActiveWatchService(gitHubMock, scannerDry, optsDry, catalogProvider: catalog, stateStore: storeDryRun);
+                await dryService.RunScanSweepAsync();
+                Assert.Null(storeDryRun.GetCursorWatermark("cve-active-watch:owner/repo"));
+            }
+
+            // 2. Live sweep persists watermark for slice 1 (pkg-1, pkg-2)
+            using (var store1 = new JsonBotStateStore(botStateOptions))
+            {
+                var scanned1 = new List<List<string>>();
+                var scanner1 = Substitute.For<IPackageVulnerabilityScanner>();
+                scanner1.ScanPackagesAsync(Arg.Do<IEnumerable<(string Name, string Version)>>(pkgs =>
+                        scanned1.Add(pkgs.Select(p => p.Name).ToList())), Arg.Any<CancellationToken>())
+                    .Returns(new PackageVulnerabilityScanResult(Array.Empty<PackageVulnerabilityFinding>(), new HashSet<string>()));
+                var optsLive = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+                {
+                    Enabled = true,
+                    DryRun = false,
+                    TargetRepository = "owner/repo",
+                    PackagesPerSweep = 2
+                });
+
+                var service1 = new CveActiveWatchService(gitHubMock, scanner1, optsLive, catalogProvider: catalog, stateStore: store1);
+                await service1.RunScanSweepAsync();
+                Assert.Equal(new[] { "pkg-1", "pkg-2" }, scanned1[0]);
+                Assert.Equal("pkg-2", store1.GetCursorWatermark("cve-active-watch:owner/repo"));
+            }
+
+            // 3. Simulated process restart resumes from pkg-3, pkg-4
+            using (var store2 = new JsonBotStateStore(botStateOptions))
+            {
+                var scanned2 = new List<List<string>>();
+                var scanner2 = Substitute.For<IPackageVulnerabilityScanner>();
+                scanner2.ScanPackagesAsync(Arg.Do<IEnumerable<(string Name, string Version)>>(pkgs =>
+                        scanned2.Add(pkgs.Select(p => p.Name).ToList())), Arg.Any<CancellationToken>())
+                    .Returns(new PackageVulnerabilityScanResult(Array.Empty<PackageVulnerabilityFinding>(), new HashSet<string>()));
+                var optsLive = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+                {
+                    Enabled = true,
+                    DryRun = false,
+                    TargetRepository = "owner/repo",
+                    PackagesPerSweep = 2
+                });
+
+                var service2 = new CveActiveWatchService(gitHubMock, scanner2, optsLive, catalogProvider: catalog, stateStore: store2);
+                await service2.RunScanSweepAsync();
+                Assert.Equal(new[] { "pkg-3", "pkg-4" }, scanned2[0]);
+                Assert.Equal("pkg-4", store2.GetCursorWatermark("cve-active-watch:owner/repo"));
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task CveActiveWatchOutputs_NeverContainEmojisAcrossBannersTruncationOverflowOrNotices()
+    {
+        // Truncated + Unverified native finding
+        var manyReports = Enumerable.Range(1, 25)
+            .Select(i => new CveReport($"CVE-2026-{i:D4}", 8.0, GitHubLabels.Severity2, "OSV", new string('A', 3500)))
+            .ToList();
+        var overflowFinding = new PackageVulnerabilityFinding(
+            "native-big", "1.0", manyReports.Select(r => r.CveId).ToList(), manyReports, TotalVulnerabilityCount: 30, IsUnverifiedEcosystem: true);
+        var overflowBody = CveActiveWatchService.GenerateIssueBody(overflowFinding);
+        Assert.Contains("[Content truncated due to size limits]", overflowBody, StringComparison.Ordinal);
+        Assert.False(ContainsEmoji(overflowBody));
+
+        // Heuristic finding
+        var heuristicFinding = new PackageVulnerabilityFinding(
+            "python-foo", "1.0", new[] { "CVE-2026-0001" }, new[] { manyReports[0] }, TotalVulnerabilityCount: 1, IsHeuristicUpstream: true);
+        var heuristicBody = CveActiveWatchService.GenerateIssueBody(heuristicFinding);
+        Assert.Contains("Heuristic Upstream Name Match", heuristicBody, StringComparison.Ordinal);
+        Assert.False(ContainsEmoji(heuristicBody));
+
+        // Unverified legacy notice comment
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        var existingIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(existingIssue, 200);
+        typeof(Issue).GetProperty(nameof(Issue.Title))?.SetValue(existingIssue, "[Security] Outstanding CVEs detected in abseil-cpp");
+        gitHubMock.SearchStaleCandidatesAsync(
+                "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(new[] { existingIssue });
+        gitHubMock.GetIssueCommentsAsync("owner", "repo", 200, Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<IssueComment>());
+
+        string? postedNotice = null;
+        gitHubMock.CreateCommentAsync("owner", "repo", 200, Arg.Do<string>(s => postedNotice = s), Arg.Any<CancellationToken>())
+            .Returns(Task.CompletedTask);
+
+        var scannerMock = Substitute.For<ITargetedPackageVulnerabilityScanner>();
+        scannerMock.ScanTargetsAsync(Arg.Any<IEnumerable<PackageScanTarget>>(), Arg.Any<CancellationToken>())
+            .Returns(new PackageVulnerabilityScanResult(
+                Array.Empty<PackageVulnerabilityFinding>(),
+                new HashSet<string>(),
+                SkippedUnverifiedCount: 1,
+                UnverifiedNativePackages: new HashSet<string> { "abseil-cpp" }));
+
+        var service = new CveActiveWatchService(
+            gitHubMock,
+            scannerMock,
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+            {
+                Enabled = true,
+                DryRun = false,
+                IncludeUnverifiedNativePackages = false,
+                TargetRepository = "owner/repo"
+            }),
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[] { ("abseil-cpp", "1.0") }));
+
+        await service.RunScanSweepAsync();
+        Assert.NotNull(postedNotice);
+        Assert.False(ContainsEmoji(postedNotice!));
+    }
+
+    private sealed class ProviderForwardingLogger<T>(Microsoft.Extensions.Logging.ILogger inner) : Microsoft.Extensions.Logging.ILogger<T>
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => inner.BeginScope(state);
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => inner.IsEnabled(logLevel);
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel,
+            Microsoft.Extensions.Logging.EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => inner.Log(logLevel, eventId, state, exception, formatter);
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_PersistentlyFailingHeadPackage_SkipsAfterThreeSweepsAndAdvancesToNextSlice()
+    {
+        // Case A: null GetSpecAsync on head package across 3 consecutive sweeps skips poison and unblocks downstream slices
+        var gitHub1 = Substitute.For<IGitHubService>();
+        gitHub1.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        gitHub1.SearchStaleCandidatesAsync(
+                "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<Issue>());
+
+        var specCatalog = Substitute.For<ISpecCatalog>();
+        specCatalog.GetAllPackageNamesAsync(Arg.Any<CancellationToken>())
+            .Returns(new[] { "pkg-a", "pkg-b", "pkg-c", "pkg-d" });
+        specCatalog.GetSpecAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var pkg = call.Arg<string>();
+                if (pkg == "pkg-a")
+                {
+                    return (SpecContext?)null;
+                }
+                return new SpecContext(pkg, pkg, $"Name: {pkg}\nVersion: 1.0.0\n", $"SPECS/{pkg}/{pkg}.spec");
+            });
+
+        var scanned1 = new List<List<string>>();
+        var scanner1 = Substitute.For<ITargetedPackageVulnerabilityScanner>();
+        scanner1.ScanTargetsAsync(Arg.Do<IEnumerable<PackageScanTarget>>(targets =>
+                scanned1.Add(targets.Select(t => t.PackageName).ToList())), Arg.Any<CancellationToken>())
+            .Returns(new PackageVulnerabilityScanResult(Array.Empty<PackageVulnerabilityFinding>(), new HashSet<string>()));
+
+        var stateStore1 = Substitute.For<IBotStateStore>();
+        var health1 = new RuntimeHealthState();
+        using var errorProvider1 = new RuntimeErrorLoggerProvider(health1);
+        var logger1 = new ProviderForwardingLogger<CveActiveWatchService>(errorProvider1.CreateLogger(nameof(CveActiveWatchService)));
+
+        var service1 = new CveActiveWatchService(
+            gitHub1,
+            scanner1,
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+            {
+                Enabled = true,
+                DryRun = false,
+                TargetRepository = "owner/repo",
+                PackagesPerSweep = 2
+            }),
+            logger: logger1,
+            specCatalog: specCatalog,
+            stateStore: stateStore1,
+            healthState: health1);
+
+        // Sweeps 1 and 2: hold cursor before failing pkg-a and report degraded health
+        await service1.RunScanSweepAsync();
+        stateStore1.DidNotReceive().SetCursorWatermark("cve-active-watch:owner/repo", Arg.Any<string?>());
+        stateStore1.Received(1).SetCursorWatermark("cve-active-watch-poison:owner/repo", "pkg-a|1");
+        Assert.Equal("degraded", health1.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+        Assert.Equal(1, health1.GetSourceHealth()[CveActiveWatchService.HealthSourceName].ConsecutiveFailures);
+
+        await service1.RunScanSweepAsync();
+        stateStore1.DidNotReceive().SetCursorWatermark("cve-active-watch:owner/repo", Arg.Any<string?>());
+        stateStore1.Received(1).SetCursorWatermark("cve-active-watch-poison:owner/repo", "pkg-a|2");
+        Assert.Equal("degraded", health1.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+        Assert.Equal(2, health1.GetSourceHealth()[CveActiveWatchService.HealthSourceName].ConsecutiveFailures);
+
+        // Sweep 3: hits threshold 3 -> emits LogError, clears poison key, skips pkg-a and commits pkg-b
+        await service1.RunScanSweepAsync();
+        stateStore1.Received(1).SetCursorWatermark("cve-active-watch:owner/repo", "pkg-b");
+        stateStore1.Received(1).SetCursorWatermark("cve-active-watch-poison:owner/repo", null);
+        Assert.Contains("pkg-a", health1.GetLastError().LastError ?? string.Empty, StringComparison.Ordinal);
+        Assert.Contains("Skipped poison-pill", health1.GetSourceHealth()[CveActiveWatchService.HealthSourceName].LastError ?? string.Empty, StringComparison.Ordinal);
+
+        // Sweep 4: progresses to [pkg-c, pkg-d] and restores healthy status
+        await service1.RunScanSweepAsync();
+        Assert.Equal(4, scanned1.Count);
+        Assert.Equal(new[] { "pkg-c", "pkg-d" }, scanned1[3]);
+        Assert.Equal("healthy", health1.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+        Assert.Equal(0, health1.GetSourceHealth()[CveActiveWatchService.HealthSourceName].ConsecutiveFailures);
+
+        // Case B: persistent AddLabelsAsync error in ProcessPackageFindingAsync on slice head
+        var gitHub2 = Substitute.For<IGitHubService>();
+        gitHub2.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        var existingIssueA = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(existingIssueA, 301);
+        typeof(Issue).GetProperty(nameof(Issue.Title))?.SetValue(existingIssueA, "[Security] Outstanding CVEs detected in pkg-a");
+        typeof(Issue).GetProperty(nameof(Issue.Labels))?.SetValue(existingIssueA, new List<Label>());
+        gitHub2.SearchStaleCandidatesAsync(
+                "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(new[] { existingIssueA });
+        gitHub2.UpdateIssueAsync(Arg.Any<string>(), Arg.Any<string>(), 301, Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(existingIssueA);
+        gitHub2.AddLabelsAsync("owner", "repo", 301, Arg.Any<string[]>(), Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new HttpRequestException("422 Label missing"));
+
+        var scanned2 = new List<List<string>>();
+        var scanner2 = Substitute.For<IPackageVulnerabilityScanner>();
+        var sampleReport = new CveReport("CVE-2026-9001", 8.0, GitHubLabels.Severity2, "OSV", "Test flaw");
+        scanner2.ScanPackagesAsync(Arg.Do<IEnumerable<(string Name, string Version)>>(pkgs =>
+                scanned2.Add(pkgs.Select(p => p.Name).ToList())), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var names = ((IEnumerable<(string Name, string Version)>)call[0]).Select(p => p.Name).ToList();
+                var list = names.Contains("pkg-a")
+                    ? new[] { new PackageVulnerabilityFinding("pkg-a", "1.0.0", new[] { "CVE-2026-9001" }, new[] { sampleReport }) }
+                    : Array.Empty<PackageVulnerabilityFinding>();
+                return new PackageVulnerabilityScanResult(list, new HashSet<string>(names));
+            });
+
+        var stateStore2 = Substitute.For<IBotStateStore>();
+        var service2 = new CveActiveWatchService(
+            gitHub2,
+            scanner2,
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+            {
+                Enabled = true,
+                DryRun = false,
+                TargetRepository = "owner/repo",
+                PackagesPerSweep = 2
+            }),
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[]
+            {
+                ("pkg-a", "1.0.0"),
+                ("pkg-b", "1.0.0"),
+                ("pkg-c", "1.0.0"),
+                ("pkg-d", "1.0.0")
+            }),
+            stateStore: stateStore2);
+
+        await service2.RunScanSweepAsync();
+        await service2.RunScanSweepAsync();
+        stateStore2.DidNotReceive().SetCursorWatermark("cve-active-watch:owner/repo", Arg.Any<string?>());
+
+        await service2.RunScanSweepAsync();
+        stateStore2.Received(1).SetCursorWatermark("cve-active-watch:owner/repo", "pkg-b");
+
+        await service2.RunScanSweepAsync();
+        Assert.Equal(4, scanned2.Count);
+        Assert.Equal(new[] { "pkg-c", "pkg-d" }, scanned2[3]);
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_PoisonRewindCounter_SurvivesRestartViaJsonBotStateStore_AndRespectsDryRun()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"abaci-cve-poison-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var botStateOptions = Microsoft.Extensions.Options.Options.Create(new BotStateOptions
+            {
+                StateDirectory = tempDir
+            });
+
+            var gitHub = Substitute.For<IGitHubService>();
+            gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+                .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+            gitHub.SearchStaleCandidatesAsync(
+                    "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(Array.Empty<Issue>());
+
+            var catalog = (CancellationToken _) => Task.FromResult<IReadOnlyList<(string, string)>>(new[]
+            {
+                ("pkg-a", "1.0"),
+                ("pkg-b", "1.0"),
+                ("pkg-c", "1.0"),
+                ("pkg-d", "1.0")
+            });
+
+            var failAScanner = Substitute.For<ITargetedPackageVulnerabilityScanner>();
+            failAScanner.ScanTargetsAsync(Arg.Any<IEnumerable<PackageScanTarget>>(), Arg.Any<CancellationToken>())
+                .Returns(new PackageVulnerabilityScanResult(
+                    Array.Empty<PackageVulnerabilityFinding>(),
+                    new HashSet<string> { "pkg-b" },
+                    FailedPackages: new HashSet<string> { "pkg-a" }));
+
+            // 1. DryRun never writes cursor or poison state to disk
+            using (var dryStore = new JsonBotStateStore(botStateOptions))
+            {
+                var drySvc = new CveActiveWatchService(
+                    gitHub,
+                    failAScanner,
+                    Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+                    {
+                        Enabled = true,
+                        DryRun = true,
+                        TargetRepository = "owner/repo",
+                        PackagesPerSweep = 2
+                    }),
+                    catalogProvider: catalog,
+                    stateStore: dryStore);
+
+                await drySvc.RunScanSweepAsync();
+                Assert.Null(dryStore.GetCursorWatermark("cve-active-watch:owner/repo"));
+                Assert.Null(dryStore.GetCursorWatermark("cve-active-watch-poison:owner/repo"));
+            }
+
+            // 2. Two live failures persist "pkg-a|2" across process lifetime
+            using (var store1 = new JsonBotStateStore(botStateOptions))
+            {
+                var optsLive = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+                {
+                    Enabled = true,
+                    DryRun = false,
+                    TargetRepository = "owner/repo",
+                    PackagesPerSweep = 2
+                });
+
+                var svc1 = new CveActiveWatchService(gitHub, failAScanner, optsLive, catalogProvider: catalog, stateStore: store1);
+                await svc1.RunScanSweepAsync();
+                await svc1.RunScanSweepAsync();
+
+                Assert.Null(store1.GetCursorWatermark("cve-active-watch:owner/repo"));
+                Assert.Equal("pkg-a|2", store1.GetCursorWatermark("cve-active-watch-poison:owner/repo"));
+            }
+
+            // 3. Simulated process restart reads "pkg-a|2": 1st sweep (3rd total failure) skips pkg-a and clears poison key
+            using (var store2 = new JsonBotStateStore(botStateOptions))
+            {
+                var health2 = new RuntimeHealthState();
+                var optsLive = Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+                {
+                    Enabled = true,
+                    DryRun = false,
+                    TargetRepository = "owner/repo",
+                    PackagesPerSweep = 2
+                });
+
+                var svc2AfterRestart = new CveActiveWatchService(
+                    gitHub, failAScanner, optsLive, catalogProvider: catalog, stateStore: store2, healthState: health2);
+                await svc2AfterRestart.RunScanSweepAsync();
+
+                Assert.Equal("pkg-b", store2.GetCursorWatermark("cve-active-watch:owner/repo"));
+                Assert.Null(store2.GetCursorWatermark("cve-active-watch-poison:owner/repo"));
+                Assert.Equal("degraded", health2.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+
+                // 4. Subsequent sweep scans clean slice [pkg-c, pkg-d] and transitions to healthy
+                var cleanScanner = Substitute.For<ITargetedPackageVulnerabilityScanner>();
+                var nextBatch = new List<string>();
+                cleanScanner.ScanTargetsAsync(Arg.Do<IEnumerable<PackageScanTarget>>(t =>
+                        nextBatch = t.Select(x => x.PackageName).ToList()), Arg.Any<CancellationToken>())
+                    .Returns(new PackageVulnerabilityScanResult(Array.Empty<PackageVulnerabilityFinding>(), new HashSet<string>()));
+
+                var svcClean = new CveActiveWatchService(
+                    gitHub, cleanScanner, optsLive, catalogProvider: catalog, stateStore: store2, healthState: health2);
+                await svcClean.RunScanSweepAsync();
+
+                Assert.Equal(new[] { "pkg-c", "pkg-d" }, nextBatch);
+                Assert.Equal("pkg-d", store2.GetCursorWatermark("cve-active-watch:owner/repo"));
+                Assert.Equal("healthy", health2.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_ReportsHealthOutcomesAcrossHealthyDegradedFailedAndFullCatalogModes()
+    {
+        var health = new RuntimeHealthState();
+        using var errorProvider = new RuntimeErrorLoggerProvider(health);
+        var logger = new ProviderForwardingLogger<CveActiveWatchService>(errorProvider.CreateLogger(nameof(CveActiveWatchService)));
+
+        // 1. Disabled worker via ExecuteAsync records "disabled"
+        var disabledSvc = new CveActiveWatchService(
+            Substitute.For<IGitHubService>(),
+            Substitute.For<IPackageVulnerabilityScanner>(),
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+            {
+                Enabled = false,
+                TargetRepository = "owner/repo",
+                CheckIntervalHours = 1
+            }),
+            logger: logger,
+            healthState: health);
+        using (var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50)))
+        {
+            await disabledSvc.StartAsync(cts.Token);
+            await Task.Delay(25);
+            await disabledSvc.StopAsync(CancellationToken.None);
+        }
+        Assert.Equal("disabled", health.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+
+        // 2. Invalid TargetRepository records "failed"
+        var invalidRepoSvc = new CveActiveWatchService(
+            Substitute.For<IGitHubService>(),
+            Substitute.For<IPackageVulnerabilityScanner>(),
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+            {
+                Enabled = true,
+                TargetRepository = "invalid-repo"
+            }),
+            logger: logger,
+            healthState: health);
+        await invalidRepoSvc.RunScanSweepAsync();
+        Assert.Equal("failed", health.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+
+        // 3. Low core rate limit records "degraded"
+        var ghLowRate = Substitute.For<IGitHubService>();
+        ghLowRate.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(100, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        var lowRateSvc = new CveActiveWatchService(
+            ghLowRate,
+            Substitute.For<IPackageVulnerabilityScanner>(),
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions { Enabled = true, TargetRepository = "owner/repo" }),
+            logger: logger,
+            healthState: health);
+        await lowRateSvc.RunScanSweepAsync();
+        Assert.Equal("degraded", health.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+
+        // 4. Scanner throws records "failed" and logs runtime.lastError
+        var ghOk = Substitute.For<IGitHubService>();
+        ghOk.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        var throwingScanner = Substitute.For<IPackageVulnerabilityScanner>();
+        throwingScanner.ScanPackagesAsync(Arg.Any<IEnumerable<(string, string)>>(), Arg.Any<CancellationToken>())
+            .Returns<Task<PackageVulnerabilityScanResult>>(_ => throw new HttpRequestException("OSV timeout"));
+        var scannerFailSvc = new CveActiveWatchService(
+            ghOk,
+            throwingScanner,
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions { Enabled = true, TargetRepository = "owner/repo" }),
+            logger: logger,
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[] { ("pkg-a", "1.0") }),
+            healthState: health);
+        await scannerFailSvc.RunScanSweepAsync();
+        Assert.Equal("failed", health.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+        Assert.Contains("OSV timeout", health.GetLastError().LastError ?? string.Empty, StringComparison.Ordinal);
+
+        // 5. GitHub Search throws records "failed"
+        var ghSearchFail = Substitute.For<IGitHubService>();
+        ghSearchFail.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        ghSearchFail.SearchStaleCandidatesAsync(
+                "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns<Task<IReadOnlyList<Issue>>>(_ => throw new HttpRequestException("GitHub Search 503"));
+        var scannedScanner = Substitute.For<IPackageVulnerabilityScanner>();
+        scannedScanner.ScanPackagesAsync(Arg.Any<IEnumerable<(string, string)>>(), Arg.Any<CancellationToken>())
+            .Returns(new PackageVulnerabilityScanResult(
+                Array.Empty<PackageVulnerabilityFinding>(),
+                new HashSet<string> { "pkg-a" }));
+        var searchFailSvc = new CveActiveWatchService(
+            ghSearchFail,
+            scannedScanner,
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions { Enabled = true, TargetRepository = "owner/repo" }),
+            logger: logger,
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[] { ("pkg-a", "1.0") }),
+            healthState: health);
+        await searchFailSvc.RunScanSweepAsync();
+        Assert.Equal("failed", health.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+        Assert.Contains("GitHub Search 503", health.GetLastError().LastError ?? string.Empty, StringComparison.Ordinal);
+
+        // 6. Full-catalog (PackagesPerSweep=0) partial failure -> "degraded", then clean -> "healthy"
+        ghOk.SearchStaleCandidatesAsync(
+                "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<Issue>());
+        var fullPartialScanner = Substitute.For<IPackageVulnerabilityScanner>();
+        fullPartialScanner.ScanPackagesAsync(Arg.Any<IEnumerable<(string, string)>>(), Arg.Any<CancellationToken>())
+            .Returns(new PackageVulnerabilityScanResult(
+                Array.Empty<PackageVulnerabilityFinding>(),
+                new HashSet<string> { "pkg-a" },
+                FailedPackages: new HashSet<string> { "pkg-b" }));
+        var fullCatalogSvc = new CveActiveWatchService(
+            ghOk,
+            fullPartialScanner,
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+            {
+                Enabled = true,
+                TargetRepository = "owner/repo",
+                PackagesPerSweep = 0
+            }),
+            logger: logger,
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[] { ("pkg-a", "1.0"), ("pkg-b", "1.0") }),
+            healthState: health);
+        await fullCatalogSvc.RunScanSweepAsync();
+        Assert.Equal("degraded", health.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+        Assert.Contains("1 failed package", health.GetSourceHealth()[CveActiveWatchService.HealthSourceName].LastError ?? string.Empty, StringComparison.Ordinal);
+
+        var fullHealthySvc = new CveActiveWatchService(
+            ghOk,
+            scannedScanner,
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+            {
+                Enabled = true,
+                TargetRepository = "owner/repo",
+                PackagesPerSweep = 0
+            }),
+            logger: logger,
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[] { ("pkg-a", "1.0") }),
+            healthState: health);
+        await fullHealthySvc.RunScanSweepAsync();
+        Assert.Equal("healthy", health.GetSourceHealth()[CveActiveWatchService.HealthSourceName].Status);
+        Assert.Null(health.GetSourceHealth()[CveActiveWatchService.HealthSourceName].LastError);
+    }
+
+    [Fact]
+    public async Task RunScanSweepAsync_HealthOutcome_FormatsSortedFailuresAndCombinedSkipPlusNextBlock()
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        gitHub.SearchStaleCandidatesAsync(
+                "owner", "repo", Arg.Any<DateTimeOffset>(), false, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<Issue>());
+
+        // 1. Full-catalog mode sorts FailedPackages alphabetically in health diagnostic preview
+        var fullHealth = new RuntimeHealthState();
+        var sortedScanner = Substitute.For<ITargetedPackageVulnerabilityScanner>();
+        sortedScanner.ScanTargetsAsync(Arg.Any<IEnumerable<PackageScanTarget>>(), Arg.Any<CancellationToken>())
+            .Returns(new PackageVulnerabilityScanResult(
+                Array.Empty<PackageVulnerabilityFinding>(),
+                new HashSet<string> { "pkg-m" },
+                FailedPackages: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "pkg-z", "pkg-a", "PKG-A" }));
+
+        var fullSvc = new CveActiveWatchService(
+            gitHub,
+            sortedScanner,
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+            {
+                Enabled = true,
+                TargetRepository = "owner/repo",
+                PackagesPerSweep = 0
+            }),
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[] { ("pkg-z", "1.0"), ("pkg-m", "1.0"), ("pkg-a", "1.0") }),
+            healthState: fullHealth);
+
+        await fullSvc.RunScanSweepAsync();
+        var fullErr = fullHealth.GetSourceHealth()[CveActiveWatchService.HealthSourceName].LastError;
+        Assert.Equal("Completed sweep with 2 failed package(s): pkg-a, pkg-z", fullErr);
+
+        // 2. Sliced mode skipping poison pkg-a (3rd fail) while next item pkg-b fails (1st fail) reports both and commits pkg-a
+        var sliceHealth = new RuntimeHealthState();
+        var stateStore = Substitute.For<IBotStateStore>();
+        stateStore.GetCursorWatermark("cve-active-watch-poison:owner/repo").Returns("pkg-a|2");
+
+        var combinedScanner = Substitute.For<ITargetedPackageVulnerabilityScanner>();
+        combinedScanner.ScanTargetsAsync(Arg.Any<IEnumerable<PackageScanTarget>>(), Arg.Any<CancellationToken>())
+            .Returns(new PackageVulnerabilityScanResult(
+                Array.Empty<PackageVulnerabilityFinding>(),
+                new HashSet<string> { "pkg-c" },
+                FailedPackages: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "pkg-a", "pkg-b" }));
+
+        var sliceSvc = new CveActiveWatchService(
+            gitHub,
+            combinedScanner,
+            Microsoft.Extensions.Options.Options.Create(new CveActiveWatchOptions
+            {
+                Enabled = true,
+                DryRun = false,
+                TargetRepository = "owner/repo",
+                PackagesPerSweep = 3
+            }),
+            catalogProvider: _ => Task.FromResult<IReadOnlyList<(string, string)>>(new[] { ("pkg-a", "1.0"), ("pkg-b", "1.0"), ("pkg-c", "1.0") }),
+            stateStore: stateStore,
+            healthState: sliceHealth);
+
+        await sliceSvc.RunScanSweepAsync();
+
+        stateStore.Received(1).SetCursorWatermark("cve-active-watch:owner/repo", "pkg-a");
+        stateStore.Received(1).SetCursorWatermark("cve-active-watch-poison:owner/repo", "pkg-b|1");
+        var combinedErr = sliceHealth.GetSourceHealth()[CveActiveWatchService.HealthSourceName].LastError ?? string.Empty;
+        Assert.Contains("Skipped poison-pill package(s) after 3 consecutive failures: pkg-a", combinedErr, StringComparison.Ordinal);
+        Assert.Contains("deferred cursor before failed package 'pkg-b' (attempt 1/3)", combinedErr, StringComparison.Ordinal);
     }
 }

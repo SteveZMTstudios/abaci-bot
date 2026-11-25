@@ -138,9 +138,9 @@ curl "http://localhost:3456/health?verbose=true"
 
 The verbose response adds:
 - `startedAt` and `uptimeSeconds`
-- `capabilities.abiEngine` (`native` / `managed` / `unavailable` / `disabled`) and `capabilities.conversationGuardPermission` (`verified` / `disabled` / `no-repositories` / `failed`)
-- `modules.*` per-module `enabled` and `dryRun` status flags
-- `runtime.lastError` / `runtime.lastErrorAt` (populated automatically from host `LogError` events with secrets redacted) and `sources` feed health
+- `capabilities.abiEngine` (`native` / `managed` / `unavailable` / `disabled`), `capabilities.conversationGuardPermission` (`verified` / `disabled` / `no-repositories` / `failed`), and `capabilities.packageUpdatePermission` (`verified` / `dry-run` / `disabled` / `failed`)
+- `modules.*` per-module `enabled`, `dryRun`, and safety switches (`archiveEnabled`, `allowManagedFallback`)
+- `runtime.lastError` / `runtime.lastErrorAt` (populated automatically from host `LogError` events with secrets redacted) and `sources` feed health (`Lookout`, `RustCrates`, `CveActiveWatch`)
 
 ---
 

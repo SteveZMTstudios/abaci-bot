@@ -26,6 +26,7 @@ public sealed partial class RuntimeHealthState
     private readonly TimeProvider _timeProvider;
     private readonly object _errorLock = new();
     private readonly Dictionary<string, SourceHealthSnapshot> _sources = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _capabilities = new(StringComparer.OrdinalIgnoreCase);
     private string? _lastError;
     private DateTimeOffset? _lastErrorAt;
 
@@ -72,6 +73,36 @@ public sealed partial class RuntimeHealthState
         lock (_errorLock)
         {
             return (_lastError, _lastErrorAt);
+        }
+    }
+
+    public void SetCapabilityStatus(string capabilityName, string status)
+    {
+        if (string.IsNullOrWhiteSpace(capabilityName))
+        {
+            return;
+        }
+
+        lock (_errorLock)
+        {
+            _capabilities[capabilityName.Trim()] = string.IsNullOrWhiteSpace(status)
+                ? "disabled"
+                : status.Trim();
+        }
+    }
+
+    public string GetCapabilityStatus(string capabilityName, string defaultStatus = "disabled")
+    {
+        if (string.IsNullOrWhiteSpace(capabilityName))
+        {
+            return defaultStatus;
+        }
+
+        lock (_errorLock)
+        {
+            return _capabilities.TryGetValue(capabilityName.Trim(), out var status)
+                ? status
+                : defaultStatus;
         }
     }
 

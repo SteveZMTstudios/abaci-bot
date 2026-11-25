@@ -301,6 +301,53 @@ public class ObsBuildServiceTests
         Assert.Equal("expanded999", freshness.LatestJobSrcMd5);
         Assert.Equal(ObsStatusCode.Succeeded, freshness.LatestJobCode);
         Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1790000000), freshness.LatestJobStartTime);
+        Assert.Equal("succeeded", freshness.ServiceCode);
+    }
+
+    [Fact]
+    public async Task GetPackageBuildFreshnessAsync_ExtractsFailedServiceCodeAndServiceEntryMtime()
+    {
+        var handler = new FakeHttpMessageHandler(req =>
+        {
+            var pathAndQuery = req.RequestUri!.PathAndQuery;
+            if (pathAndQuery.EndsWith("/public/source/openruyi/pkg-broken", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""
+                        <directory name="pkg-broken" srcmd5="raw111">
+                          <serviceinfo code="failed" />
+                          <entry name="_service" mtime="1700000100" />
+                          <entry name="_service:tar_scm:pkg-broken.spec" mtime="1790000500" />
+                          <entry name="pkg-broken.spec" mtime="1600000000" />
+                        </directory>
+                        """)
+                };
+            }
+
+            if (pathAndQuery.Contains("_jobhistory", StringComparison.Ordinal))
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("<jobhistlist />")
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            Obs = new ObsOptions { BaseUrl = "https://build.openruyi.cn", Project = "openruyi" }
+        });
+        var service = new ObsBuildService(new HttpClient(handler), options);
+
+        var freshness = await service.GetPackageBuildFreshnessAsync("openruyi", "pkg-broken", "riscv64", "riscv64");
+        Assert.NotNull(freshness);
+        Assert.False(freshness!.IsServiceReady);
+        Assert.Equal("failed", freshness.ServiceCode);
+        Assert.Equal("raw111", freshness.SourceMd5);
+        Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1790000500), freshness.LatestSourceMtime);
     }
 }
 

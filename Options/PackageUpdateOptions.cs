@@ -15,7 +15,10 @@ public class PackageUpdateOptions
 
     /// <summary>
     /// Optional Personal Access Token for the bot. If empty, falls back to GitHub App authentication.
-    /// Strictly scoped to target repository contents and pull requests.
+    /// Note: setting <c>BotPat</c> switches ALL GitHub API calls globally to that PAT user identity, so it must hold
+    /// <c>Contents: Read and write</c>, <c>Pull requests: Read and write</c>, <c>Issues: Read and write</c>,
+    /// <c>Actions: Read-only</c>, <c>Organization Members: Read-only</c> (classic <c>read:org</c>, required by <c>WorkflowStateModule</c>),
+    /// and <c>push+</c> repository access (required whenever <c>PackageUpdate</c> runs live with <c>DryRun=false</c> or <c>ConversationGuard:Enabled=true</c>).
     /// </summary>
     public string BotPat { get; set; } = string.Empty;
 
@@ -63,8 +66,9 @@ public class PackageUpdateOptions
     public int RequestThrottleMilliseconds { get; set; } = 2000;
 
     /// <summary>
-    /// Maximum repository tarball archive size in bytes accepted by <c>GitHubSpecCatalog</c> before falling back to the Git Tree API.
-    /// Set to 0 to disable the size cap. Default: 104857600 (100 MiB).
+    /// Maximum compressed repository tarball size in bytes accepted by <c>GitHubSpecCatalog</c> (via HTTP <c>Content-Length</c> pre-check
+    /// and bounded streaming read) before aborting download and falling back to the Git Tree API; individual and cumulative decompressed
+    /// <c>.spec</c> entries are additionally capped at 4 MiB per spec and 256 MiB total. Set to 0 to disable the compressed archive size cap. Default: 104857600 (100 MiB).
     /// </summary>
     public long MaxArchiveBytes { get; set; } = 100L * 1024 * 1024;
 }

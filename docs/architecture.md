@@ -78,7 +78,11 @@ In addition to event-driven webhook processing, `abaci-bot` hosts background ser
 
 ### ConversationGuardPermissionProbe
 - Runs at startup when `ConversationGuard:Enabled == true` to verify collaborator endpoint access across `ConversationGuard:RepositoryAllowList`.
-- Enforces the community governance permission gate: aborts startup if the GitHub App lacks `Administration: Read-only` (or `Contents: Read & write`) required to query `triage`/`write`+ collaborator permissions.
+- Enforces the community governance permission gate: aborts startup if collaborator permission queries fail (App tokens require mandatory `Metadata: Read-only`; `BotPat` mode requires `push`+ repository access) or if `ArchiveEnabled == true` lacks a compliant `PackageUpdate:BotPat`.
+
+### PackageUpdatePermissionProbe
+- Runs at startup to verify all required repository permissions (`Contents: Read and write`, `Pull requests: Read and write`, `Issues: Read and write`, and `Actions: Read-only` in GitHub App mode; `push+` repository role and read-only `Actions` access in `BotPat` mode) when `PackageUpdate:Enabled == true && DryRun == false`.
+- Whenever `PackageUpdate:BotPat` and `GitHubApp:TeamName` are configured, also verifies `BotPat` organization team-read permission (`read:org` / `Organization -> Members: Read-only`) once per unique organization across active modules (falling back to `PackageUpdate:TargetRepository` when optional modules are disabled) so `WorkflowStateModule` does not block `issue_comment` events on runtime webhooks.
 
 ### StaleLifecycleService
 - Scans monitored repositories for inactive issues and pull requests.

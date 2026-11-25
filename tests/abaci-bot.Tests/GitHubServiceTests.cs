@@ -1820,39 +1820,442 @@ public class GitHubServiceTests
     }
 
     [Fact]
-    public async Task GetRepositoryTarballAsync_HandlesSuccessNotFoundErrorAndCancellation()
+    public async Task OpenRepositoryTarballStreamAsync_HandlesSuccessNotFoundErrorAndCancellation()
     {
         var (pem, rsa) = GenerateRsaKeyPair();
         using (rsa)
         {
-            var (service, client) = CreateTestService(pem);
-            var reposClient = Substitute.For<IRepositoriesClient>();
-            var contentsClient = Substitute.For<IRepositoryContentsClient>();
-            reposClient.Content.Returns(contentsClient);
-            client.Repository.Returns(reposClient);
-
             var expectedBytes = new byte[] { 0x1F, 0x8B, 0x08, 0x00 };
-            contentsClient.GetArchive("owner", "repo", ArchiveFormat.Tarball, "main", Arg.Any<TimeSpan>())
-                .Returns(Task.FromResult(expectedBytes));
+            Uri? capturedUri = null;
+            string? capturedAuth = null;
 
-            var result = await service.GetRepositoryTarballAsync("owner", "repo", "main");
-            Assert.Equal(expectedBytes, result);
+            using var archiveHandler = new ControllableHttpMessageHandler((req, _) =>
+            {
+                capturedUri = req.RequestUri;
+                capturedAuth = req.Headers.Authorization?.ToString();
 
-            // 404 NotFoundException -> returns null
-            contentsClient.GetArchive("owner", "missing", ArchiveFormat.Tarball, "main", Arg.Any<TimeSpan>())
-                .Returns<Task<byte[]>>(_ => throw new NotFoundException("not found", HttpStatusCode.NotFound));
-            Assert.Null(await service.GetRepositoryTarballAsync("owner", "missing", "main"));
+                var path = req.RequestUri?.AbsolutePath ?? string.Empty;
+                if (path.Contains("/repos/owner/repo/tarball/"))
+                {
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new ByteArrayContent(expectedBytes)
+                    });
+                }
 
-            // Unexpected HTTP error -> logs warning and returns null
-            contentsClient.GetArchive("owner", "broken", ArchiveFormat.Tarball, "main", Arg.Any<TimeSpan>())
-                .Returns<Task<byte[]>>(_ => throw new HttpRequestException("gateway timeout"));
-            Assert.Null(await service.GetRepositoryTarballAsync("owner", "broken", "main"));
+                if (path.Contains("/repos/owner/missing/tarball/"))
+                {
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+                }
 
-            // Pre-cancelled token -> throws OperationCanceledException
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadGateway));
+            });
+
+            var client = Substitute.For<IGitHubClient>();
+            var connection = Substitute.For<IConnection>();
+            connection.BaseAddress.Returns(new Uri("https://api.github.com/"));
+            client.Connection.Returns(connection);
+            var appsClient = Substitute.For<IGitHubAppsClient>();
+            client.GitHubApps.Returns(appsClient);
+            appsClient.CreateInstallationToken(Arg.Any<long>())
+                .Returns(Task.FromResult(CreateInstallationToken("test-installation-token", DateTimeOffset.UtcNow.AddHours(1))));
+
+            using var service = new GitHubService(123456, pem, 789012, client, logger: null, archiveHttpHandler: archiveHandler);
+
+            // 1. Success -> streams bytes with Bearer token
+            await using (var stream = await service.OpenRepositoryTarballStreamAsync("owner", "repo", "main"))
+            {
+                Assert.NotNull(stream);
+                using var ms = new MemoryStream();
+                await stream!.CopyToAsync(ms);
+                Assert.Equal(expectedBytes, ms.ToArray());
+            }
+            Assert.Equal("https://api.github.com/repos/owner/repo/tarball/main", capturedUri?.ToString());
+            Assert.Equal("Bearer test-installation-token", capturedAuth);
+
+            // 2. 404 NotFound -> returns null
+            Assert.Null(await service.OpenRepositoryTarballStreamAsync("owner", "missing", "main"));
+
+            // 3. Unexpected 502 BadGateway -> logs warning and returns null
+            Assert.Null(await service.OpenRepositoryTarballStreamAsync("owner", "broken", "main"));
+
+            // 4. Pre-cancelled token -> throws OperationCanceledException
             using var cts = new CancellationTokenSource();
             cts.Cancel();
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-                service.GetRepositoryTarballAsync("owner", "repo", "main", cts.Token));
+                service.OpenRepositoryTarballStreamAsync("owner", "repo", "main", ct: cts.Token));
+        }
+    }
+
+    [Fact]
+    public async Task OpenRepositoryTarballStreamAsync_RejectsOversizedContentLengthWithoutReading_AndAbortsChunkedOverrunMidStream()
+    {
+        var (pem, rsa) = GenerateRsaKeyPair();
+        using (rsa)
+        {
+            var headerTracker = new CountingZeroStream(1024);
+            var chunkedTracker = new CountingZeroStream(1024 * 1024);
+
+            using var archiveHandler = new ControllableHttpMessageHandler((req, _) =>
+            {
+                var path = req.RequestUri?.AbsolutePath ?? string.Empty;
+                if (path.Contains("/repos/owner/header-too-big/"))
+                {
+                    var content = new StreamContent(headerTracker);
+                    content.Headers.ContentLength = 500;
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = content
+                    });
+                }
+
+                // No Content-Length header -> simulates chunked transfer encoding
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StreamContent(chunkedTracker)
+                });
+            });
+
+            var client = Substitute.For<IGitHubClient>();
+            var connection = Substitute.For<IConnection>();
+            connection.BaseAddress.Returns(new Uri("https://api.github.com/"));
+            client.Connection.Returns(connection);
+            var appsClient = Substitute.For<IGitHubAppsClient>();
+            client.GitHubApps.Returns(appsClient);
+            appsClient.CreateInstallationToken(Arg.Any<long>())
+                .Returns(Task.FromResult(CreateInstallationToken("test-token", DateTimeOffset.UtcNow.AddHours(1))));
+
+            using var service = new GitHubService(123456, pem, 789012, client, logger: null, archiveHttpHandler: archiveHandler);
+
+            // 1. Content-Length > maxArchiveBytes rejects immediately with 0 bytes consumed
+            var headerRejected = await service.OpenRepositoryTarballStreamAsync("owner", "header-too-big", "main", maxArchiveBytes: 100);
+            Assert.Null(headerRejected);
+            Assert.Equal(0, headerTracker.BytesReadFromUnderlying);
+
+            // 2. Chunked stream without Content-Length aborts mid-stream once limit exceeded
+            await using var chunkedStream = await service.OpenRepositoryTarballStreamAsync("owner", "chunked-too-big", "main", maxArchiveBytes: 100);
+            Assert.NotNull(chunkedStream);
+            var buf = new byte[4096];
+            await Assert.ThrowsAsync<ArchiveSizeLimitExceededException>(async () =>
+            {
+                while (await chunkedStream!.ReadAsync(buf) > 0)
+                {
+                }
+            });
+            Assert.InRange(chunkedTracker.BytesReadFromUnderlying, 101, 256);
+
+            // 3. Exact limit stream reads cleanly through EOF
+            using var exactInner = new MemoryStream(new byte[100], writable: false);
+            await using var exactBounded = new BoundedReadStream(exactInner, maxBytes: 100);
+            var drained = new byte[256];
+            var total = 0;
+            while (true)
+            {
+                var n = await exactBounded.ReadAsync(drained);
+                if (n == 0)
+                    break;
+                total += n;
+            }
+            Assert.Equal(100, total);
+        }
+    }
+
+    private sealed class CountingZeroStream : Stream
+    {
+        private readonly long _totalLength;
+        private long _position;
+
+        public CountingZeroStream(long totalLength) => _totalLength = totalLength;
+
+        public long BytesReadFromUnderlying => _position;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => _position; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var remaining = _totalLength - _position;
+            if (remaining <= 0)
+                return 0;
+
+            var toRead = (int)Math.Min(count, remaining);
+            Array.Fill(buffer, (byte)'A', offset, toRead);
+            _position += toRead;
+            return toRead;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task OpenRepositoryTarballStreamAsync_PrivateRepoRedirectToCodeload_StripsAuthorizationAcrossHosts()
+    {
+        var (pem, rsa) = GenerateRsaKeyPair();
+        using (rsa)
+        {
+            using var apiListener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+            using var codeloadListener = new System.Net.Sockets.TcpListener(IPAddress.IPv6Loopback, 0);
+            apiListener.Start();
+            codeloadListener.Start();
+
+            var apiPort = ((IPEndPoint)apiListener.LocalEndpoint).Port;
+            var codeloadPort = ((IPEndPoint)codeloadListener.LocalEndpoint).Port;
+            var payload = new byte[] { 0x1F, 0x8B, 0x08, 0x00, 0xCA, 0xFE, 0xBA, 0xBE };
+
+            static async Task<string> ReadHttpRequestHeadAsync(System.Net.Sockets.NetworkStream netStream)
+            {
+                var sb = new StringBuilder();
+                var buf = new byte[1024];
+                while (!sb.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+                {
+                    var n = await netStream.ReadAsync(buf);
+                    if (n == 0) break;
+                    sb.Append(Encoding.ASCII.GetString(buf, 0, n));
+                }
+                return sb.ToString();
+            }
+
+            string? hop1Request = null;
+            string? hop2Request = null;
+
+            var serverTask = Task.Run(async () =>
+            {
+                using (var c1 = await apiListener.AcceptTcpClientAsync())
+                await using (var s1 = c1.GetStream())
+                {
+                    hop1Request = await ReadHttpRequestHeadAsync(s1);
+                    var redirect = $"HTTP/1.1 302 Found\r\nLocation: http://[::1]:{codeloadPort}/owner/private-repo/legacy.tar.gz/main?token=signed-5m\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    await s1.WriteAsync(Encoding.ASCII.GetBytes(redirect));
+                }
+
+                using (var c2 = await codeloadListener.AcceptTcpClientAsync())
+                await using (var s2 = c2.GetStream())
+                {
+                    hop2Request = await ReadHttpRequestHeadAsync(s2);
+                    var okHeader = Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Length: {payload.Length}\r\nConnection: close\r\n\r\n");
+                    await s2.WriteAsync(okHeader);
+                    await s2.WriteAsync(payload);
+                }
+            });
+
+            var client = Substitute.For<IGitHubClient>();
+            var connection = Substitute.For<IConnection>();
+            connection.BaseAddress.Returns(new Uri($"http://127.0.0.1:{apiPort}/"));
+            client.Connection.Returns(connection);
+            var appsClient = Substitute.For<IGitHubAppsClient>();
+            client.GitHubApps.Returns(appsClient);
+            appsClient.CreateInstallationToken(Arg.Any<long>())
+                .Returns(Task.FromResult(CreateInstallationToken("private-install-token", DateTimeOffset.UtcNow.AddHours(1))));
+
+            // Default HttpClient (no custom archiveHttpHandler) exercises real cross-host 302 redirect behavior
+            using var service = new GitHubService(123456, pem, 789012, client);
+            await using var stream = await service.OpenRepositoryTarballStreamAsync("owner", "private-repo", "main");
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.NotNull(stream);
+            using var ms = new MemoryStream();
+            await stream!.CopyToAsync(ms);
+            Assert.Equal(payload, ms.ToArray());
+
+            Assert.Contains("Authorization: Bearer private-install-token", hop1Request, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("GET /owner/private-repo/legacy.tar.gz/main?token=signed-5m HTTP/1.1", hop2Request, StringComparison.Ordinal);
+            Assert.DoesNotContain("Authorization:", hop2Request, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    [Fact]
+    public async Task VerifyPackageUpdateWritePermissionAsync_ValidatesAllAppInstallationScopes_AndPatPermissions()
+    {
+        var (pem, rsa) = GenerateRsaKeyPair();
+        using (rsa)
+        {
+            // 1. App mode: requires Contents=Write, PullRequests=Write, Issues=Write, Actions=Read (or Write)
+            var (appService, appClient) = CreateTestService(pem);
+            var appsClient = Substitute.For<IGitHubAppsClient>();
+            appClient.GitHubApps.Returns(appsClient);
+
+            static Installation MakeInstallation(
+                InstallationReadWritePermissionLevel? contentsLevel,
+                InstallationReadWritePermissionLevel? pullRequestsLevel,
+                InstallationReadWritePermissionLevel? issuesLevel,
+                InstallationReadWritePermissionLevel? actionsLevel)
+            {
+                var perms = (InstallationPermissions)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(InstallationPermissions));
+                if (contentsLevel.HasValue)
+                {
+                    typeof(InstallationPermissions).GetProperty(nameof(InstallationPermissions.Contents))?.SetValue(
+                        perms, (StringEnum<InstallationReadWritePermissionLevel>?)new StringEnum<InstallationReadWritePermissionLevel>(contentsLevel.Value));
+                }
+                if (pullRequestsLevel.HasValue)
+                {
+                    typeof(InstallationPermissions).GetProperty(nameof(InstallationPermissions.PullRequests))?.SetValue(
+                        perms, (StringEnum<InstallationReadWritePermissionLevel>?)new StringEnum<InstallationReadWritePermissionLevel>(pullRequestsLevel.Value));
+                }
+                if (issuesLevel.HasValue)
+                {
+                    typeof(InstallationPermissions).GetProperty(nameof(InstallationPermissions.Issues))?.SetValue(
+                        perms, (StringEnum<InstallationReadWritePermissionLevel>?)new StringEnum<InstallationReadWritePermissionLevel>(issuesLevel.Value));
+                }
+                if (actionsLevel.HasValue)
+                {
+                    typeof(InstallationPermissions).GetProperty(nameof(InstallationPermissions.Actions))?.SetValue(
+                        perms, (StringEnum<InstallationReadWritePermissionLevel>?)new StringEnum<InstallationReadWritePermissionLevel>(actionsLevel.Value));
+                }
+
+                var inst = (Installation)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Installation));
+                typeof(Installation).GetProperty(nameof(Installation.Permissions))?.SetValue(inst, perms);
+                return inst;
+            }
+
+            appsClient.GetRepositoryInstallationForCurrent("openRuyi-Project", "openRuyi")
+                .Returns(Task.FromResult(MakeInstallation(
+                    InstallationReadWritePermissionLevel.Write,
+                    InstallationReadWritePermissionLevel.Write,
+                    InstallationReadWritePermissionLevel.Write,
+                    InstallationReadWritePermissionLevel.Read)));
+            await appService.VerifyPackageUpdateWritePermissionAsync("openRuyi-Project", "openRuyi");
+
+            appsClient.GetRepositoryInstallationForCurrent("openRuyi-Project", "openRuyi")
+                .Returns(Task.FromResult(MakeInstallation(
+                    InstallationReadWritePermissionLevel.Read,
+                    InstallationReadWritePermissionLevel.Write,
+                    InstallationReadWritePermissionLevel.Write,
+                    InstallationReadWritePermissionLevel.Read)));
+            var exContents = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                appService.VerifyPackageUpdateWritePermissionAsync("openRuyi-Project", "openRuyi"));
+            Assert.Contains("Contents='read'", exContents.Message);
+            Assert.Contains("Contents: Read and write", exContents.Message);
+
+            appsClient.GetRepositoryInstallationForCurrent("openRuyi-Project", "openRuyi")
+                .Returns(Task.FromResult(MakeInstallation(
+                    InstallationReadWritePermissionLevel.Write,
+                    InstallationReadWritePermissionLevel.Read,
+                    InstallationReadWritePermissionLevel.Write,
+                    InstallationReadWritePermissionLevel.Read)));
+            var exPrs = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                appService.VerifyPackageUpdateWritePermissionAsync("openRuyi-Project", "openRuyi"));
+            Assert.Contains("Pull requests='read'", exPrs.Message);
+
+            appsClient.GetRepositoryInstallationForCurrent("openRuyi-Project", "openRuyi")
+                .Returns(Task.FromResult(MakeInstallation(
+                    InstallationReadWritePermissionLevel.Write,
+                    InstallationReadWritePermissionLevel.Write,
+                    InstallationReadWritePermissionLevel.Read,
+                    InstallationReadWritePermissionLevel.Read)));
+            var exIssues = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                appService.VerifyPackageUpdateWritePermissionAsync("openRuyi-Project", "openRuyi"));
+            Assert.Contains("Issues='read'", exIssues.Message);
+
+            appsClient.GetRepositoryInstallationForCurrent("openRuyi-Project", "openRuyi")
+                .Returns(Task.FromResult(MakeInstallation(
+                    InstallationReadWritePermissionLevel.Write,
+                    InstallationReadWritePermissionLevel.Write,
+                    InstallationReadWritePermissionLevel.Write,
+                    null)));
+            var exActions = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                appService.VerifyPackageUpdateWritePermissionAsync("openRuyi-Project", "openRuyi"));
+            Assert.Contains("Actions='none'", exActions.Message);
+            Assert.Contains("Actions: Read-only", exActions.Message);
+
+            // 2. BotPat mode: Push=true + Actions read OK passes; Push=false throws; missing Actions read throws
+            var patClient = Substitute.For<IGitHubClient>();
+            patClient.Connection.Returns(Substitute.For<IConnection>());
+            var reposClient = Substitute.For<IRepositoriesClient>();
+            var actionsClient = Substitute.For<IActionsClient>();
+            var workflowsClient = Substitute.For<IActionsWorkflowsClient>();
+            var runsClient = Substitute.For<IActionsWorkflowRunsClient>();
+            actionsClient.Workflows.Returns(workflowsClient);
+            workflowsClient.Runs.Returns(runsClient);
+            patClient.Repository.Returns(reposClient);
+            patClient.Actions.Returns(actionsClient);
+            var patService = new GitHubService(123456, pem, 789012, "ghp_pat", patClient);
+
+            var pushRepo = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+            typeof(Repository).GetProperty(nameof(Repository.Permissions))?.SetValue(
+                pushRepo, new RepositoryPermissions(admin: false, maintain: false, push: true, triage: true, pull: true));
+            reposClient.Get("openRuyi-Project", "openRuyi").Returns(Task.FromResult(pushRepo));
+            var emptyRuns = (WorkflowRunsResponse)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(WorkflowRunsResponse));
+            runsClient.List("openRuyi-Project", "openRuyi", Arg.Any<WorkflowRunsRequest>(), Arg.Any<ApiOptions>())
+                .Returns(Task.FromResult(emptyRuns));
+
+            await patService.VerifyPackageUpdateWritePermissionAsync("openRuyi-Project", "openRuyi");
+            await runsClient.Received(1).List(
+                "openRuyi-Project",
+                "openRuyi",
+                Arg.Any<WorkflowRunsRequest>(),
+                Arg.Is<ApiOptions>(o => o.PageSize == 1 && o.PageCount == 1));
+
+            var triageRepo = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+            typeof(Repository).GetProperty(nameof(Repository.Permissions))?.SetValue(
+                triageRepo, new RepositoryPermissions(admin: false, maintain: false, push: false, triage: true, pull: true));
+            reposClient.Get("openRuyi-Project", "openRuyi").Returns(Task.FromResult(triageRepo));
+            var exPat = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                patService.VerifyPackageUpdateWritePermissionAsync("openRuyi-Project", "openRuyi"));
+            Assert.Contains("push+", exPat.Message);
+
+            reposClient.Get("openRuyi-Project", "openRuyi").Returns(Task.FromResult(pushRepo));
+            var forbiddenResp = Substitute.For<IResponse>();
+            forbiddenResp.StatusCode.Returns(HttpStatusCode.Forbidden);
+            runsClient.List("openRuyi-Project", "openRuyi", Arg.Any<WorkflowRunsRequest>(), Arg.Any<ApiOptions>())
+                .Returns<Task<WorkflowRunsResponse>>(_ => throw new ForbiddenException(forbiddenResp));
+            var exPatActions = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                patService.VerifyPackageUpdateWritePermissionAsync("openRuyi-Project", "openRuyi"));
+            Assert.Contains("Actions: Read-only", exPatActions.Message);
+        }
+    }
+
+    [Fact]
+    public async Task VerifyBotPatTeamReadPermissionAsync_VerifiesOrganizationTeamAndSkipsPersonalUserRepo()
+    {
+        var (pem, rsa) = GenerateRsaKeyPair();
+        using (rsa)
+        {
+            var patClient = Substitute.For<IGitHubClient>();
+            patClient.Connection.Returns(Substitute.For<IConnection>());
+            var reposClient = Substitute.For<IRepositoriesClient>();
+            var orgClient = Substitute.For<IOrganizationsClient>();
+            var teamClient = Substitute.For<ITeamsClient>();
+            orgClient.Team.Returns(teamClient);
+            patClient.Repository.Returns(reposClient);
+            patClient.Organization.Returns(orgClient);
+
+            var patService = new GitHubService(123456, pem, 789012, "ghp_pat", patClient);
+
+            static Repository MakeRepoWithOwnerType(AccountType ownerType)
+            {
+                var ownerUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+                typeof(User).GetProperty(nameof(User.Type))?.SetValue(ownerUser, ownerType);
+                var repo = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+                typeof(Repository).GetProperty(nameof(Repository.Owner))?.SetValue(repo, ownerUser);
+                return repo;
+            }
+
+            // 1. Personal user repo -> skips organization team lookup
+            reposClient.Get("5teve2NT", "openRuyi").Returns(Task.FromResult(MakeRepoWithOwnerType(AccountType.User)));
+            await patService.VerifyBotPatTeamReadPermissionAsync("5teve2NT", "openRuyi", "captains");
+            await teamClient.DidNotReceiveWithAnyArgs().GetByName(default!, default!);
+
+            // 2. Organization repo with read:org -> succeeds
+            reposClient.Get("openRuyi-Project", "openRuyi").Returns(Task.FromResult(MakeRepoWithOwnerType(AccountType.Organization)));
+            var teamObj = (Team)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Team));
+            typeof(Team).GetProperty(nameof(Team.Id))?.SetValue(teamObj, 42);
+            teamClient.GetByName("openRuyi-Project", "captains").Returns(Task.FromResult(teamObj));
+            teamClient.GetAllMembers(42).Returns(Task.FromResult<IReadOnlyList<User>>(Array.Empty<User>()));
+            await patService.VerifyBotPatTeamReadPermissionAsync("openRuyi-Project", "openRuyi", "captains");
+
+            // 3. Organization repo missing read:org -> throws actionable InvalidOperationException
+            var forbiddenResp = Substitute.For<IResponse>();
+            forbiddenResp.StatusCode.Returns(HttpStatusCode.Forbidden);
+            teamClient.GetByName("openRuyi-Project", "captains")
+                .Returns<Task<Team>>(_ => throw new ForbiddenException(forbiddenResp));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                patService.VerifyBotPatTeamReadPermissionAsync("openRuyi-Project", "openRuyi", "captains"));
+            Assert.Contains("read:org", ex.Message);
         }
     }
 

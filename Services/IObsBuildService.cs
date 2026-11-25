@@ -38,7 +38,9 @@ public sealed record ObsPackageBuildFreshness(
     string? SourceMd5,
     string? LatestJobSrcMd5,
     DateTimeOffset? LatestJobStartTime,
-    ObsStatusCode LatestJobCode);
+    ObsStatusCode LatestJobCode,
+    string? ServiceCode = null,
+    DateTimeOffset? LatestSourceMtime = null);
 
 /// <summary>
 /// Narrow freshness verification gateway implemented by <see cref="ObsBuildService"/> to decouple

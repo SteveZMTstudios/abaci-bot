@@ -10,7 +10,8 @@
 
 1. **Create and install the GitHub App.** Configure the webhook URL
    (`https://<your-host>/api/webhook`), the webhook secret, the repository and
-   organization permissions, the private key, and the event subscriptions. Install
+   organization permissions (`Contents: Read and write` when `PackageUpdate:Enabled=true && DryRun=false`,
+   or `Read-only` when disabled or in `DryRun`), the private key, and the event subscriptions. Install
    the App on your organization (`<your-org>`) and note the installation ID.
    Follow [GitHub App Setup from Scratch](docs/deployment.md#5-github-app-setup-from-scratch).
 
@@ -87,7 +88,7 @@ curl -f "http://localhost:3456/health?verbose=true"
 ```
 
 `/health` returns liveness and immutable build/artifact metadata (`status`, `timestamp`, `version`, `commit`, `imageDigest`, `buildTime`, `deployment`).
-Passing `?verbose=true` additionally returns `startedAt`, `uptimeSeconds`, `capabilities` (`abiEngine`, `conversationGuardPermission`), `modules` (non-secret enabled/dryRun flags), and `runtime` (`lastError`, `lastErrorAt`).
+Passing `?verbose=true` additionally returns `startedAt`, `uptimeSeconds`, `capabilities` (`abiEngine`, `conversationGuardPermission`, `packageUpdatePermission`), `modules` (per-module `enabled`, `dryRun`, and safety switches such as `archiveEnabled` and `allowManagedFallback`), `runtime` (`lastError`, `lastErrorAt`), and `sources` (`Lookout`, `RustCrates`, `CveActiveWatch`).
 When the native Libabigail tool (`abipkgdiff`) is missing at startup (from which
 RPM extraction support is also inferred), the process aborts unless
 `AbiCompliance:AllowManagedFallback` is explicitly enabled. See [docs/modules/abi-compliance.md](docs/modules/abi-compliance.md).

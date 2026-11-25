@@ -367,8 +367,8 @@
     // Empty: allowed at startup; branch commit ownership, post-merge verification, and bot-triage checks fail closed whenever live identity resolution also fails.
     // Default: "aqua-rium".
     "BotLogin": "aqua-rium",
-    // Format: PAT with repository push+ access when combined with ConversationGuard:Enabled=true (ArchiveEnabled=true checks triage+, while collaborator probing in PAT mode requires push+).
-    // Note: when set, ALL bot GitHub API identity and writes switch from the App token to this user (use a dedicated machine user).
+    // Format: Personal Access Token string; when set, switches ALL GitHub API calls globally to that PAT user identity.
+    // Allowed scopes when enabled: Contents (Read and write), Pull requests (Read and write), Issues (Read and write), Actions (Read-only), Organization Members (Read-only / classic 'read:org' for team lookup in WorkflowStateModule), plus repository push+ access whenever PackageUpdate runs live (DryRun=false) or ConversationGuard:Enabled=true.
     // Empty: the GitHub App installation token is used instead (ConversationGuard:ArchiveEnabled=true is disallowed).
     // Default: empty (the App installation token is used).
     "BotPat": "",
@@ -466,8 +466,8 @@
     // 0: no delay between publishing candidates.
     "RequestThrottleMilliseconds": 2000,
     // Unit: bytes. Range: >= 0. Default: 104857600 (100 MiB).
-    // Maximum repository tarball size accepted for tar parsing after download buffering before falling back to Git Tree API.
-    // 0: disables the size cap and accepts any archive size.
+    // Maximum compressed repository tarball size accepted via HTTP Content-Length pre-check and bounded streaming read before aborting and falling back to Git Tree API (individual and cumulative decompressed .spec entries are separately capped at 4 MiB per file and 256 MiB total).
+    // 0: disables the compressed archive size cap and streams any compressed archive size.
     "MaxArchiveBytes": 104857600
   },
 
@@ -490,11 +490,11 @@
     "TargetRepository": "openRuyi-Project/openRuyi",
     // Unit: hours. Range: >= 1. Default: 24.
     "CheckIntervalHours": 24,
-    // Range: >= 1. Default: 1000.
+    // Range: 1..1000. Default: 1000.
     "OsvBatchSize": 1000,
     // Range: >= 0. Default: 0.
     // 0: every package in the catalog is evaluated during a sweep.
-    // Non-zero: packages scanned per sweep, advancing sequentially through the catalog across successive cycles.
+    // Non-zero: packages scanned per sweep, advancing sequentially across sweeps using a repository-scoped 2PC watermark persisted in bot-state.json when DryRun is false.
     "PackagesPerSweep": 0,
     // Allowed values: true, false. Default: false.
     // false: skips native RPM specs lacking an authoritative OSV ecosystem feed (crates.io or PyPI) to avoid cross-distribution false positives.
@@ -604,15 +604,15 @@
     // Unit: days. Range: >= 1. Default: 180.
     // Retention period for user language preferences before inactive entries are pruned.
     "LocaleRetentionDays": 180,
-    // Allowed values: "en", "zh".
+    // Allowed values: "en", "zh", and "en-*" / "zh-*" locale tags (normalized on validation).
     // Global fallback locale when neither repository policy nor user preference is set.
     // Default: "en".
     "DefaultLocale": "en",
-    // Format: map of "owner/repo" to "en" or "zh".
+    // Format: map of "owner/repo" to "en", "zh", or "en-*" / "zh-*" locale tags.
     // Empty: no repositories force a global language; users may select their preferred language.
     // Default: {}.
     "RepositoryForcedLocales": {},
-    // Format: map of "owner/repo" to "en" or "zh".
+    // Format: map of "owner/repo" to "en", "zh", or "en-*" / "zh-*" locale tags.
     // Empty: repositories fall back to DefaultLocale when a user has no personal preference.
     // Default: {}.
     "RepositoryDefaultLocales": {},

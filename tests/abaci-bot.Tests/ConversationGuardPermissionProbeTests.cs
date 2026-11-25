@@ -15,6 +15,7 @@ public class ConversationGuardPermissionProbeTests
     [Fact]
     public async Task StartAsync_WhenDisabled_SetsDisabledAndSkipsProbe()
     {
+        var runtimeHealth = new RuntimeHealthState();
         var options = Microsoft.Extensions.Options.Options.Create(new ConversationGuardOptions
         {
             Enabled = false,
@@ -24,18 +25,21 @@ public class ConversationGuardPermissionProbeTests
         var probe = new ConversationGuardPermissionProbe(
             options,
             _permissionService,
-            NullLogger<ConversationGuardPermissionProbe>.Instance);
+            NullLogger<ConversationGuardPermissionProbe>.Instance,
+            runtimeHealth);
 
         await probe.StartAsync(CancellationToken.None);
         await probe.StopAsync(CancellationToken.None);
 
-        Assert.Equal("disabled", ConversationGuardPermissionProbe.ProbeStatus);
+        Assert.Equal("disabled", probe.Status);
+        Assert.Equal("disabled", runtimeHealth.GetCapabilityStatus("conversationGuardPermission"));
         await _permissionService.DidNotReceiveWithAnyArgs().VerifyCollaboratorPermissionProbeAsync(default!, default!, default);
     }
 
     [Fact]
     public async Task StartAsync_WhenEnabledWithNoRepositories_SetsNoRepositories()
     {
+        var runtimeHealth = new RuntimeHealthState();
         var options = Microsoft.Extensions.Options.Options.Create(new ConversationGuardOptions
         {
             Enabled = true,
@@ -45,17 +49,20 @@ public class ConversationGuardPermissionProbeTests
         var probe = new ConversationGuardPermissionProbe(
             options,
             _permissionService,
-            NullLogger<ConversationGuardPermissionProbe>.Instance);
+            NullLogger<ConversationGuardPermissionProbe>.Instance,
+            runtimeHealth);
 
         await probe.StartAsync(CancellationToken.None);
 
-        Assert.Equal("no-repositories", ConversationGuardPermissionProbe.ProbeStatus);
+        Assert.Equal("no-repositories", probe.Status);
+        Assert.Equal("no-repositories", runtimeHealth.GetCapabilityStatus("conversationGuardPermission"));
         await _permissionService.DidNotReceiveWithAnyArgs().VerifyCollaboratorPermissionProbeAsync(default!, default!, default);
     }
 
     [Fact]
     public async Task StartAsync_WhenProbeSucceeds_SetsVerified()
     {
+        var runtimeHealth = new RuntimeHealthState();
         var options = Microsoft.Extensions.Options.Options.Create(new ConversationGuardOptions
         {
             Enabled = true,
@@ -65,11 +72,13 @@ public class ConversationGuardPermissionProbeTests
         var probe = new ConversationGuardPermissionProbe(
             options,
             _permissionService,
-            NullLogger<ConversationGuardPermissionProbe>.Instance);
+            NullLogger<ConversationGuardPermissionProbe>.Instance,
+            runtimeHealth);
 
         await probe.StartAsync(CancellationToken.None);
 
-        Assert.Equal("verified", ConversationGuardPermissionProbe.ProbeStatus);
+        Assert.Equal("verified", probe.Status);
+        Assert.Equal("verified", runtimeHealth.GetCapabilityStatus("conversationGuardPermission"));
         await _permissionService.Received(1).VerifyCollaboratorPermissionProbeAsync("owner", "repo", Arg.Any<CancellationToken>());
         await _permissionService.DidNotReceiveWithAnyArgs().VerifyArchivePermissionProbeAsync(default!, default!, default);
     }
@@ -77,6 +86,7 @@ public class ConversationGuardPermissionProbeTests
     [Fact]
     public async Task StartAsync_WhenArchiveEnabledAndProbeSucceeds_VerifiesArchivePermissionAndSetsVerified()
     {
+        var runtimeHealth = new RuntimeHealthState();
         var options = Microsoft.Extensions.Options.Options.Create(new ConversationGuardOptions
         {
             Enabled = true,
@@ -87,11 +97,13 @@ public class ConversationGuardPermissionProbeTests
         var probe = new ConversationGuardPermissionProbe(
             options,
             _permissionService,
-            NullLogger<ConversationGuardPermissionProbe>.Instance);
+            NullLogger<ConversationGuardPermissionProbe>.Instance,
+            runtimeHealth);
 
         await probe.StartAsync(CancellationToken.None);
 
-        Assert.Equal("verified", ConversationGuardPermissionProbe.ProbeStatus);
+        Assert.Equal("verified", probe.Status);
+        Assert.Equal("verified", runtimeHealth.GetCapabilityStatus("conversationGuardPermission"));
         await _permissionService.Received(1).VerifyCollaboratorPermissionProbeAsync("owner", "repo", Arg.Any<CancellationToken>());
         await _permissionService.Received(1).VerifyArchivePermissionProbeAsync("owner", "repo", Arg.Any<CancellationToken>());
     }
@@ -99,6 +111,7 @@ public class ConversationGuardPermissionProbeTests
     [Fact]
     public async Task StartAsync_WhenArchiveEnabledAndArchiveProbeFails_AbortsStartupWithFatalException()
     {
+        var runtimeHealth = new RuntimeHealthState();
         var options = Microsoft.Extensions.Options.Options.Create(new ConversationGuardOptions
         {
             Enabled = true,
@@ -112,11 +125,13 @@ public class ConversationGuardPermissionProbeTests
         var probe = new ConversationGuardPermissionProbe(
             options,
             _permissionService,
-            NullLogger<ConversationGuardPermissionProbe>.Instance);
+            NullLogger<ConversationGuardPermissionProbe>.Instance,
+            runtimeHealth);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => probe.StartAsync(CancellationToken.None));
 
-        Assert.Equal("failed", ConversationGuardPermissionProbe.ProbeStatus);
+        Assert.Equal("failed", probe.Status);
+        Assert.Equal("failed", runtimeHealth.GetCapabilityStatus("conversationGuardPermission"));
         Assert.Contains("PackageUpdate:BotPat", ex.Message);
         Assert.Contains("cannot execute archivePullRequest", ex.Message);
         Assert.Contains("ArchiveEnabled=false", ex.Message);
@@ -125,6 +140,7 @@ public class ConversationGuardPermissionProbeTests
     [Fact]
     public async Task StartAsync_WhenProbeThrowsForbidden_AbortsStartupWithFatalException()
     {
+        var runtimeHealth = new RuntimeHealthState();
         var options = Microsoft.Extensions.Options.Options.Create(new ConversationGuardOptions
         {
             Enabled = true,
@@ -137,12 +153,14 @@ public class ConversationGuardPermissionProbeTests
         var probe = new ConversationGuardPermissionProbe(
             options,
             _permissionService,
-            NullLogger<ConversationGuardPermissionProbe>.Instance);
+            NullLogger<ConversationGuardPermissionProbe>.Instance,
+            runtimeHealth);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => probe.StartAsync(CancellationToken.None));
 
-        Assert.Equal("failed", ConversationGuardPermissionProbe.ProbeStatus);
-        Assert.Contains("Administration: Read-only", ex.Message);
+        Assert.Equal("failed", probe.Status);
+        Assert.Equal("failed", runtimeHealth.GetCapabilityStatus("conversationGuardPermission"));
+        Assert.Contains("Metadata: Read-only", ex.Message);
     }
 
     [Fact]

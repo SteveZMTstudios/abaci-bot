@@ -981,7 +981,34 @@ public class ConversationGuardServiceTests
         await _gitHub.DidNotReceiveWithAnyArgs().MinimizeCommentAsync(default!, default!, default, default!, default!, default);
         await _gitHub.Received(1).CreateCommentAsync(
             "owner", "repo", 42,
-            Arg.Is<string>(s => s.Contains("maintainers cannot be hidden", StringComparison.OrdinalIgnoreCase)),
+            Arg.Is<string>(s =>
+                s.Contains("Failed to verify repository permissions", StringComparison.OrdinalIgnoreCase) &&
+                s.Contains("GitHub API error", StringComparison.OrdinalIgnoreCase) &&
+                !s.Contains("maintainers cannot be hidden", StringComparison.OrdinalIgnoreCase)),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task HandleCommandAsync_Hide_WhenBotFallbackPermissionLookupThrows_FailsClosedWithLookupErrorReply()
+    {
+        var service = CreateService();
+        var context = CreateContext("maintainer-user", senderPermission: RepositoryAccessLevel.Maintain);
+        _permissionService.GetUserPermissionAsync("owner", "repo", "some-app", Arg.Any<CancellationToken>())
+            .Returns(RepositoryAccessLevel.None);
+        _permissionService.GetUserPermissionAsync("owner", "repo", "some-app[bot]", Arg.Any<CancellationToken>())
+            .Returns<Task<RepositoryAccessLevel>>(_ => throw new HttpRequestException("503 Service Unavailable"));
+        _gitHub.GetIssueCommentsAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(new[] { CreateIssueComment(12L, "IC_12", "some-app[bot]") });
+
+        await service.HandleCommandAsync(context, "@abaci-bot hide @some-app", "maintainer-user", CancellationToken.None);
+
+        await _gitHub.DidNotReceiveWithAnyArgs().MinimizeCommentAsync(default!, default!, default, default!, default!, default);
+        await _gitHub.Received(1).CreateCommentAsync(
+            "owner", "repo", 42,
+            Arg.Is<string>(s =>
+                s.Contains("some-app[bot]", StringComparison.Ordinal) &&
+                s.Contains("Failed to verify repository permissions", StringComparison.OrdinalIgnoreCase) &&
+                !s.Contains("maintainers cannot be hidden", StringComparison.OrdinalIgnoreCase)),
             Arg.Any<CancellationToken>());
     }
 

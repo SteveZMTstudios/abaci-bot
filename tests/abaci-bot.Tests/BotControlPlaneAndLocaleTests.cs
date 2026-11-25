@@ -771,6 +771,7 @@ public class BotControlPlaneAndLocaleTests
         Assert.Contains("\"status\":\"healthy\"", minimalJson, StringComparison.Ordinal);
         Assert.DoesNotContain("abiEngine", minimalJson, StringComparison.Ordinal);
         Assert.DoesNotContain("conversationGuardPermission", minimalJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("packageUpdatePermission", minimalJson, StringComparison.Ordinal);
         Assert.DoesNotContain("uptimeSeconds", minimalJson, StringComparison.Ordinal);
 
         var firstVerboseJson = System.Text.Json.JsonSerializer.Serialize(HealthResponseBuilder.Build(
@@ -788,6 +789,12 @@ public class BotControlPlaneAndLocaleTests
 
         Assert.Contains("\"uptimeSeconds\":45", firstVerboseJson, StringComparison.Ordinal);
         Assert.Contains("\"lastError\":null", firstVerboseJson, StringComparison.Ordinal);
+        Assert.Contains("\"conversationGuardPermission\":\"disabled\"", firstVerboseJson, StringComparison.Ordinal);
+        Assert.Contains("\"packageUpdatePermission\":\"disabled\"", firstVerboseJson, StringComparison.Ordinal);
+
+        // Capability probe statuses come from instance RuntimeHealthState rather than static mutable fields
+        runtimeHealth.SetCapabilityStatus("conversationGuardPermission", "verified");
+        runtimeHealth.SetCapabilityStatus("packageUpdatePermission", "verified");
 
         // Error logged via host ILogger populates lastError and redacts tokens
         logger.LogError(new InvalidOperationException("bad token ghp_secret123"), "Sweep failed");
@@ -807,7 +814,8 @@ public class BotControlPlaneAndLocaleTests
 
         Assert.Contains("\"capabilities\"", secondVerboseJson, StringComparison.Ordinal);
         Assert.Contains("\"abiEngine\"", secondVerboseJson, StringComparison.Ordinal);
-        Assert.Contains("\"conversationGuardPermission\"", secondVerboseJson, StringComparison.Ordinal);
+        Assert.Contains("\"conversationGuardPermission\":\"verified\"", secondVerboseJson, StringComparison.Ordinal);
+        Assert.Contains("\"packageUpdatePermission\":\"verified\"", secondVerboseJson, StringComparison.Ordinal);
         Assert.Contains("\"modules\"", secondVerboseJson, StringComparison.Ordinal);
         Assert.Contains("TestService: Sweep failed (InvalidOperationException: bad token [REDACTED])", secondVerboseJson, StringComparison.Ordinal);
         Assert.DoesNotContain("ghp_secret123", secondVerboseJson, StringComparison.Ordinal);

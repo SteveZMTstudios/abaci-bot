@@ -131,7 +131,14 @@ public partial class ConversationGuardService : IConversationGuardService
         }
     }
 
-    private async Task<bool> IsProtectedMaintainerAsync(
+    private enum TargetProtectionStatus
+    {
+        NonMaintainer,
+        Maintainer,
+        LookupFailed
+    }
+
+    private async Task<TargetProtectionStatus> CheckTargetProtectionAsync(
         string owner,
         string repo,
         string username,
@@ -139,24 +146,62 @@ public partial class ConversationGuardService : IConversationGuardService
     {
         if (string.IsNullOrWhiteSpace(username))
         {
-            return false;
+            return TargetProtectionStatus.NonMaintainer;
         }
 
         try
         {
             var level = await _permissionService.GetUserPermissionAsync(owner, repo, username, cancellationToken);
-            return level >= RepositoryAccessLevel.Triage;
+            return level >= RepositoryAccessLevel.Triage
+                ? TargetProtectionStatus.Maintainer
+                : TargetProtectionStatus.NonMaintainer;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Target protection fails closed so transient API/rate-limit errors never fold a maintainer's comment.
             _logger?.LogWarning(
                 ex,
-                "Failed to query repository collaborator permission for target '{Username}' on '{Owner}/{Repo}'; treating target as protected maintainer fail-closed.",
+                "Failed to query repository collaborator permission for target '{Username}' on '{Owner}/{Repo}'; aborting hide fail-closed.",
                 username,
                 owner,
                 repo);
-            return true;
+            return TargetProtectionStatus.LookupFailed;
+        }
+    }
+
+    private async Task<bool> TryEnsureTargetCanBeHiddenAsync(
+        PullRequestContext context,
+        string targetLogin,
+        string senderLogin,
+        bool isZh,
+        CancellationToken cancellationToken)
+    {
+        switch (await CheckTargetProtectionAsync(context.Owner, context.Repo, targetLogin, cancellationToken))
+        {
+            case TargetProtectionStatus.Maintainer:
+                await TryPostReplyAsync(
+                    context,
+                    isZh
+                        ? $"@{senderLogin} 不能折叠仓库维护者的评论。"
+                        : $"@{senderLogin} Comments authored by repository maintainers cannot be hidden.",
+                    $"Would reject hide targeting maintainer @{targetLogin} by @{senderLogin}",
+                    ephemeral: true,
+                    cancellationToken);
+                return false;
+
+            case TargetProtectionStatus.LookupFailed:
+                await TryPostReplyAsync(
+                    context,
+                    isZh
+                        ? $"@{senderLogin} 查询 @{targetLogin} 的仓库权限时发生 GitHub API 错误，出于安全考虑已取消折叠，请稍后重试。"
+                        : $"@{senderLogin} Failed to verify repository permissions for @{targetLogin} due to a GitHub API error; hiding was aborted fail-closed. Please try again later.",
+                    $"Would abort hide targeting @{targetLogin} fail-closed due to permission lookup error for @{senderLogin}",
+                    ephemeral: true,
+                    cancellationToken);
+                return false;
+
+            default:
+                return true;
         }
     }
 
@@ -523,16 +568,8 @@ public partial class ConversationGuardService : IConversationGuardService
             return;
         }
 
-        if (await IsProtectedMaintainerAsync(context.Owner, context.Repo, targetUser, cancellationToken))
+        if (!await TryEnsureTargetCanBeHiddenAsync(context, targetUser, senderLogin, isZh, cancellationToken))
         {
-            await TryPostReplyAsync(
-                context,
-                isZh
-                    ? $"@{senderLogin} 不能折叠仓库维护者的评论。"
-                    : $"@{senderLogin} Comments authored by repository maintainers cannot be hidden.",
-                $"Would reject hide targeting maintainer @{targetUser} by @{senderLogin}",
-                ephemeral: true,
-                cancellationToken);
             return;
         }
 
@@ -579,16 +616,8 @@ public partial class ConversationGuardService : IConversationGuardService
 
             if (botComments.Count > 0)
             {
-                if (await IsProtectedMaintainerAsync(context.Owner, context.Repo, botLoginCandidate, cancellationToken))
+                if (!await TryEnsureTargetCanBeHiddenAsync(context, botLoginCandidate, senderLogin, isZh, cancellationToken))
                 {
-                    await TryPostReplyAsync(
-                        context,
-                        isZh
-                            ? $"@{senderLogin} 不能折叠仓库维护者的评论。"
-                            : $"@{senderLogin} Comments authored by repository maintainers cannot be hidden.",
-                        $"Would reject hide targeting maintainer @{botLoginCandidate} by @{senderLogin}",
-                        ephemeral: true,
-                        cancellationToken);
                     return;
                 }
 

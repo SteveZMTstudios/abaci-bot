@@ -218,39 +218,20 @@ server {
 
 | Scope | Permission | Why |
 |---|---|---|
-| Repository | **Actions: Read-only** | List and download workflow artifacts for ABI comparison. |
-| Repository | **Contents: Read-only** | Read changed specs, patches, and license expressions. |
+| Repository | **Actions: Read-only** | List and download workflow artifacts for ABI comparison and CI checksum extraction. |
+| Repository | **Contents: Read and write** | Read specs/patches/licenses and (when `PackageUpdate:Enabled=true && DryRun=false`) create/update `autoupdate/<pkg>` branches, commit rewritten SPECs, backfill `#!RemoteAsset`, and reclaim branches. Can stay **Read-only** while `PackageUpdate:Enabled=false` or `PackageUpdate:DryRun=true`. |
 | Repository | **Issues: Read & write** | Apply labels, post comments, file CVE/update issues. |
-| Repository | **Pull requests: Read & write** | Apply labels, post comments, read review state. |
-| Repository | **Metadata: Read-only** | Mandatory for every GitHub App. |
+| Repository | **Pull requests: Read & write** | Apply labels, post comments, read review state, and open automated update pull requests. |
+| Repository | **Metadata: Read-only** | Mandatory for every GitHub App (and sufficient for App collaborator permission queries). |
 | Organization | **Members: Read-only** | Resolve the configured maintainer team (`GitHubApp:TeamName`, e.g. `captains`) for review transitions. |
 
-`Contents: write` is only needed if you want the App itself to merge pull requests; the
-bot does not. No `Workflows` or `Checks` permission is required while community
-governance (`ConversationGuard`) remains disabled.
+`Contents: Read and write` is required whenever `PackageUpdate:Enabled` is `true` and `PackageUpdate:DryRun` is `false` (unless using a compliant `PackageUpdate:BotPat`). If `PackageUpdate:Enabled` remains `false` or `PackageUpdate:DryRun` remains `true`, `Contents: Read-only` is sufficient—`abaci-bot` never merges pull requests. No `Workflows` or `Checks` permission is required while community governance (`ConversationGuard`) remains disabled.
 
 > [!NOTE]
-> **Elevated permissions for `ConversationGuard`:** When `ConversationGuard:Enabled`
-> is set to `true`, authorizing `@<bot> lock`, `@<bot> unlock`, and `@<bot> hide` against
-> authoritative repository collaborator roles (`triage`/`write`+) requires granting the
-> GitHub App **Repository -> Administration: Read-only** (or **Contents: Read & write**);
-> if `PackageUpdate:BotPat` is configured, GitHub's collaborator permissions endpoint routes
-> through the PAT and `VerifyCollaboratorPermissionProbeAsync` requires **`push`+** access on
-> that PAT.
-> Additionally enabling `ConversationGuard:ArchiveEnabled=true` (`@<bot> archive`) requires
-> `PackageUpdate:BotPat` (note: configuring `BotPat` shifts all bot GitHub API writes to that
-> user account) because GitHub's `archivePullRequest` GraphQL mutation requires a user role
-> (`triage` or higher) and always returns `FORBIDDEN` for GitHub App installation tokens even
-> when **Administration: Read & write** is granted; while `VerifyArchivePermissionProbeAsync`
-> checks `triage`+, combining `ArchiveEnabled=true` with `ConversationGuard:Enabled=true`
-> means the shared PAT must hold **`push`+** access for collaborator probing (once archived, PRs
-> are strictly read-only and reject all new comments with HTTP 403).
-> On startup (including when `DryRun` is `true`, and before webhooks or background sweeps run),
-> `ConversationGuardOptionsValidator` and `ConversationGuardPermissionProbe` verify collaborator
-> endpoint access (and require `PackageUpdate:BotPat` when `ArchiveEnabled=true`) across
-> `ConversationGuard:RepositoryAllowList`, aborting startup if requirements are missing. Keep
-> `ConversationGuard:ArchiveEnabled` set to `false` for App-only deployments, and keep
-> `ConversationGuard:Enabled` set to `false` to preserve the baseline minimal permission set.
+> **Elevated & PAT Permissions for `ConversationGuard` and `PackageUpdate:BotPat`:**
+> - **App-only `ConversationGuard` (`Enabled=true`, `ArchiveEnabled=false`):** GitHub REST collaborator queries require only mandatory **Repository -> Metadata: Read-only** on the GitHub App installation (do **not** grant `Administration` or `Contents: Read and write` solely for collaborator probing).
+> - **PAT mode (`PackageUpdate:BotPat` configured, mandatory for `ArchiveEnabled=true`):** Configuring `BotPat` switches **all** GitHub API calls across every module globally to that PAT user identity. Therefore, the PAT must hold the **complete superset** required by active modules: **`push+`** repository access (required whenever `PackageUpdate` runs live with `DryRun=false` or `ConversationGuard:Enabled=true`), **`triage+`** access (for `@<bot> archive`), **`Contents: Read and write`**, **`Issues: Read and write`**, **`Pull requests: Read and write`**, **`Actions: Read-only`**, and classic **`read:org`** / fine-grained **`Organization -> Members: Read-only`** (so `WorkflowStateModule` team-captain queries succeed on `issue_comment` events).
+> - On startup (including `DryRun=true`, and before webhooks or background sweeps start), `ConversationGuardPermissionProbe` verifies collaborator/`ArchiveEnabled` requirements and `PackageUpdatePermissionProbe` verifies all four required repository GitHub App installation permissions (`Contents: write`, `Pull requests: write`, `Issues: write`, `Actions: read`) when `PackageUpdate:Enabled=true && DryRun=false`, or in `BotPat` mode verifies repository `push+` write role and read-only `Actions` access when `PackageUpdate:Enabled=true && DryRun=false`, plus organization `read:org` / `Members: Read-only` team lookup (deduplicated once per unique organization across active modules, falling back to `PackageUpdate:TargetRepository` even when optional modules are disabled; note GitHub's REST API exposes no non-mutating write-scope introspection endpoint for fine-grained PAT `Contents`/`Issues`/`Pull requests` grants), aborting startup on missing permissions. Keep `ConversationGuard:ArchiveEnabled=false` for App-only deployments.
 
 ### 5.3 Event subscriptions
 
@@ -331,7 +312,7 @@ Expected default JSON response (liveness + immutable build/artifact identity):
   "deployment": "container"
 }
 ```
-Pass `?verbose=true` (`curl -f "http://localhost:3456/health?verbose=true"`) for operational diagnostics including `startedAt`, `uptimeSeconds`, `capabilities` (`abiEngine`, `conversationGuardPermission`), `modules` (non-secret enabled/dryRun flags), `runtime` (`lastError`, `lastErrorAt`), and `sources` (per-source snapshots for `Lookout` and `RustCrates`: `status` as `healthy` / `degraded` / `failed` / `disabled`, `lastAttemptAt`, `lastSuccessAt` reflecting only clean `healthy` sweeps and preserved across `degraded`/`failed`, `lastCandidateCount`, `lastPublishedCount`, `lastSkippedCount`, `oldestCandidatePublishedAt`, `consecutiveFailures`, and sanitized `lastError`). Because `GET /health` is an unauthenticated Kubernetes/Docker liveness endpoint, default `GET /health` always returns HTTP 200 regardless of third-party upstream outages, and operators exposing `abaci-bot` on the public internet should restrict `?verbose=true` (for example matching query string `verbose`) to localhost or internal monitoring networks at the reverse proxy.
+Pass `?verbose=true` (`curl -f "http://localhost:3456/health?verbose=true"`) for operational diagnostics including `startedAt`, `uptimeSeconds`, `capabilities` (`abiEngine`, `conversationGuardPermission`, `packageUpdatePermission`), `modules` (non-secret enabled/dryRun flags and safety toggles), `runtime` (`lastError`, `lastErrorAt`), and `sources` (per-source snapshots for `Lookout`, `RustCrates`, and `CveActiveWatch`: `status` as `healthy` / `degraded` / `failed` / `disabled`, `lastAttemptAt`, `lastSuccessAt` reflecting only clean `healthy` sweeps and preserved across `degraded`/`failed`, `lastCandidateCount`, `lastPublishedCount`, `lastSkippedCount`, `oldestCandidatePublishedAt`, `consecutiveFailures`, and sanitized `lastError`). Because `GET /health` is an unauthenticated Kubernetes/Docker liveness endpoint, default `GET /health` always returns HTTP 200 regardless of third-party upstream outages, and operators exposing `abaci-bot` on the public internet should restrict `?verbose=true` (for example matching query string `verbose`) to localhost or internal monitoring networks at the reverse proxy.
 Use `./scripts/docker-build.sh` (or `./scripts/docker-build.ps1`) when building the Docker image locally so `GIT_COMMIT` and `GIT_DIRTY` are detected automatically; native `dotnet build`/`dotnet publish` and the release workflow (`github.sha` + `git status --porcelain`) populate `commit` automatically (appending `-dirty` when the working tree has uncommitted changes). Because the OCI registry manifest digest (`sha256:...`) does not exist until after a container image is built and pushed, the release workflow captures `build-and-push.outputs.digest` into a `deployment-manifest.env` artifact (`ABACI_IMAGE_DIGEST`), which you fetch with `gh run download -R openRuyi-Project/abaci-bot --name deployment-manifest --dir .` and pass via `docker compose --env-file deployment-manifest.env up -d` (defaulting to `"unknown"` when omitted). Neither `/health` nor `/health?verbose=true` exposes filesystem paths, environment variables, or secrets.
 
 In verbose mode, `capabilities.abiEngine` reports `native`, `managed`, `unavailable`, or

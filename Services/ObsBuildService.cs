@@ -174,6 +174,9 @@ public class ObsBuildService : IObsBuildService, IObsBuildFreshnessGateway
         bool isServiceReady = true;
         string? directorySrcMd5 = null;
         string? serviceXsrcMd5 = null;
+        string? serviceCode = null;
+        long? maxServiceEntryMtime = null;
+        long? maxAnyEntryMtime = null;
 
         try
         {
@@ -197,10 +200,34 @@ public class ObsBuildService : IObsBuildService, IObsBuildFreshnessGateway
                 }
                 else if (sourceReader.Name == "serviceinfo")
                 {
-                    var serviceCode = sourceReader.GetAttribute("code")?.Trim();
+                    serviceCode = sourceReader.GetAttribute("code")?.Trim();
                     isServiceReady = string.IsNullOrEmpty(serviceCode) ||
                                      string.Equals(serviceCode, "succeeded", StringComparison.OrdinalIgnoreCase);
                     serviceXsrcMd5 = sourceReader.GetAttribute("xsrcmd5")?.Trim();
+                }
+                else if (sourceReader.Name == "entry")
+                {
+                    var mtimeRaw = sourceReader.GetAttribute("mtime");
+                    if (long.TryParse(
+                            mtimeRaw,
+                            System.Globalization.NumberStyles.Integer,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            out var mtimeSec) &&
+                        mtimeSec >= 0)
+                    {
+                        if (!maxAnyEntryMtime.HasValue || mtimeSec > maxAnyEntryMtime.Value)
+                        {
+                            maxAnyEntryMtime = mtimeSec;
+                        }
+
+                        var entryName = sourceReader.GetAttribute("name")?.Trim();
+                        if (!string.IsNullOrEmpty(entryName) &&
+                            entryName.StartsWith("_service:", StringComparison.OrdinalIgnoreCase) &&
+                            (!maxServiceEntryMtime.HasValue || mtimeSec > maxServiceEntryMtime.Value))
+                        {
+                            maxServiceEntryMtime = mtimeSec;
+                        }
+                    }
                 }
             }
         }
@@ -210,6 +237,10 @@ public class ObsBuildService : IObsBuildService, IObsBuildFreshnessGateway
             return null;
         }
 
+        var selectedMtime = maxServiceEntryMtime ?? maxAnyEntryMtime;
+        DateTimeOffset? latestSourceMtime = selectedMtime.HasValue
+            ? DateTimeOffset.FromUnixTimeSeconds(selectedMtime.Value)
+            : null;
         var sourceMd5 = !string.IsNullOrWhiteSpace(serviceXsrcMd5) ? serviceXsrcMd5 : directorySrcMd5;
 
         // OBS _jobhistory?package={pkg}&limit=5 returns the 5 newest jobs in ascending starttime order;
@@ -269,10 +300,10 @@ public class ObsBuildService : IObsBuildService, IObsBuildFreshnessGateway
 
         if (!foundAnyJob)
         {
-            return new ObsPackageBuildFreshness(isServiceReady, sourceMd5, null, null, ObsStatusCode.Unknown);
+            return new ObsPackageBuildFreshness(isServiceReady, sourceMd5, null, null, ObsStatusCode.Unknown, serviceCode, latestSourceMtime);
         }
 
-        return new ObsPackageBuildFreshness(isServiceReady, sourceMd5, bestSrcMd5, bestStartTime, bestCode);
+        return new ObsPackageBuildFreshness(isServiceReady, sourceMd5, bestSrcMd5, bestStartTime, bestCode, serviceCode, latestSourceMtime);
     }
 
     private static ObsStatusCode ParseStatusCode(string rawCode)

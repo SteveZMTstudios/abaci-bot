@@ -14,6 +14,11 @@ namespace abaci_bot.Services;
 /// </summary>
 public class CveActiveWatchService : BackgroundService
 {
+    internal const string HealthSourceName = "CveActiveWatch";
+    internal const int MaxConsecutiveRewindsPerPackage = 3;
+    private const string CursorStateKey = "cve-active-watch";
+    private const string PoisonCursorStateKey = "cve-active-watch-poison";
+
     private readonly IGitHubService _gitHubService;
     private readonly IPagedIssueSearchGateway? _pagedIssueSearch;
     private readonly IPackageVulnerabilityScanner _scanner;
@@ -21,7 +26,25 @@ public class CveActiveWatchService : BackgroundService
     private readonly ILogger<CveActiveWatchService>? _logger;
     private readonly ISpecCatalog? _specCatalog;
     private readonly Func<CancellationToken, Task<IReadOnlyList<(string PackageName, string Version)>>>? _catalogProvider;
-    private int _catalogOffset;
+    private readonly IBotStateStore? _stateStore;
+    private readonly RuntimeHealthState? _healthState;
+    private readonly string _cursorStateKey;
+    private readonly string _poisonStateKey;
+    private string? _lastWatermark;
+    private string? _lastPoisonPackage;
+    private int _lastPoisonRewindCount;
+    private bool _poisonStateLoaded;
+    private bool _hasPersistedPoisonState;
+
+    public static string GetCursorStateKey(string? targetRepository) =>
+        string.IsNullOrWhiteSpace(targetRepository)
+            ? CursorStateKey
+            : $"{CursorStateKey}:{targetRepository.Trim().ToLowerInvariant()}";
+
+    public static string GetPoisonStateKey(string? targetRepository) =>
+        string.IsNullOrWhiteSpace(targetRepository)
+            ? PoisonCursorStateKey
+            : $"{PoisonCursorStateKey}:{targetRepository.Trim().ToLowerInvariant()}";
 
     private static readonly Regex PackageIssueTitleRegex = new(
         @"^\[Security\]\s*Outstanding CVEs detected in\s+(?<pkg>\S+)",
@@ -41,14 +64,6 @@ public class CveActiveWatchService : BackgroundService
         GitHubLabels.Severity4
     };
 
-    private static readonly Regex FullVersionRegex = new(
-        @"^\s*%global\s+full_version\s+(?<ver>\S+)",
-        RegexOptions.Compiled | RegexOptions.Multiline);
-
-    private static readonly Regex VersionRegex = new(
-        @"^Version:\s*(?<ver>\S+)",
-        RegexOptions.Compiled | RegexOptions.Multiline);
-
     private static readonly Regex CrateNameRegex = new(
         @"^%global\s+crate_name\s+(?<name>\S+)",
         RegexOptions.Compiled | RegexOptions.Multiline);
@@ -64,7 +79,9 @@ public class CveActiveWatchService : BackgroundService
         ILogger<CveActiveWatchService>? logger = null,
         ISpecCatalog? specCatalog = null,
         Func<CancellationToken, Task<IReadOnlyList<(string PackageName, string Version)>>>? catalogProvider = null,
-        IPagedIssueSearchGateway? pagedIssueSearch = null)
+        IPagedIssueSearchGateway? pagedIssueSearch = null,
+        IBotStateStore? stateStore = null,
+        RuntimeHealthState? healthState = null)
     {
         _gitHubService = gitHubService;
         _scanner = scanner;
@@ -73,6 +90,10 @@ public class CveActiveWatchService : BackgroundService
         _specCatalog = specCatalog;
         _catalogProvider = catalogProvider;
         _pagedIssueSearch = pagedIssueSearch ?? gitHubService as IPagedIssueSearchGateway;
+        _stateStore = stateStore;
+        _healthState = healthState;
+        _cursorStateKey = GetCursorStateKey(options.Value.TargetRepository);
+        _poisonStateKey = GetPoisonStateKey(options.Value.TargetRepository);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -89,6 +110,7 @@ public class CveActiveWatchService : BackgroundService
                 }
                 else
                 {
+                    _healthState?.RecordSourceOutcome(HealthSourceName, "disabled", 0);
                     _logger?.LogDebug("CveActiveWatchService is disabled or TargetRepository is unconfigured; skipping sweep");
                 }
             }
@@ -98,6 +120,7 @@ public class CveActiveWatchService : BackgroundService
             }
             catch (Exception ex)
             {
+                _healthState?.RecordSourceOutcome(HealthSourceName, "failed", 0, ex.Message);
                 _logger?.LogError(ex, "Unexpected error occurred during CveActiveWatchService sweep");
             }
 
@@ -115,6 +138,7 @@ public class CveActiveWatchService : BackgroundService
         if (parts.Length != 2)
         {
             _logger?.LogError("Invalid TargetRepository format '{Repo}'; expected 'owner/repo'", targetRepo);
+            _healthState?.RecordSourceOutcome(HealthSourceName, "failed", 0, $"Invalid TargetRepository format '{targetRepo}'");
             return;
         }
 
@@ -129,16 +153,21 @@ public class CveActiveWatchService : BackgroundService
         {
             _logger?.LogWarning("Rate limit remaining ({Remaining}) is unknown or low; deferring CVE scan sweep",
                 rateLimit?.CoreRemaining?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown");
+            _healthState?.RecordSourceOutcome(HealthSourceName, "degraded", 0, "GitHub Core API rate limit is unknown or low.");
             return;
         }
         if (!rateLimit.SearchRemaining.HasValue || rateLimit.SearchRemaining.Value < 5)
         {
             _logger?.LogWarning("GitHub Search API rate limit remaining ({Remaining}) is unknown or low; deferring CVE scan sweep",
                 rateLimit.SearchRemaining?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown");
+            _healthState?.RecordSourceOutcome(HealthSourceName, "degraded", 0, "GitHub Search API rate limit is unknown or low.");
             return;
         }
 
         IReadOnlyList<PackageScanTarget> targetsToScan = Array.Empty<PackageScanTarget>();
+        IReadOnlyList<string> selectedSliceNames = Array.Empty<string>();
+        var failedPackages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var currentWatermark = _lastWatermark ?? _stateStore?.GetCursorWatermark(_cursorStateKey);
         var slicedUpstream = false;
 
         // Slice package names BEFORE calling GetSpecAsync so fallback mode never fetches O(N) specs.
@@ -147,7 +176,8 @@ public class CveActiveWatchService : BackgroundService
             var allNames = await _specCatalog.GetAllPackageNamesAsync(ct);
             if (allNames.Count > 0)
             {
-                targetsToScan = await FetchSlicedSpecCatalogAsync(allNames, _options.PackagesPerSweep, ct);
+                (targetsToScan, selectedSliceNames) = await FetchSlicedSpecCatalogAsync(
+                    allNames, _options.PackagesPerSweep, currentWatermark, failedPackages, ct);
                 slicedUpstream = true;
             }
         }
@@ -157,20 +187,33 @@ public class CveActiveWatchService : BackgroundService
             var packages = await LoadPackageCatalogAsync(ct);
             if (packages.Count == 0)
             {
+                _healthState?.RecordSourceOutcome(HealthSourceName, "healthy", 0);
                 _logger?.LogInformation("No packages found in catalog to scan for vulnerabilities");
                 return;
             }
 
-            if (_options.PackagesPerSweep > 0 && _options.PackagesPerSweep < packages.Count)
+            if (_options.PackagesPerSweep > 0)
             {
-                var offset = _catalogOffset % packages.Count;
-                var chunk = new List<PackageScanTarget>(_options.PackagesPerSweep);
-                for (int i = 0; i < _options.PackagesPerSweep; i++)
+                var sortedPackages = packages
+                    .Where(p => !string.IsNullOrWhiteSpace(p.PackageName))
+                    .OrderBy(p => p.PackageName, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                var sortedNames = sortedPackages.Select(p => p.PackageName).ToList();
+                if (sortedNames.Count > 0)
                 {
-                    chunk.Add(packages[(offset + i) % packages.Count]);
+                    var sliceCount = Math.Min(_options.PackagesPerSweep, sortedNames.Count);
+                    var startIndex = FindWatermarkStartIndex(sortedNames, currentWatermark);
+                    var chunk = new List<PackageScanTarget>(sliceCount);
+                    var sliceNames = new List<string>(sliceCount);
+                    for (int i = 0; i < sliceCount; i++)
+                    {
+                        var pkg = sortedPackages[(startIndex + i) % sortedPackages.Count];
+                        chunk.Add(pkg);
+                        sliceNames.Add(pkg.PackageName);
+                    }
+                    targetsToScan = chunk;
+                    selectedSliceNames = sliceNames;
                 }
-                _catalogOffset = (offset + _options.PackagesPerSweep) % packages.Count;
-                targetsToScan = chunk;
             }
             else
             {
@@ -180,15 +223,42 @@ public class CveActiveWatchService : BackgroundService
 
         if (targetsToScan.Count == 0)
         {
+            if (!ct.IsCancellationRequested)
+            {
+                var outcome = CommitSliceWatermark(selectedSliceNames, failedPackages);
+                RecordSweepHealthOutcome(0, failedPackages, outcome);
+            }
             _logger?.LogInformation("No packages found in catalog to scan for vulnerabilities");
             return;
         }
 
         _logger?.LogInformation("Dispatching OSV scan for {Count} catalog packages", targetsToScan.Count);
 
-        var scanResult = _scanner is ITargetedPackageVulnerabilityScanner targetedScanner
-            ? await targetedScanner.ScanTargetsAsync(targetsToScan, ct)
-            : await _scanner.ScanPackagesAsync(targetsToScan.Select(t => (t.PackageName, t.Version)).ToList(), ct);
+        PackageVulnerabilityScanResult scanResult;
+        try
+        {
+            scanResult = _scanner is ITargetedPackageVulnerabilityScanner targetedScanner
+                ? await targetedScanner.ScanTargetsAsync(targetsToScan, ct)
+                : await _scanner.ScanPackagesAsync(targetsToScan.Select(t => (t.PackageName, t.Version)).ToList(), ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogError(ex, "Vulnerability scan failed; deferring CVE cursor advancement so the current slice is retried");
+            _healthState?.RecordSourceOutcome(HealthSourceName, "failed", 0, ex.Message);
+            return;
+        }
+
+        if (scanResult.FailedPackages != null)
+        {
+            foreach (var failedPkg in scanResult.FailedPackages)
+            {
+                if (!string.IsNullOrWhiteSpace(failedPkg))
+                {
+                    failedPackages.Add(failedPkg);
+                }
+            }
+        }
+
         var findings = scanResult.Findings;
         var vulnerablePackages = BuildVulnerablePackagesMap(findings);
         var hasUnverifiedPackages = scanResult.UnverifiedNativePackages != null && scanResult.UnverifiedNativePackages.Count > 0;
@@ -197,6 +267,11 @@ public class CveActiveWatchService : BackgroundService
 
         if (findings.Count == 0 && scanResult.SuccessfullyScannedPackages.Count == 0 && !hasUnverifiedPackages)
         {
+            if (!ct.IsCancellationRequested)
+            {
+                var outcome = CommitSliceWatermark(selectedSliceNames, failedPackages);
+                RecordSweepHealthOutcome(0, failedPackages, outcome);
+            }
             return;
         }
 
@@ -230,11 +305,12 @@ public class CveActiveWatchService : BackgroundService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger?.LogWarning(
+            _logger?.LogError(
                 ex,
                 "Failed to query existing open vulnerability issues for {Owner}/{Repo}; deferring issue creation and closure to avoid duplicates",
                 owner,
                 repo);
+            _healthState?.RecordSourceOutcome(HealthSourceName, "failed", 0, ex.Message);
             return;
         }
 
@@ -260,16 +336,26 @@ public class CveActiveWatchService : BackgroundService
             if (ct.IsCancellationRequested)
                 break;
 
-            await ProcessPackageFindingAsync(owner, repo, finding, issueLabel, openIssuesByPackage, isIndexTruncated, ct);
+            var ok = await ProcessPackageFindingAsync(owner, repo, finding, issueLabel, openIssuesByPackage, isIndexTruncated, ct);
+            if (!ok)
+            {
+                failedPackages.Add(finding.PackageName);
+            }
         }
 
         // 2. Pure scan-based auto-close: reuse the pre-fetched index so resolved checks emit zero extra Search API calls
-        await CheckAndCloseResolvedIssuesAsync(owner, repo, issueLabel, openVulnerabilityIssues, scanResult.SuccessfullyScannedPackages, vulnerablePackages, ct);
+        await CheckAndCloseResolvedIssuesAsync(owner, repo, issueLabel, openVulnerabilityIssues, scanResult.SuccessfullyScannedPackages, vulnerablePackages, failedPackages, ct);
 
         // 3. Notify maintainers once on pre-existing open issues for native RPMs skipped by the authoritative ecosystem gate
         if (!_options.IncludeUnverifiedNativePackages && hasUnverifiedPackages)
         {
             await NotifyUnverifiedLegacyIssuesAsync(owner, repo, openIssuesByPackage, scanResult.UnverifiedNativePackages!, ct);
+        }
+
+        if (!ct.IsCancellationRequested)
+        {
+            var outcome = CommitSliceWatermark(selectedSliceNames, failedPackages);
+            RecordSweepHealthOutcome(findings.Count, failedPackages, outcome);
         }
     }
 
@@ -353,7 +439,7 @@ public class CveActiveWatchService : BackgroundService
                 }
 
                 var notice = $"""
-                    > ℹ️ **Unverified Native RPM Ecosystem Notice**
+                    > **Unverified Native RPM Ecosystem Notice**
                     >
                     > Package `{packageName}` does not declare an authoritative upstream OSV ecosystem (`crates.io` or `PyPI`). By default (`CveActiveWatch:IncludeUnverifiedNativePackages = false`), automated scanning now skips unverified native RPM packages to prevent cross-distribution false positives, so this tracking issue will no longer be automatically updated or auto-closed.
                     >
@@ -374,7 +460,7 @@ public class CveActiveWatchService : BackgroundService
         }
     }
 
-    private async Task ProcessPackageFindingAsync(
+    private async Task<bool> ProcessPackageFindingAsync(
         string owner,
         string repo,
         PackageVulnerabilityFinding finding,
@@ -429,7 +515,7 @@ public class CveActiveWatchService : BackgroundService
                 {
                     _logger?.LogDebug("Existing vulnerability issue #{Number} for {Package} is already up to date; skipping writes",
                         existingIssue.Number, finding.PackageName);
-                    return;
+                    return true;
                 }
 
                 _logger?.LogInformation("Updating existing vulnerability issue #{Number} for {Package}", existingIssue.Number, finding.PackageName);
@@ -479,10 +565,12 @@ public class CveActiveWatchService : BackgroundService
                     }
                 }
             }
+            return true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger?.LogWarning(ex, "Failed to create or update vulnerability issue for {Package}", finding.PackageName);
+            return false;
         }
     }
 
@@ -493,6 +581,7 @@ public class CveActiveWatchService : BackgroundService
         IReadOnlyList<Issue> openVulnerabilityIssues,
         IReadOnlySet<string> successfullyScannedPackages,
         Dictionary<string, PackageVulnerabilityFinding> currentVulnerabilities,
+        ISet<string> failedPackages,
         CancellationToken ct)
     {
         foreach (var issue in openVulnerabilityIssues)
@@ -537,6 +626,7 @@ public class CveActiveWatchService : BackgroundService
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
+                        failedPackages.Add(packageName);
                         _logger?.LogWarning(ex,
                             "Failed to verify and close resolved vulnerability issue #{Number} for {Package}",
                             issue.Number, packageName);
@@ -626,15 +716,15 @@ public class CveActiveWatchService : BackgroundService
         }));
 
         var truncationNotice = totalCount > displayReports.Count
-            ? $"\n\n> ⚠️ **Notice**: Truncated. Displaying {displayReports.Count} sampled vulnerabilities (sorted by CVSS within the {displayReports.Count}-entry detail cap) out of {totalCount} total reported advisories."
+            ? $"\n\n> **Notice**: Truncated. Displaying {displayReports.Count} sampled vulnerabilities (sorted by CVSS within the {displayReports.Count}-entry detail cap) out of {totalCount} total reported advisories."
             : string.Empty;
 
         var bestEffortBanner = finding.IsUnverifiedEcosystem
-            ? "\n\n> ⚠️ **Best-Effort / Unverified Ecosystem**: This native RPM package has no authoritative openRuyi OSV ecosystem feed; results are matched by package name across upstream distributions and may contain false positives."
+            ? "\n\n> **Best-Effort / Unverified Ecosystem**: This native RPM package has no authoritative openRuyi OSV ecosystem feed; results are matched by package name across upstream distributions and may contain false positives."
             : string.Empty;
 
         var heuristicBanner = !finding.IsUnverifiedEcosystem && finding.IsHeuristicUpstream
-            ? "\n\n> ⚠️ **Heuristic Upstream Name Match**: This package lacks an explicit `%global pypi_name`, `srcname`, or `crate_name` macro and was matched using a package-name prefix heuristic. Because OSV empty responses cannot reliably prove resolution for heuristic names, this issue will **not** auto-close and requires manual maintainer triage."
+            ? "\n\n> **Heuristic Upstream Name Match**: This package lacks an explicit `%global pypi_name`, `srcname`, or `crate_name` macro and was matched using a package-name prefix heuristic. Because OSV empty responses cannot reliably prove resolution for heuristic names, this issue will **not** auto-close and requires manual maintainer triage."
             : string.Empty;
 
         var markerPackage = EscapeHtmlCommentMarker(finding.PackageName);
@@ -657,7 +747,7 @@ public class CveActiveWatchService : BackgroundService
             """;
 
         // Hard cap at 60,000 characters to prevent GitHub 422 limit (65536 max) while keeping identity marker intact
-        const string overflowNotice = "\n\n> ⚠️ [Content truncated due to size limits]";
+        const string overflowNotice = "\n\n> [Content truncated due to size limits]";
         var maxContentLength = 60000 - marker.Length - overflowNotice.Length;
         if (body.Length + marker.Length > 60000)
         {
@@ -700,13 +790,7 @@ public class CveActiveWatchService : BackgroundService
             return null;
         }
 
-        var fullVerMatch = FullVersionRegex.Match(specContent);
-        var verMatch = VersionRegex.Match(specContent);
-        string? version = fullVerMatch.Success
-            ? fullVerMatch.Groups["ver"].Value.Trim()
-            : (verMatch.Success ? verMatch.Groups["ver"].Value.Trim() : null);
-
-        if (string.IsNullOrWhiteSpace(version))
+        if (!UpdateAdmission.TryExtractCurrentVersion(specContent, out var version))
         {
             return null;
         }
@@ -742,24 +826,263 @@ public class CveActiveWatchService : BackgroundService
         return new PackageScanTarget(packageName, version, ecosystem, upstreamName);
     }
 
-    private async Task<IReadOnlyList<PackageScanTarget>> FetchSlicedSpecCatalogAsync(
+    internal static int FindWatermarkStartIndex(IReadOnlyList<string> sortedNames, string? lastWatermark)
+    {
+        if (sortedNames.Count == 0 || string.IsNullOrWhiteSpace(lastWatermark))
+        {
+            return 0;
+        }
+
+        for (int i = 0; i < sortedNames.Count; i++)
+        {
+            if (StringComparer.OrdinalIgnoreCase.Compare(sortedNames[i], lastWatermark) > 0)
+            {
+                return i;
+            }
+        }
+
+        return 0;
+    }
+
+    private readonly record struct WatermarkCommitOutcome(
+        string? BlockingPackage,
+        int BlockingAttempts,
+        IReadOnlyList<string> SkippedPoisonPackages)
+    {
+        public static readonly WatermarkCommitOutcome None = new(null, 0, Array.Empty<string>());
+    }
+
+    private void EnsurePoisonStateLoaded()
+    {
+        if (_poisonStateLoaded)
+        {
+            return;
+        }
+
+        _poisonStateLoaded = true;
+        var raw = _stateStore?.GetCursorWatermark(_poisonStateKey);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return;
+        }
+
+        var separator = raw.LastIndexOf('|');
+        if (separator <= 0 || separator >= raw.Length - 1)
+        {
+            return;
+        }
+
+        var pkg = raw[..separator].Trim();
+        if (!string.IsNullOrWhiteSpace(pkg) &&
+            int.TryParse(
+                raw[(separator + 1)..],
+                System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var count) &&
+            count >= 1)
+        {
+            _lastPoisonPackage = pkg;
+            _lastPoisonRewindCount = count;
+            _hasPersistedPoisonState = true;
+        }
+    }
+
+    private void TryPersistPoisonState(string? packageName, int attempts)
+    {
+        if (_options.DryRun || _stateStore == null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (string.IsNullOrWhiteSpace(packageName))
+            {
+                if (!_hasPersistedPoisonState)
+                {
+                    return;
+                }
+
+                _stateStore.SetCursorWatermark(_poisonStateKey, null);
+                _hasPersistedPoisonState = false;
+                return;
+            }
+
+            _stateStore.SetCursorWatermark(
+                _poisonStateKey,
+                $"{packageName}|{attempts.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+            _hasPersistedPoisonState = true;
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Failed to persist CVE poison-pill state for package '{Package}'", packageName ?? "<clear>");
+        }
+    }
+
+    private void RecordSweepHealthOutcome(
+        int findingsCount,
+        IReadOnlySet<string> failedPackages,
+        WatermarkCommitOutcome commitOutcome)
+    {
+        if (_healthState == null)
+        {
+            return;
+        }
+
+        if (commitOutcome.SkippedPoisonPackages is { Count: > 0 } skipped)
+        {
+            var preview = string.Join(", ", skipped.Take(5));
+            var message = $"Skipped poison-pill package(s) after {MaxConsecutiveRewindsPerPackage} consecutive failures: {preview}";
+            if (!string.IsNullOrEmpty(commitOutcome.BlockingPackage))
+            {
+                message += $"; deferred cursor before failed package '{commitOutcome.BlockingPackage}' (attempt {commitOutcome.BlockingAttempts}/{MaxConsecutiveRewindsPerPackage}).";
+            }
+
+            _healthState.RecordSourceOutcome(
+                HealthSourceName,
+                "degraded",
+                findingsCount,
+                message);
+            return;
+        }
+
+        if (!string.IsNullOrEmpty(commitOutcome.BlockingPackage))
+        {
+            _healthState.RecordSourceOutcome(
+                HealthSourceName,
+                "degraded",
+                findingsCount,
+                $"Deferred cursor before failed package '{commitOutcome.BlockingPackage}' (attempt {commitOutcome.BlockingAttempts}/{MaxConsecutiveRewindsPerPackage}).");
+            return;
+        }
+
+        if (failedPackages.Count > 0)
+        {
+            var preview = string.Join(", ", failedPackages.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).Take(5));
+            _healthState.RecordSourceOutcome(
+                HealthSourceName,
+                "degraded",
+                findingsCount,
+                $"Completed sweep with {failedPackages.Count} failed package(s): {preview}");
+            return;
+        }
+
+        _healthState.RecordSourceOutcome(HealthSourceName, "healthy", findingsCount);
+    }
+
+    private WatermarkCommitOutcome CommitSliceWatermark(IReadOnlyList<string> sliceNames, IReadOnlySet<string> failedPackages)
+    {
+        if (_options.PackagesPerSweep <= 0 || sliceNames.Count == 0)
+        {
+            return WatermarkCommitOutcome.None;
+        }
+
+        EnsurePoisonStateLoaded();
+
+        var blockingIdx = -1;
+        string? blockingPackage = null;
+        var blockingAttempts = 0;
+        var skippedPoisons = new List<string>();
+
+        for (int i = 0; i < sliceNames.Count; i++)
+        {
+            var pkg = sliceNames[i];
+            if (!failedPackages.Contains(pkg))
+            {
+                if (string.Equals(_lastPoisonPackage, pkg, StringComparison.OrdinalIgnoreCase))
+                {
+                    _lastPoisonPackage = null;
+                    _lastPoisonRewindCount = 0;
+                }
+                continue;
+            }
+
+            var attempts = string.Equals(_lastPoisonPackage, pkg, StringComparison.OrdinalIgnoreCase)
+                ? _lastPoisonRewindCount + 1
+                : 1;
+
+            if (attempts < MaxConsecutiveRewindsPerPackage)
+            {
+                _lastPoisonPackage = pkg;
+                _lastPoisonRewindCount = attempts;
+                blockingIdx = i;
+                blockingPackage = pkg;
+                blockingAttempts = attempts;
+                break;
+            }
+
+            _lastPoisonPackage = null;
+            _lastPoisonRewindCount = 0;
+            skippedPoisons.Add(pkg);
+            _logger?.LogError(
+                "Skipping poison-pill CVE package {Package} after {Attempts} consecutive failures to prevent cursor starvation",
+                pkg, attempts);
+        }
+
+        TryPersistPoisonState(blockingPackage, blockingAttempts);
+
+        if (blockingIdx == 0)
+        {
+            _logger?.LogWarning(
+                "Keeping CVE scan watermark at {Watermark} because first package {Package} in slice failed (attempt {Attempts}/{MaxAttempts})",
+                _lastWatermark ?? "<start>", sliceNames[0], blockingAttempts, MaxConsecutiveRewindsPerPackage);
+            return new WatermarkCommitOutcome(blockingPackage, blockingAttempts, skippedPoisons);
+        }
+
+        string newWatermark;
+        if (blockingIdx > 0)
+        {
+            newWatermark = sliceNames[blockingIdx - 1];
+            _logger?.LogWarning(
+                "Rewinding CVE scan watermark to {Watermark} before failed package {Package} (attempt {Attempts}/{MaxAttempts})",
+                newWatermark, sliceNames[blockingIdx], blockingAttempts, MaxConsecutiveRewindsPerPackage);
+        }
+        else
+        {
+            newWatermark = sliceNames[^1];
+        }
+
+        _lastWatermark = newWatermark;
+        if (!_options.DryRun && _stateStore != null)
+        {
+            try
+            {
+                _stateStore.SetCursorWatermark(_cursorStateKey, newWatermark);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Failed to persist CVE scan cursor watermark '{Watermark}'", newWatermark);
+            }
+        }
+
+        return new WatermarkCommitOutcome(blockingPackage, blockingAttempts, skippedPoisons);
+    }
+
+    private async Task<(IReadOnlyList<PackageScanTarget> Targets, IReadOnlyList<string> SliceNames)> FetchSlicedSpecCatalogAsync(
         IReadOnlyList<string> allNames,
         int packagesPerSweep,
+        string? currentWatermark,
+        ISet<string> failedPackages,
         CancellationToken ct)
     {
         var sortedNames = allNames
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
+        if (sortedNames.Count == 0)
+        {
+            return (Array.Empty<PackageScanTarget>(), Array.Empty<string>());
+        }
+
         var sliceCount = Math.Min(packagesPerSweep, sortedNames.Count);
-        var offset = _catalogOffset % sortedNames.Count;
+        var startIndex = FindWatermarkStartIndex(sortedNames, currentWatermark);
         var selectedNames = new List<string>(sliceCount);
         for (int i = 0; i < sliceCount; i++)
         {
-            selectedNames.Add(sortedNames[(offset + i) % sortedNames.Count]);
+            selectedNames.Add(sortedNames[(startIndex + i) % sortedNames.Count]);
         }
-
-        _catalogOffset = (offset + sliceCount) % sortedNames.Count;
 
         var result = new List<PackageScanTarget>(sliceCount);
         foreach (var name in selectedNames)
@@ -767,15 +1090,32 @@ public class CveActiveWatchService : BackgroundService
             if (ct.IsCancellationRequested)
                 break;
 
-            var spec = await _specCatalog!.GetSpecAsync(name, ct);
-            var target = TryExtractScanTargetFromSpec(name, spec?.Content);
+            SpecContext? spec = null;
+            try
+            {
+                spec = await _specCatalog!.GetSpecAsync(name, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger?.LogWarning(ex, "Failed to fetch spec for {Package}; marking slice item failed for retry", name);
+                failedPackages.Add(name);
+                continue;
+            }
+
+            if (spec == null)
+            {
+                failedPackages.Add(name);
+                continue;
+            }
+
+            var target = TryExtractScanTargetFromSpec(name, spec.Content);
             if (target != null)
             {
                 result.Add(target);
             }
         }
 
-        return result;
+        return (result, selectedNames);
     }
 
     private async Task<IReadOnlyList<PackageScanTarget>> LoadPackageCatalogAsync(CancellationToken ct)

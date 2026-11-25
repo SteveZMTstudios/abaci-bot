@@ -240,7 +240,7 @@ public class PackageUpdateService : BackgroundService
         {
             (GitHubLabels.AutoUpdate, "0366d6", "Pull requests automatically created for package updates"),
             (GitHubLabels.AutoUpdateRust, "dea584", "Pull requests automatically created for Rust crate updates"),
-            (GitHubLabels.AutoUpdateBlocked, "d73a4a", "Package updates blocked due to repeated failures or missing dependencies"),
+            (GitHubLabels.AutoUpdateBlocked, "d73a4a", "Package updates blocked due to repeated CI failures or post-merge OBS failures"),
             (GitHubLabels.StatusStaleExempt, "ffffff", "Exempt from automatic stale closure")
         };
 
@@ -661,13 +661,16 @@ public class PackageUpdateService : BackgroundService
 
                 var branchName = fullPr?.Head?.Ref ?? fallbackPr?.Head?.Ref;
                 var prAuthor = fullPr?.User?.Login ?? fallbackPr?.User?.Login ?? labelIssue?.User?.Login;
+                var headRepoFullName = fullPr?.Head?.Repository?.FullName ?? fallbackPr?.Head?.Repository?.FullName;
+                var isSameRepo = !string.IsNullOrWhiteSpace(headRepoFullName) &&
+                                 string.Equals(headRepoFullName, $"{owner}/{repo}", StringComparison.OrdinalIgnoreCase);
 
-                // Do not self-heal labels, count slots, record failure cooldowns, or close human PRs that merely share the branch prefix.
-                if (labelIssue == null && !BotCommitOwnership.IsOwnBotLogin(prAuthor, ownBotLogins))
+                // Tier 1: Auto-Update label never bypasses PR authorship or same-repository head ownership.
+                if (!BotCommitOwnership.IsOwnBotLogin(prAuthor, ownBotLogins) || !isSameRepo)
                 {
                     _logger?.LogDebug(
-                        "Ignoring non-bot open PR #{PrNumber} on branch {Branch} (author={Author})",
-                        prNumber, branchName, prAuthor ?? "unknown");
+                        "Ignoring non-bot or fork open PR #{PrNumber} on branch {Branch} (author={Author}, headRepo={HeadRepo})",
+                        prNumber, branchName, prAuthor ?? "unknown", headRepoFullName ?? "unknown");
                     continue;
                 }
 
@@ -692,7 +695,7 @@ public class PackageUpdateService : BackgroundService
                 // Backfill updated #!RemoteAsset checksums when remoteasset workflow fails on a pure-bot branch
                 if (isRemoteAssetFailed && !string.IsNullOrWhiteSpace(branchName) && remoteAssetRun != null && !_options.DryRun)
                 {
-                    if (await CanBackfillBotBranchAsync(owner, repo, branchName, ownBotLogins, ct))
+                    if (await CanBackfillBotBranchAsync(owner, repo, branchName, branchPrefix, prAuthor, headSha, isSameRepo, ownBotLogins, ct))
                     {
                         await _remoteAssetBackfiller.TryBackfillAsync(owner, repo, branchName, prNumber, remoteAssetRun.Id, ct);
                     }
@@ -727,13 +730,11 @@ public class PackageUpdateService : BackgroundService
 
                 if (isInactiveFailed)
                 {
-                    var headRepoFullName = fullPr?.Head?.Repository?.FullName ?? fallbackPr?.Head?.Repository?.FullName;
-                    var isSameRepo = headRepoFullName != null && string.Equals(headRepoFullName, $"{owner}/{repo}", StringComparison.OrdinalIgnoreCase);
                     var hasExpectedPrefix = !string.IsNullOrWhiteSpace(branchName) && branchName.StartsWith(branchPrefix, StringComparison.Ordinal);
 
                     if (!_options.DryRun)
                     {
-                        var canAutoClose = await CanAutoCloseFailedPrAsync(owner, repo, branchName, prAuthor, isSameRepo, ownBotLogins, ct);
+                        var canAutoClose = await CanAutoCloseFailedPrAsync(owner, repo, branchName, prAuthor, headSha, isSameRepo, ownBotLogins, ct);
                         if (!canAutoClose)
                         {
                             _logger?.LogWarning(
@@ -812,17 +813,35 @@ public class PackageUpdateService : BackgroundService
         string owner,
         string repo,
         string branchName,
+        string branchPrefix,
+        string? prAuthor,
+        string? headSha,
+        bool isSameRepo,
         IReadOnlySet<string> ownBotLogins,
         CancellationToken ct)
     {
+        if (!isSameRepo ||
+            string.IsNullOrWhiteSpace(branchName) ||
+            !branchName.StartsWith(branchPrefix, StringComparison.Ordinal) ||
+            string.IsNullOrWhiteSpace(headSha) ||
+            !BotCommitOwnership.IsOwnBotLogin(prAuthor, ownBotLogins))
+        {
+            _logger?.LogWarning(
+                "Skipping #!RemoteAsset backfill on branch {Branch} because PR ownership/prefix/SHA preconditions failed (sameRepo={SameRepo}, author={Author})",
+                branchName, isSameRepo, prAuthor ?? "unknown");
+            return false;
+        }
+
         try
         {
             var latestCommit = await _gitHubService.GetBranchLatestCommitAsync(owner, repo, branchName, ct);
-            var isBotCommit = BotCommitOwnership.IsOwnBotCommit(latestCommit, ownBotLogins);
+            var isBotCommit = latestCommit != null &&
+                              string.Equals(latestCommit.Sha, headSha, StringComparison.OrdinalIgnoreCase) &&
+                              BotCommitOwnership.IsOwnBotCommit(latestCommit, ownBotLogins);
             if (!isBotCommit)
             {
                 _logger?.LogWarning(
-                    "Skipping #!RemoteAsset backfill on branch {Branch} because latest commit is missing or authored by a human ({Author})",
+                    "Skipping #!RemoteAsset backfill on branch {Branch} because latest commit is missing, moved beyond PR head SHA, or authored by a human ({Author})",
                     branchName, latestCommit?.AuthorLogin ?? "unknown");
             }
 
@@ -840,25 +859,31 @@ public class PackageUpdateService : BackgroundService
         string repo,
         string? branchName,
         string? prAuthor,
+        string? headSha,
         bool isSameRepo,
         IReadOnlySet<string> ownBotLogins,
         CancellationToken ct)
     {
-        if (isSameRepo && !string.IsNullOrWhiteSpace(branchName))
+        if (!isSameRepo ||
+            string.IsNullOrWhiteSpace(branchName) ||
+            string.IsNullOrWhiteSpace(headSha) ||
+            !BotCommitOwnership.IsOwnBotLogin(prAuthor, ownBotLogins))
         {
-            try
-            {
-                var latestCommit = await _gitHubService.GetBranchLatestCommitAsync(owner, repo, branchName, ct);
-                return BotCommitOwnership.IsOwnBotCommit(latestCommit, ownBotLogins);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger?.LogDebug(ex, "Failed to verify branch commit ownership for {Branch}; skipping TTL close fail-closed", branchName);
-                return false;
-            }
+            return false;
         }
 
-        return BotCommitOwnership.IsOwnBotLogin(prAuthor, ownBotLogins);
+        try
+        {
+            var latestCommit = await _gitHubService.GetBranchLatestCommitAsync(owner, repo, branchName, ct);
+            return latestCommit != null &&
+                   string.Equals(latestCommit.Sha, headSha, StringComparison.OrdinalIgnoreCase) &&
+                   BotCommitOwnership.IsOwnBotCommit(latestCommit, ownBotLogins);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogDebug(ex, "Failed to verify branch commit ownership for {Branch}; skipping TTL close fail-closed", branchName);
+            return false;
+        }
     }
 
     private async Task SelfHealMissingBotPrLabelsAsync(

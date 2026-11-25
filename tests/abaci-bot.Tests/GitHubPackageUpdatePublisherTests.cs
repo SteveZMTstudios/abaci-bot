@@ -880,4 +880,123 @@ public class GitHubPackageUpdatePublisherTests
         await gitHubMock.Received(1).CreatePullRequestAsync(
             "openRuyi-Project", "openRuyi", Arg.Any<string>(), "autoupdate/curl", "main", Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
+
+    [Fact]
+    public async Task PublishUpdateAsync_ExplicitEmptyRewriters_FailsClosedWithoutWritingCachedContent()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.GetRefShaAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>()).Returns((string?)null);
+        gitHubMock.GetRefShaAsync("owner", "repo", "main", Arg.Any<CancellationToken>()).Returns("mainSha");
+        gitHubMock.GetFileContentAsync("owner", "repo", "SPECS/curl/curl.spec", "mainSha", Arg.Any<CancellationToken>())
+            .Returns("Name: curl\nVersion: 8.21.0\n");
+
+        var publisher = new GitHubPackageUpdatePublisher(
+            gitHubMock,
+            Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions { DryRun = false }),
+            specRewriters: Array.Empty<ISpecVersionRewriter>());
+
+        var candidate = new UpdateCandidate("curl", "8.21.0", "8.22.0", CandidateOrigin.Lookout, "https://evidence");
+        var rewriteResult = new SpecRewriteResult(true, "Name: curl\nVersion: 8.22.0\n", null, HasChanged: true);
+
+        var result = await publisher.PublishUpdateAsync(candidate, rewriteResult, "owner/repo", "main", "SPECS/curl/curl.spec");
+
+        Assert.False(result.Success);
+        Assert.False(result.Skipped);
+        Assert.Contains("No spec rewriters configured", result.SkipReason, StringComparison.Ordinal);
+        await gitHubMock.DidNotReceiveWithAnyArgs().UpdateFileContentAsync(default!, default!, default!, default!, default!, default!, default);
+    }
+
+    [Fact]
+    public async Task PublishUpdateAsync_DefaultConstructorRewritesLiveMain_OrphanRemoteAssetPreserved_AndExistingBranchRaceFailsClosed()
+    {
+        var opts = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            DryRun = false,
+            BotLogin = "aqua-rium",
+            BranchPrefix = "autoupdate/"
+        });
+
+        // 1. Default constructor (specRewriters omitted) re-rewrites against live main and preserves newer main edits on version bump.
+        var ghDefault = Substitute.For<IGitHubService>();
+        ghDefault.GetRefShaAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>()).Returns("branchSha1");
+        ghDefault.GetRefShaAsync("owner", "repo", "main", Arg.Any<CancellationToken>()).Returns("liveMainSha");
+        ghDefault.GetBranchLatestCommitAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>())
+            .Returns(new BranchCommitInfo("branchSha1", "bump curl 8.21.0", "aqua-rium", "", "web-flow", ""));
+        ghDefault.GetFileContentAsync("owner", "repo", "SPECS/curl/curl.spec", "autoupdate/curl", Arg.Any<CancellationToken>())
+            .Returns("Name: curl\nVersion: 8.21.0\n#!RemoteAsset: curl.tar.xz sha256=old\n");
+        ghDefault.GetFileContentAsync("owner", "repo", "SPECS/curl/curl.spec", "liveMainSha", Arg.Any<CancellationToken>())
+            .Returns("Name: curl\nVersion: 8.20.0\nBuildRequires: maintainer-added\n#!RemoteAsset: curl.tar.xz sha256=base\n");
+
+        var existingPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(existingPr, 301);
+        ghDefault.FindOpenPullRequestByHeadAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>()).Returns(existingPr);
+        ghDefault.UpdatePullRequestAsync("owner", "repo", 301, Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>()).Returns(existingPr);
+
+        string? pushedDefault = null;
+        ghDefault.When(g => g.UpdateFileContentAsync("owner", "repo", "SPECS/curl/curl.spec", Arg.Any<string>(), Arg.Any<string>(), "autoupdate/curl", Arg.Any<CancellationToken>()))
+            .Do(ci => pushedDefault = ci.ArgAt<string>(4));
+
+        var pubDefault = new GitHubPackageUpdatePublisher(ghDefault, opts);
+        var bumpRes = await pubDefault.PublishUpdateAsync(
+            new UpdateCandidate("curl", "8.20.0", "8.22.0", CandidateOrigin.Lookout, "https://evidence"),
+            new SpecRewriteResult(true, "stale-cached-content\nVersion: 8.22.0\n", HasChanged: true),
+            "owner/repo", "main", "SPECS/curl/curl.spec");
+
+        Assert.True(bumpRes.Success);
+        Assert.NotNull(pushedDefault);
+        Assert.Contains("Version: 8.22.0", pushedDefault!, StringComparison.Ordinal);
+        Assert.Contains("BuildRequires: maintainer-added", pushedDefault!, StringComparison.Ordinal);
+        Assert.DoesNotContain("stale-cached-content", pushedDefault!, StringComparison.Ordinal);
+
+        // 2. Orphan branch already at target version with #!RemoteAsset backfill and no non-RemoteAsset drift on main preserves backfill.
+        var ghOrphan = Substitute.For<IGitHubService>();
+        ghOrphan.GetRefShaAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>()).Returns("orphanSha");
+        ghOrphan.GetRefShaAsync("owner", "repo", "main", Arg.Any<CancellationToken>()).Returns("mainSha");
+        ghOrphan.FindOpenPullRequestByHeadAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>()).Returns((PullRequest?)null);
+        ghOrphan.GetBranchLatestCommitAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>())
+            .Returns(new BranchCommitInfo("orphanSha", "backfill", "aqua-rium", "", "web-flow", ""));
+        ghOrphan.GetFileContentAsync("owner", "repo", "SPECS/curl/curl.spec", "autoupdate/curl", Arg.Any<CancellationToken>())
+            .Returns("Name: curl\nVersion: 8.22.0\n#!RemoteAsset: curl.tar.xz sha256=backfilled-new\n");
+        ghOrphan.GetFileContentAsync("owner", "repo", "SPECS/curl/curl.spec", "mainSha", Arg.Any<CancellationToken>())
+            .Returns("Name: curl\nVersion: 8.21.0\n#!RemoteAsset: curl.tar.xz sha256=old-main\n");
+
+        var createdOrphanPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(createdOrphanPr, 302);
+        ghOrphan.CreatePullRequestAsync("owner", "repo", Arg.Any<string>(), "autoupdate/curl", "main", Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(createdOrphanPr);
+
+        var pubOrphan = new GitHubPackageUpdatePublisher(ghOrphan, opts);
+        var orphanRes = await pubOrphan.PublishUpdateAsync(
+            new UpdateCandidate("curl", "8.21.0", "8.22.0", CandidateOrigin.Lookout, "https://evidence"),
+            new SpecRewriteResult(true, "Name: curl\nVersion: 8.22.0\n", HasChanged: true),
+            "owner/repo", "main", "SPECS/curl/curl.spec");
+
+        Assert.True(orphanRes.Success);
+        Assert.False(orphanRes.Skipped);
+        Assert.Equal(302, orphanRes.PullRequestNumber);
+        await ghOrphan.DidNotReceiveWithAnyArgs().UpdateFileContentAsync(default!, default!, default!, default!, default!, default!, default);
+
+        // 3. Existing branch ref SHA moves between ownership check and write -> fails closed without writing.
+        var ghRace = Substitute.For<IGitHubService>();
+        ghRace.GetRefShaAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>())
+            .Returns("branchShaInitial", "branchShaHumanPushed");
+        ghRace.GetRefShaAsync("owner", "repo", "main", Arg.Any<CancellationToken>()).Returns("mainSha");
+        ghRace.GetBranchLatestCommitAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>())
+            .Returns(new BranchCommitInfo("branchShaInitial", "bump", "aqua-rium", "", "web-flow", ""));
+        ghRace.GetFileContentAsync("owner", "repo", "SPECS/curl/curl.spec", "autoupdate/curl", Arg.Any<CancellationToken>())
+            .Returns("Name: curl\nVersion: 8.21.0\n");
+        ghRace.GetFileContentAsync("owner", "repo", "SPECS/curl/curl.spec", "mainSha", Arg.Any<CancellationToken>())
+            .Returns("Name: curl\nVersion: 8.21.0\n");
+
+        var pubRace = new GitHubPackageUpdatePublisher(ghRace, opts);
+        var raceRes = await pubRace.PublishUpdateAsync(
+            new UpdateCandidate("curl", "8.21.0", "8.22.0", CandidateOrigin.Lookout, "https://evidence"),
+            new SpecRewriteResult(true, "Name: curl\nVersion: 8.22.0\n", HasChanged: true),
+            "owner/repo", "main", "SPECS/curl/curl.spec");
+
+        Assert.False(raceRes.Success);
+        Assert.False(raceRes.Skipped);
+        Assert.Contains("changed concurrently", raceRes.SkipReason, StringComparison.Ordinal);
+        await ghRace.DidNotReceiveWithAnyArgs().UpdateFileContentAsync(default!, default!, default!, default!, default!, default!, default);
+    }
 }

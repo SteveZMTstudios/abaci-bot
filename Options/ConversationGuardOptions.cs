@@ -1,12 +1,12 @@
 namespace abaci_bot.Options;
 
 /// <summary>
-/// Configuration options for conversation locking, slash command moderation, and inactive PR sweep.
+/// Configuration options for conversation locking, mention command moderation, and inactive PR sweep.
 /// </summary>
 public class ConversationGuardOptions
 {
     /// <summary>
-    /// Whether conversation guard slash command moderation (/lock, /unlock, /hide, /archive) is enabled.
+    /// Whether conversation guard mention command moderation (<c>@&lt;bot&gt; lock</c>, <c>unlock</c>, <c>hide</c>, <c>archive</c>) is enabled.
     /// Default: false.
     /// </summary>
     public bool Enabled { get; set; }
@@ -48,7 +48,7 @@ public class ConversationGuardOptions
     public int SweepIntervalHours { get; set; } = 12;
 
     /// <summary>
-    /// Time window in minutes for the PR author to reply with `/lock confirm` (or `/archive confirm`) before the confirmation request expires.
+    /// Time window in minutes for the PR author to reply with <c>@&lt;bot&gt; lock confirm</c> (or <c>@&lt;bot&gt; archive confirm</c>) before the confirmation request expires.
     /// Bound to 1..60.
     /// Default: 15.
     /// </summary>

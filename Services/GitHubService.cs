@@ -7,7 +7,7 @@ using System.Text.Json;
 
 namespace abaci_bot.Services;
 
-public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotIdentityProvider, IEphemeralCommentGateway, IRepositoryArchiveGateway, IPagedIssueSearchGateway, IOpenPullRequestInventoryGateway, IDisposable
+public class GitHubService : IGitHubService, IRepositoryPermissionService, IPackageUpdatePermissionProbeGateway, IBotIdentityProvider, IEphemeralCommentGateway, IRepositoryArchiveGateway, IPagedIssueSearchGateway, IOpenPullRequestInventoryGateway, IDisposable
 {
     private static readonly AsyncLocal<CancellationToken> _ambientCancellationToken = new();
 
@@ -16,10 +16,12 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
     private readonly long _installationId;
     private readonly string? _botPat;
     private readonly IGitHubClient _client;
+    private readonly HttpClient _archiveHttpClient;
     private readonly Func<Credentials, IGitHubClient>? _jwtClientFactory;
     private DateTimeOffset _tokenExpiry;
     private readonly SemaphoreSlim _authLock = new(1, 1);
     private readonly SemaphoreSlim _botLoginLock = new(1, 1);
+    private volatile string? _cachedToken;
     private string? _cachedBotLogin;
     private readonly ILogger<GitHubService>? _logger;
 
@@ -34,7 +36,15 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
     }
 
     internal GitHubService(int appId, string privateKey, long installationId, HttpMessageHandler httpMessageHandler, ILogger<GitHubService>? logger = null)
-        : this(appId, privateKey, installationId, null, CreateCancellableTransport(new HttpClientAdapter(() => httpMessageHandler)), logger)
+        : this(
+            appId,
+            privateKey,
+            installationId,
+            null,
+            CreateClientForTransport(CreateCancellableTransport(new HttpClientAdapter(() => httpMessageHandler))),
+            creds => CreateClientForTransport(CreateCancellableTransport(new HttpClientAdapter(() => httpMessageHandler)), creds),
+            logger,
+            httpMessageHandler)
     {
     }
 
@@ -56,13 +66,26 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
     {
     }
 
-    internal GitHubService(int appId, string privateKey, long installationId, IGitHubClient client, ILogger<GitHubService>? logger = null)
-        : this(appId, privateKey, installationId, null, client, null, logger)
+    internal GitHubService(
+        int appId,
+        string privateKey,
+        long installationId,
+        IGitHubClient client,
+        ILogger<GitHubService>? logger = null,
+        HttpMessageHandler? archiveHttpHandler = null)
+        : this(appId, privateKey, installationId, null, client, null, logger, archiveHttpHandler)
     {
     }
 
-    internal GitHubService(int appId, string privateKey, long installationId, string? botPat, IGitHubClient client, ILogger<GitHubService>? logger = null)
-        : this(appId, privateKey, installationId, botPat, client, null, logger)
+    internal GitHubService(
+        int appId,
+        string privateKey,
+        long installationId,
+        string? botPat,
+        IGitHubClient client,
+        ILogger<GitHubService>? logger = null,
+        HttpMessageHandler? archiveHttpHandler = null)
+        : this(appId, privateKey, installationId, botPat, client, null, logger, archiveHttpHandler)
     {
     }
 
@@ -73,7 +96,8 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
         string? botPat,
         IGitHubClient client,
         Func<Credentials, IGitHubClient>? jwtClientFactory,
-        ILogger<GitHubService>? logger)
+        ILogger<GitHubService>? logger,
+        HttpMessageHandler? archiveHttpHandler = null)
     {
         _appId = appId;
         _privateKey = privateKey;
@@ -82,6 +106,9 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
         _client = client;
         _jwtClientFactory = jwtClientFactory;
         _logger = logger;
+        _archiveHttpClient = archiveHttpHandler != null
+            ? new HttpClient(archiveHttpHandler, disposeHandler: false) { Timeout = TimeSpan.FromSeconds(60) }
+            : new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
     }
 
     private static Octokit.Internal.IHttpClient CreateDefaultTransport() =>
@@ -126,6 +153,7 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
         if (!string.IsNullOrWhiteSpace(_botPat))
         {
             _client.Connection.Credentials = new Credentials(_botPat);
+            _cachedToken = _botPat;
             return;
         }
 
@@ -153,6 +181,7 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
             }
 
             _client.Connection.Credentials = new Credentials(token.Token);
+            _cachedToken = token.Token;
             _tokenExpiry = token.ExpiresAt;
         }
         finally
@@ -937,31 +966,84 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
         }
     }
 
-    public async Task<byte[]?> GetRepositoryTarballAsync(
-        string owner, string repo, string reference, CancellationToken ct = default)
+    public async Task<Stream?> OpenRepositoryTarballStreamAsync(
+        string owner,
+        string repo,
+        string reference,
+        long maxArchiveBytes = 0,
+        CancellationToken ct = default)
     {
         using var _ = SetAmbientToken(ct);
         ct.ThrowIfCancellationRequested();
         await EnsureAuthenticatedAsync(ct);
         ct.ThrowIfCancellationRequested();
 
+        var configuredBase = _client.Connection?.BaseAddress ?? new Uri("https://api.github.com/");
+        var normalizedBase = configuredBase.AbsoluteUri.EndsWith('/')
+            ? configuredBase
+            : new Uri(configuredBase.AbsoluteUri + "/");
+        var escapedRef = string.Join("/", reference.Split('/').Select(Uri.EscapeDataString));
+        var requestUri = new Uri(normalizedBase, $"repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(repo)}/tarball/{escapedRef}");
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+        request.Headers.UserAgent.ParseAdd("abaci-bot");
+        request.Headers.Accept.ParseAdd("application/vnd.github+json");
+        request.Headers.TryAddWithoutValidation("X-GitHub-Api-Version", "2022-11-28");
+
+        var token = _cachedToken ?? _client.Connection?.Credentials?.GetToken();
+        if (!string.IsNullOrWhiteSpace(token))
+        {
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+        }
+
+        HttpResponseMessage? response = null;
         try
         {
-            return await _client.Repository.Content
-                .GetArchive(owner, repo, ArchiveFormat.Tarball, reference, TimeSpan.FromSeconds(60))
-                .WaitAsync(ct);
-        }
-        catch (NotFoundException)
-        {
-            return null;
+            response = await _archiveHttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                response.Dispose();
+                return null;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger?.LogWarning(
+                    "Failed to open repository tarball stream for {Owner}/{Repo}@{Reference}: HTTP {StatusCode}",
+                    owner, repo, reference, (int)response.StatusCode);
+                response.Dispose();
+                return null;
+            }
+
+            if (maxArchiveBytes > 0 &&
+                response.Content.Headers.ContentLength is long contentLength &&
+                contentLength > maxArchiveBytes)
+            {
+                _logger?.LogWarning(
+                    "Repository tarball Content-Length for {Owner}/{Repo}@{Reference} ({ContentLength} bytes) exceeds MaxArchiveBytes ({LimitBytes}); rejecting before reading body",
+                    owner, repo, reference, contentLength, maxArchiveBytes);
+                response.Dispose();
+                return null;
+            }
+
+            var rawStream = await response.Content.ReadAsStreamAsync(ct);
+            var bounded = new BoundedReadStream(
+                rawStream,
+                maxArchiveBytes > 0 ? maxArchiveBytes : long.MaxValue,
+                leaveOpen: false,
+                ownedResource: response);
+            response = null;
+            return bounded;
         }
         catch (OperationCanceledException)
         {
+            response?.Dispose();
             throw;
         }
         catch (Exception ex)
         {
-            _logger?.LogWarning(ex, "Failed to download repository tarball for {Owner}/{Repo}@{Reference}", owner, repo, reference);
+            response?.Dispose();
+            _logger?.LogWarning(ex, "Failed to download repository tarball stream for {Owner}/{Repo}@{Reference}", owner, repo, reference);
             return null;
         }
     }
@@ -1506,6 +1588,151 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
             "Set ConversationGuard:ArchiveEnabled=false (recommended) or configure a triage+ user PAT via PackageUpdate:BotPat.");
     }
 
+    public async Task VerifyPackageUpdateWritePermissionAsync(
+        string owner, string repo, CancellationToken ct = default)
+    {
+        using var _ = SetAmbientToken(ct);
+        ct.ThrowIfCancellationRequested();
+
+        if (!string.IsNullOrWhiteSpace(_botPat))
+        {
+            await EnsureAuthenticatedAsync(ct);
+            ct.ThrowIfCancellationRequested();
+
+            var repoInfo = await _client.Repository.Get(owner, repo);
+            var perms = repoInfo?.Permissions;
+            if (perms == null || !(perms.Push || perms.Maintain || perms.Admin))
+            {
+                throw new InvalidOperationException(
+                    $"Configured PackageUpdate:BotPat lacks write access (push+) on '{owner}/{repo}' required for PackageUpdate:Enabled=true && DryRun=false.");
+            }
+
+            try
+            {
+                await _client.Actions.Workflows.Runs.List(
+                    owner,
+                    repo,
+                    new WorkflowRunsRequest(),
+                    new ApiOptions { PageSize = 1, PageCount = 1 });
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    $"Configured PackageUpdate:BotPat failed to read GitHub Actions workflow runs on '{owner}/{repo}' ({ex.Message}). " +
+                    "Grant 'Actions: Read-only' (or classic 'repo' / 'public_repo') on PackageUpdate:BotPat.",
+                    ex);
+            }
+
+            return;
+        }
+
+        Installation? installation;
+        if (_jwtClientFactory != null)
+        {
+            var jwtClient = _jwtClientFactory(new Credentials(GenerateJwt(), AuthenticationType.Bearer));
+            installation = await jwtClient.GitHubApps.GetRepositoryInstallationForCurrent(owner, repo);
+        }
+        else
+        {
+            await _authLock.WaitAsync(ct);
+            try
+            {
+                var priorCredentials = _client.Connection.Credentials;
+                try
+                {
+                    _client.Connection.Credentials = new Credentials(GenerateJwt(), AuthenticationType.Bearer);
+                    installation = await _client.GitHubApps.GetRepositoryInstallationForCurrent(owner, repo);
+                }
+                finally
+                {
+                    _client.Connection.Credentials = priorCredentials;
+                }
+            }
+            finally
+            {
+                _authLock.Release();
+            }
+        }
+
+        var installPerms = installation?.Permissions;
+        var checks = new (string ScopeName, string? Actual, bool RequireWrite)[]
+        {
+            ("Contents", installPerms?.Contents?.StringValue, true),
+            ("Pull requests", installPerms?.PullRequests?.StringValue, true),
+            ("Issues", installPerms?.Issues?.StringValue, true),
+            ("Actions", installPerms?.Actions?.StringValue, false)
+        };
+
+        var missing = new List<string>();
+        foreach (var (scopeName, actual, requireWrite) in checks)
+        {
+            var ok = requireWrite
+                ? string.Equals(actual, "write", StringComparison.OrdinalIgnoreCase)
+                : string.Equals(actual, "read", StringComparison.OrdinalIgnoreCase) ||
+                  string.Equals(actual, "write", StringComparison.OrdinalIgnoreCase);
+
+            if (!ok)
+            {
+                var expected = requireWrite ? "write" : "read";
+                missing.Add($"{scopeName}='{actual ?? "none"}' (expected '{expected}')");
+            }
+        }
+
+        if (missing.Count > 0)
+        {
+            throw new InvalidOperationException(
+                $"GitHub App installation on '{owner}/{repo}' is missing required PackageUpdate permissions: {string.Join("; ", missing)}. " +
+                "Grant 'Repository -> Contents: Read and write', 'Pull requests: Read and write', 'Issues: Read and write', and 'Actions: Read-only' " +
+                "on the GitHub App and accept updated permissions on the installation before running PackageUpdate with DryRun=false.");
+        }
+    }
+
+    public async Task VerifyBotPatTeamReadPermissionAsync(
+        string owner, string repo, string teamName, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(_botPat) || string.IsNullOrWhiteSpace(teamName))
+        {
+            return;
+        }
+
+        using var _ = SetAmbientToken(ct);
+        ct.ThrowIfCancellationRequested();
+        await EnsureAuthenticatedAsync(ct);
+        ct.ThrowIfCancellationRequested();
+
+        var repoInfo = await _client.Repository.Get(owner, repo);
+        ct.ThrowIfCancellationRequested();
+
+        if (repoInfo?.Owner?.Type == AccountType.User)
+        {
+            _logger?.LogWarning(
+                "Repository '{Owner}/{Repo}' is owned by a personal user account rather than an organization; skipping BotPat team lookup probe for '{TeamName}'.",
+                owner, repo, teamName);
+            return;
+        }
+
+        try
+        {
+            await GetTeamMembersAsync(owner, teamName, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                $"Configured PackageUpdate:BotPat failed to read organization team '{owner}/{teamName}' ({ex.Message}). " +
+                "Because PackageUpdate:BotPat switches all GitHub API calls globally, it must include classic 'read:org' " +
+                "or fine-grained 'Organization -> Members: Read-only' permission in addition to repository scopes so WorkflowStateModule does not block issue_comment commands.",
+                ex);
+        }
+    }
+
     public async Task<string> GetBotLoginAsync(CancellationToken cancellationToken = default)
     {
         if (!string.IsNullOrWhiteSpace(_cachedBotLogin))
@@ -1660,7 +1887,9 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IBotI
 
     public void Dispose()
     {
+        _archiveHttpClient.Dispose();
         _authLock.Dispose();
+        _botLoginLock.Dispose();
         GC.SuppressFinalize(this);
     }
 }

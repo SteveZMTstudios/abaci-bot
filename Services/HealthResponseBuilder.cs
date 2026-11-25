@@ -51,7 +51,8 @@ public static class HealthResponseBuilder
             capabilities = new
             {
                 abiEngine = AbiEngineProbe.ActiveEngineTier,
-                conversationGuardPermission = ConversationGuardPermissionProbe.ProbeStatus
+                conversationGuardPermission = runtimeHealth.GetCapabilityStatus("conversationGuardPermission"),
+                packageUpdatePermission = runtimeHealth.GetCapabilityStatus("packageUpdatePermission")
             },
             modules = new
             {

@@ -65,7 +65,7 @@ The table below lists all labels defined in [`Services/GitHubLabels.cs`](../Serv
 | `Rebuild: 5001+` | Official Taxonomy | Over 5000 downstream packages affected. |
 | `Auto-Update` | Bot Extension | Pull request automatically created for upstream package updates. |
 | `Auto-Update: Rust` | Bot Extension | Pull request automatically created for Rust crate updates. |
-| `Auto-Update: Blocked` | Bot Extension | Automated package updates blocked due to repeated failures or missing dependencies. |
+| `Auto-Update: Blocked` | Bot Extension | Automated package updates blocked due to repeated CI failures or post-merge OBS build failures. |
 
 ---
 
@@ -205,7 +205,7 @@ gh label create "Rebuild: 5001+" --repo "$REPO" --color "e99695" --description "
 # 11. Automated Package Updates
 gh label create "Auto-Update" --repo "$REPO" --color "0366d6" --description "Pull request automatically created for package updates." --force
 gh label create "Auto-Update: Rust" --repo "$REPO" --color "dea584" --description "Pull request automatically created for Rust crate updates." --force
-gh label create "Auto-Update: Blocked" --repo "$REPO" --color "d73a4a" --description "Package updates blocked due to repeated failures or missing dependencies." --force
+gh label create "Auto-Update: Blocked" --repo "$REPO" --color "d73a4a" --description "Package updates blocked due to repeated CI failures or post-merge OBS failures." --force
 ```
 
 ### 3.2 Homepage Repository (`openRuyi-Project/homepage`)

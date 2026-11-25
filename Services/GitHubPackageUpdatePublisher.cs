@@ -21,7 +21,7 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
     private readonly PackageUpdateOptions _options;
     private readonly IBotIdentityProvider? _botIdentity;
     private readonly ILocaleResolver? _localeResolver;
-    private readonly IReadOnlyList<ISpecVersionRewriter>? _specRewriters;
+    private readonly IReadOnlyList<ISpecVersionRewriter> _specRewriters;
     private readonly ILogger<GitHubPackageUpdatePublisher>? _logger;
 
     public GitHubPackageUpdatePublisher(
@@ -37,7 +37,9 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         _logger = logger;
         _botIdentity = botIdentity ?? gitHubService as IBotIdentityProvider;
         _localeResolver = localeResolver;
-        _specRewriters = specRewriters?.ToList();
+        _specRewriters = specRewriters != null
+            ? specRewriters.ToList()
+            : new List<ISpecVersionRewriter> { new PlainSpecVersionRewriter(), new RustCrateSpecRewriter() };
     }
 
     public async Task<PublishResult> PublishUpdateAsync(
@@ -188,8 +190,10 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
 
             // 3. Re-verify and re-rewrite against live baseBranch SPEC so #!NoAutoUpdate, admission blocks,
             // and non-version edits merged into main after the PR opened are preserved (including orphan branches).
+            var liveBaseSha = await _gitHubService.GetRefShaAsync(owner, repo, baseBranch, ct);
+            var baseRefForCheck = !string.IsNullOrEmpty(liveBaseSha) ? liveBaseSha : baseBranch;
             var baseCheck = await VerifyLiveBaseSpecAsync(
-                owner, repo, finalSpecPath, baseBranch, candidate, rewriteResult, allowReRewrite: true, ct);
+                owner, repo, finalSpecPath, baseRefForCheck, candidate, rewriteResult, ct);
             if (baseCheck.AbortResult != null)
             {
                 return baseCheck.AbortResult;
@@ -198,7 +202,8 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
             effectiveCandidate = baseCheck.EffectiveCandidate;
 
             if (branchAlreadyAtTarget &&
-                string.Equals(NormalizeLineEndings(branchSpecContent), NormalizeLineEndings(effectiveContent), StringComparison.Ordinal))
+                (string.Equals(NormalizeLineEndings(branchSpecContent), NormalizeLineEndings(effectiveContent), StringComparison.Ordinal) ||
+                 AreEqualIgnoringRemoteAssetLines(branchSpecContent, effectiveContent)))
             {
                 needsBranchCommit = false;
             }
@@ -214,7 +219,7 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
 
             // Re-verify and re-rewrite against live base SPEC at baseSha so stale catalog caches never overwrite main commits or bypass #!NoAutoUpdate.
             var baseCheck = await VerifyLiveBaseSpecAsync(
-                owner, repo, finalSpecPath, baseSha, candidate, rewriteResult, allowReRewrite: true, ct);
+                owner, repo, finalSpecPath, baseSha, candidate, rewriteResult, ct);
             if (baseCheck.AbortResult != null)
             {
                 return baseCheck.AbortResult;
@@ -241,6 +246,19 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
 
         if (needsBranchCommit)
         {
+            if (!string.IsNullOrEmpty(existingBranchSha))
+            {
+                var currentBranchSha = await _gitHubService.GetRefShaAsync(owner, repo, branchName, ct);
+                if (!string.IsNullOrEmpty(currentBranchSha) &&
+                    !string.Equals(currentBranchSha, existingBranchSha, StringComparison.Ordinal))
+                {
+                    _logger?.LogWarning(
+                        "Branch {Branch} moved concurrently from {ExpectedSha} to {CurrentSha} before write; failing closed",
+                        branchName, existingBranchSha, currentBranchSha);
+                    return new PublishResult(false, false, $"Branch '{branchName}' changed concurrently before commit (fail-closed)");
+                }
+            }
+
             // Commit updated SPEC to branch
             await _gitHubService.UpdateFileContentAsync(
                 owner, repo, finalSpecPath, commitMessage, effectiveContent, branchName, ct);
@@ -285,7 +303,6 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         string baseRefOrSha,
         UpdateCandidate candidate,
         SpecRewriteResult rewriteResult,
-        bool allowReRewrite,
         CancellationToken ct)
     {
         string? liveBaseSpec;
@@ -348,32 +365,34 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
                 rewriteResult.UpdatedContent, effectiveCandidate);
         }
 
-        if (allowReRewrite && _specRewriters is { Count: > 0 })
+        if (_specRewriters.Count == 0)
         {
-            var normalizedDir = Path.GetDirectoryName(finalSpecPath.Replace('\\', '/'))?.Replace('\\', '/');
-            var dirName = !string.IsNullOrEmpty(normalizedDir)
-                ? Path.GetFileName(normalizedDir)
-                : effectiveCandidate.PackageName;
-            var liveContext = new SpecContext(effectiveCandidate.PackageName, dirName, liveBaseSpec, finalSpecPath);
-            var rewriter = _specRewriters.FirstOrDefault(r => r.CanHandle(liveContext));
-            if (rewriter == null)
-            {
-                return (new PublishResult(true, true, "Live base SPEC has no compatible automated rewriter"),
-                    rewriteResult.UpdatedContent, effectiveCandidate);
-            }
-
-            var liveRewrite = rewriter.Rewrite(liveContext, effectiveCandidate.TargetVersion);
-            if (!liveRewrite.Success || !liveRewrite.HasChanged)
-            {
-                return (new PublishResult(true, true,
-                        $"Live base SPEC rewrite produced no change or failed: {liveRewrite.ErrorMessage ?? "no-op"}"),
-                    rewriteResult.UpdatedContent, effectiveCandidate);
-            }
-
-            return (null, liveRewrite.UpdatedContent, effectiveCandidate);
+            _logger?.LogWarning("No spec rewriters configured to re-rewrite live base SPEC {SpecPath}; failing closed", finalSpecPath);
+            return (new PublishResult(false, false, "No spec rewriters configured to re-rewrite live base SPEC (fail-closed)"),
+                rewriteResult.UpdatedContent, effectiveCandidate);
         }
 
-        return (null, rewriteResult.UpdatedContent, effectiveCandidate);
+        var normalizedDir = Path.GetDirectoryName(finalSpecPath.Replace('\\', '/'))?.Replace('\\', '/');
+        var dirName = !string.IsNullOrEmpty(normalizedDir)
+            ? Path.GetFileName(normalizedDir)
+            : effectiveCandidate.PackageName;
+        var liveContext = new SpecContext(effectiveCandidate.PackageName, dirName, liveBaseSpec, finalSpecPath);
+        var rewriter = _specRewriters.FirstOrDefault(r => r.CanHandle(liveContext));
+        if (rewriter == null)
+        {
+            return (new PublishResult(true, true, "Live base SPEC has no compatible automated rewriter"),
+                rewriteResult.UpdatedContent, effectiveCandidate);
+        }
+
+        var liveRewrite = rewriter.Rewrite(liveContext, effectiveCandidate.TargetVersion);
+        if (!liveRewrite.Success || !liveRewrite.HasChanged)
+        {
+            return (new PublishResult(true, true,
+                    $"Live base SPEC rewrite produced no change or failed: {liveRewrite.ErrorMessage ?? "no-op"}"),
+                rewriteResult.UpdatedContent, effectiveCandidate);
+        }
+
+        return (null, liveRewrite.UpdatedContent, effectiveCandidate);
     }
 
     internal static string[] GetRequiredLabels(UpdateCandidate candidate)
@@ -434,6 +453,40 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
 
     private static string? NormalizeLineEndings(string? value)
         => value?.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+
+    private static bool AreEqualIgnoringRemoteAssetLines(string? left, string? right)
+    {
+        var normLeft = NormalizeLineEndings(left);
+        var normRight = NormalizeLineEndings(right);
+        if (normLeft == null || normRight == null)
+        {
+            return false;
+        }
+
+        var leftLines = normLeft.Split('\n');
+        var rightLines = normRight.Split('\n');
+        if (leftLines.Length != rightLines.Length)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < leftLines.Length; i++)
+        {
+            if (string.Equals(leftLines[i], rightLines[i], StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var isLeftRemoteAsset = leftLines[i].TrimStart().StartsWith("#!RemoteAsset", StringComparison.OrdinalIgnoreCase);
+            var isRightRemoteAsset = rightLines[i].TrimStart().StartsWith("#!RemoteAsset", StringComparison.OrdinalIgnoreCase);
+            if (!isLeftRemoteAsset || !isRightRemoteAsset)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     public static string GeneratePullRequestBody(UpdateCandidate candidate, string? locale = null, string? botLogin = null)
     {

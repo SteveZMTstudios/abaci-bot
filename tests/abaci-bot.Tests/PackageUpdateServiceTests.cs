@@ -32,15 +32,23 @@ public class PackageUpdateServiceTests
             "openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), true, Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new[] { stalePr });
 
+        var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "openRuyi-Project/openRuyi");
+
         var fullPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
         typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(fullPr, botUser);
         var headRef = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
         typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headRef, "autoupdate/curl");
+        typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(headRef, "sha88");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headRef, repoObj);
         typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(fullPr, headRef);
         gitHubMock.GetPullRequestAsync("openRuyi-Project", "openRuyi", 88, Arg.Any<CancellationToken>())
             .Returns(fullPr);
+        gitHubMock.GetBranchLatestCommitAsync("openRuyi-Project", "openRuyi", "autoupdate/curl", Arg.Any<CancellationToken>())
+            .Returns(new BranchCommitInfo("sha88", "bump", "aqua-rium", "bot@example.com", "web-flow", "noreply@github.com"));
 
         var failedRun = (WorkflowRun)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(WorkflowRun));
+        typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.HeadSha))?.SetValue(failedRun, "sha88");
         typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.CreatedAt))?.SetValue(failedRun, DateTimeOffset.UtcNow.AddDays(-9));
         typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.Conclusion))?.SetValue(failedRun, new Octokit.StringEnum<WorkflowRunConclusion>(WorkflowRunConclusion.Failure));
         gitHubMock.ListWorkflowRunsAsync("openRuyi-Project", "openRuyi", "autoupdate/curl", Arg.Any<CancellationToken>())
@@ -128,11 +136,16 @@ public class PackageUpdateServiceTests
         typeof(Label).GetProperty(nameof(Label.Name))?.SetValue(autoUpdateLabel, GitHubLabels.AutoUpdate);
         typeof(Issue).GetProperty(nameof(Issue.Labels))?.SetValue(stalePr, new List<Label> { autoUpdateLabel });
 
+        var prefixPrIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(prefixPrIssue, 90);
+        typeof(Issue).GetProperty(nameof(Issue.UpdatedAt))?.SetValue(prefixPrIssue, (DateTimeOffset?)DateTimeOffset.UtcNow.AddDays(-10));
+        typeof(Issue).GetProperty(nameof(Issue.Labels))?.SetValue(prefixPrIssue, new List<Label> { autoUpdateLabel });
+
         gitHubMock.SearchStaleCandidatesAsync(
             "openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), true, Arg.Any<string>(), Arg.Any<CancellationToken>())
-            .Returns(new[] { stalePr });
+            .Returns(new[] { stalePr, prefixPrIssue });
 
-        // PR from a fork repository: "external-fork/openRuyi"
+        // PR #89 from a fork repository ("external-fork/openRuyi"): ignored completely at Tier 1
         var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
         typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
         var fullPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
@@ -144,13 +157,29 @@ public class PackageUpdateServiceTests
         typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headRef, forkRepo);
         typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(fullPr, headRef);
 
+        // PR #90 same-repo bot PR on non-autoupdate/ branch ("manual/curl"): closed on TTL without deleting branch
+        var sameRepo = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(sameRepo, "openRuyi-Project/openRuyi");
+        var prefixMismatchHead = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
+        typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(prefixMismatchHead, "manual/curl");
+        typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(prefixMismatchHead, "sha90");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(prefixMismatchHead, sameRepo);
+        var prefixMismatchPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(prefixMismatchPr, botUser);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(prefixMismatchPr, prefixMismatchHead);
+
         gitHubMock.GetPullRequestAsync("openRuyi-Project", "openRuyi", 89, Arg.Any<CancellationToken>())
             .Returns(fullPr);
+        gitHubMock.GetPullRequestAsync("openRuyi-Project", "openRuyi", 90, Arg.Any<CancellationToken>())
+            .Returns(prefixMismatchPr);
+        gitHubMock.GetBranchLatestCommitAsync("openRuyi-Project", "openRuyi", "manual/curl", Arg.Any<CancellationToken>())
+            .Returns(new BranchCommitInfo("sha90", "manual bump", "aqua-rium", "bot@example.com", "web-flow", "noreply@github.com"));
 
         var failedRun = (WorkflowRun)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(WorkflowRun));
+        typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.HeadSha))?.SetValue(failedRun, "sha90");
         typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.CreatedAt))?.SetValue(failedRun, DateTimeOffset.UtcNow.AddDays(-9));
         typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.Conclusion))?.SetValue(failedRun, new Octokit.StringEnum<WorkflowRunConclusion>(WorkflowRunConclusion.Failure));
-        gitHubMock.ListWorkflowRunsAsync("openRuyi-Project", "openRuyi", "autoupdate/curl", Arg.Any<CancellationToken>())
+        gitHubMock.ListWorkflowRunsAsync("openRuyi-Project", "openRuyi", "manual/curl", Arg.Any<CancellationToken>())
             .Returns(new[] { failedRun });
 
         var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
@@ -175,8 +204,13 @@ public class PackageUpdateServiceTests
 
         await service.RunSweepAsync();
 
-        // CloseIssue is called, but DeleteRefAsync must NOT be called on target repo for a fork's branch!
-        await gitHubMock.Received(1).CloseIssueAsync("openRuyi-Project", "openRuyi", 89, Arg.Any<CancellationToken>());
+        // Fork PR #89 must receive zero workflow queries, label self-healing, closures, or branch deletions.
+        await gitHubMock.DidNotReceive().ListWorkflowRunsAsync("openRuyi-Project", "openRuyi", "autoupdate/curl", Arg.Any<CancellationToken>());
+        await gitHubMock.DidNotReceive().AddLabelsAsync("openRuyi-Project", "openRuyi", 89, Arg.Any<string[]>(), Arg.Any<CancellationToken>());
+        await gitHubMock.DidNotReceive().CloseIssueAsync("openRuyi-Project", "openRuyi", 89, Arg.Any<CancellationToken>());
+
+        // Prefix-mismatch same-repo bot PR #90 is closed past TTL without deleting the non-autoupdate/ branch.
+        await gitHubMock.Received(1).CloseIssueAsync("openRuyi-Project", "openRuyi", 90, Arg.Any<CancellationToken>());
         await gitHubMock.DidNotReceive().DeleteRefAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
     }
 
@@ -421,6 +455,7 @@ public class PackageUpdateServiceTests
         typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(fullPr, botUser);
         var headRef = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
         typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headRef, "autoupdate/curl");
+        typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(headRef, "sha95");
 
         var targetRepoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
         typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(targetRepoObj, "openRuyi-Project/openRuyi");
@@ -433,6 +468,7 @@ public class PackageUpdateServiceTests
             .Returns(new BranchCommitInfo("sha95", "bump", "aqua-rium", "bot@example.com", "web-flow", "noreply@github.com"));
 
         var failedRun = (WorkflowRun)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(WorkflowRun));
+        typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.HeadSha))?.SetValue(failedRun, "sha95");
         typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.CreatedAt))?.SetValue(failedRun, DateTimeOffset.UtcNow.AddDays(-9));
         typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.Conclusion))?.SetValue(failedRun, new Octokit.StringEnum<WorkflowRunConclusion>(WorkflowRunConclusion.Failure));
         gitHubMock.ListWorkflowRunsAsync("openRuyi-Project", "openRuyi", "autoupdate/curl", Arg.Any<CancellationToken>())
@@ -532,9 +568,16 @@ public class PackageUpdateServiceTests
         gitHubMock.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), true, Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new[] { stalePr });
 
+        var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+        var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "openRuyi-Project/openRuyi");
+
         var fullPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(fullPr, botUser);
         var headRef = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
         typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headRef, "autoupdate/curl");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headRef, repoObj);
         typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(fullPr, headRef);
         gitHubMock.GetPullRequestAsync("openRuyi-Project", "openRuyi", 88, Arg.Any<CancellationToken>()).Returns(fullPr);
 
@@ -621,9 +664,16 @@ public class PackageUpdateServiceTests
         gitHubMock.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), true, Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new[] { activePr });
 
+        var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+        var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "openRuyi-Project/openRuyi");
+
         var fullPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(fullPr, botUser);
         var headRef = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
         typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headRef, "autoupdate/active-pkg");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headRef, repoObj);
         typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(fullPr, headRef);
         gitHubMock.GetPullRequestAsync("openRuyi-Project", "openRuyi", 101, Arg.Any<CancellationToken>())
             .Returns(fullPr);
@@ -831,9 +881,16 @@ public class PackageUpdateServiceTests
         gitHubMock.SearchStaleCandidatesAsync("owner", "repo", Arg.Any<DateTimeOffset>(), true, Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new[] { stalePr });
 
+        var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+        var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "owner/repo");
+
         var fullPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(fullPr, botUser);
         var headRef = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
         typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headRef, "autoupdate/failing-dryrun");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headRef, repoObj);
         typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(fullPr, headRef);
         gitHubMock.GetPullRequestAsync("owner", "repo", 301, Arg.Any<CancellationToken>()).Returns(fullPr);
 
@@ -951,10 +1008,17 @@ public class PackageUpdateServiceTests
         gitHubMock.SearchStaleCandidatesAsync("owner", "repo", Arg.Any<DateTimeOffset>(), true, Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new[] { prIssue });
 
+        var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+        var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "owner/repo");
+
         var fullPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(fullPr, botUser);
         var headRef = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
         typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headRef, "autoupdate/curl");
         typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(headRef, "sha501");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headRef, repoObj);
         typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(fullPr, headRef);
         gitHubMock.GetPullRequestAsync("owner", "repo", 501, Arg.Any<CancellationToken>()).Returns(fullPr);
         gitHubMock.GetBranchLatestCommitAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>())
@@ -1045,6 +1109,21 @@ public class PackageUpdateServiceTests
         typeof(Issue).GetProperty(nameof(Issue.Labels))?.SetValue(activePr, new List<Label> { autoUpdateLabel });
         gitHubMock.SearchStaleCandidatesAsync("owner", "repo", Arg.Any<DateTimeOffset>(), true, Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new[] { activePr });
+
+        var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+        var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "owner/repo");
+        var activeHead = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
+        typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(activeHead, "autoupdate/active");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(activeHead, repoObj);
+        var activeFullPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(activeFullPr, 10);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(activeFullPr, botUser);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(activeFullPr, activeHead);
+        gitHubMock.GetPullRequestAsync("owner", "repo", 10, Arg.Any<CancellationToken>()).Returns(activeFullPr);
+        gitHubMock.ListWorkflowRunsAsync("owner", "repo", "autoupdate/active", Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<WorkflowRun>());
 
         var routineCandidate = new UpdateCandidate("curl", "8.0", "8.1", CandidateOrigin.Lookout, string.Empty, IsSecurityAdvisory: false);
         var securityCandidate = new UpdateCandidate("openssl", "3.0", "3.1", CandidateOrigin.Lookout, string.Empty, IsSecurityAdvisory: true);
@@ -1266,9 +1345,16 @@ public class PackageUpdateServiceTests
                 "owner", "repo", Arg.Any<DateTimeOffset>(), true, Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns(new[] { openPrIssue });
 
+        var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+        var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "owner/repo");
+
         var fullPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(fullPr, botUser);
         var headRef = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
         typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headRef, "autoupdate/zlib");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headRef, repoObj);
         typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(fullPr, headRef);
         gitHubMock.GetPullRequestAsync("owner", "repo", 505, Arg.Any<CancellationToken>()).Returns(fullPr);
         gitHubMock.ListWorkflowRunsAsync("owner", "repo", "autoupdate/zlib", Arg.Any<CancellationToken>())
@@ -1413,10 +1499,17 @@ public class PackageUpdateServiceTests
                 "owner", "repo", Arg.Any<DateTimeOffset>(), true, Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns(new[] { failedPrIssue });
 
+        var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+        var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "owner/repo");
+
         var fullPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(fullPr, botUser);
         var headRef = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
         typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headRef, "autoupdate/curl");
         typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(headRef, "sha99");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headRef, repoObj);
         typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(fullPr, headRef);
         gitHubMock.GetPullRequestAsync("owner", "repo", 99, Arg.Any<CancellationToken>()).Returns(fullPr);
 
@@ -1644,9 +1737,16 @@ public class PackageUpdateServiceTests
         gitHubMock.SearchStaleCandidatesAsync("owner", "repo", Arg.Any<DateTimeOffset>(), true, Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns(new[] { stalePr });
 
+        var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+        var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "owner/repo");
+
         var fullPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(fullPr, botUser);
         var headRef = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
         typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headRef, "autoupdate/curl");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headRef, repoObj);
         typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(fullPr, headRef);
         gitHubMock.GetPullRequestAsync("owner", "repo", 701, Arg.Any<CancellationToken>()).Returns(fullPr);
 
@@ -1911,6 +2011,8 @@ public class PackageUpdateServiceTests
 
         var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
         typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+        var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "openRuyi-Project/openRuyi");
         var unlabeledPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
         typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(unlabeledPr, 77);
         typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(unlabeledPr, botUser);
@@ -1920,6 +2022,7 @@ public class PackageUpdateServiceTests
         typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(unlabeledPr, Array.Empty<Label>());
         var headRef = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
         typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headRef, "autoupdate/rust-zip");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headRef, repoObj);
         typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(unlabeledPr, headRef);
 
         var inventoryGateway = Substitute.For<IOpenPullRequestInventoryGateway>();
@@ -2101,8 +2204,14 @@ public class PackageUpdateServiceTests
             typeof(Issue).GetProperty(nameof(Issue.UpdatedAt))?.SetValue(issue, (DateTimeOffset?)DateTimeOffset.UtcNow.AddHours(-1));
             typeof(Issue).GetProperty(nameof(Issue.Labels))?.SetValue(issue, new List<Label> { autoLabel });
 
+            var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+            typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+            var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+            typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "openRuyi-Project/openRuyi");
+
             var pr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
             typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(pr, number);
+            typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(pr, botUser);
             typeof(PullRequest).GetProperty(nameof(PullRequest.Title))?.SetValue(pr, $"Update {pkg} to 1.0.0");
             typeof(PullRequest).GetProperty(nameof(PullRequest.UpdatedAt))?.SetValue(pr, DateTimeOffset.UtcNow.AddHours(-1));
             typeof(PullRequest).GetProperty(nameof(PullRequest.CreatedAt))?.SetValue(pr, DateTimeOffset.UtcNow.AddHours(-1));
@@ -2110,6 +2219,7 @@ public class PackageUpdateServiceTests
             var head = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
             typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(head, $"autoupdate/{pkg}");
             typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(head, $"sha-{number}");
+            typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(head, repoObj);
             typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(pr, head);
 
             var failedRun = (WorkflowRun)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(WorkflowRun));
@@ -2656,10 +2766,17 @@ public class PackageUpdateServiceTests
         gitHubMock.SearchStaleCandidatesAsync("owner", "repo", Arg.Any<DateTimeOffset>(), true, Arg.Any<string>(), Arg.Any<CancellationToken>())
             .Returns(new[] { prIssue });
 
+        var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+        var repoObj = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repoObj, "owner/repo");
+
         var fullPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(fullPr, botUser);
         var headRef = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
         typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(headRef, "autoupdate/curl");
         typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(headRef, "sha502");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(headRef, repoObj);
         typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(fullPr, headRef);
         gitHubMock.GetPullRequestAsync("owner", "repo", 502, Arg.Any<CancellationToken>()).Returns(fullPr);
 
@@ -2996,6 +3113,280 @@ public class PackageUpdateServiceTests
 
         await gitHubMock.DidNotReceive().CloseIssueAsync("owner", "repo", 410, Arg.Any<CancellationToken>());
         await gitHubMock.DidNotReceive().DeleteRefAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task RunSweepAsync_HumanPrCarryingAutoUpdateLabel_SameRepoOrFork_PerformsZeroWrites()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        gitHubMock.SearchStaleCandidatesAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), false, Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<Issue>());
+        gitHubMock.SearchMergedPullRequestsAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<PullRequest>());
+
+        var autoUpdateLabel = (Label)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Label));
+        typeof(Label).GetProperty(nameof(Label.Name))?.SetValue(autoUpdateLabel, GitHubLabels.AutoUpdate);
+
+        static (Issue Issue, PullRequest Pr) MakeHumanAutoUpdatePr(int number, string author, string headRepoFullName, Label label)
+        {
+            var user = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+            typeof(User).GetProperty(nameof(User.Login))?.SetValue(user, author);
+            var issue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+            typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issue, number);
+            typeof(Issue).GetProperty(nameof(Issue.User))?.SetValue(issue, user);
+            typeof(Issue).GetProperty(nameof(Issue.UpdatedAt))?.SetValue(issue, (DateTimeOffset?)DateTimeOffset.UtcNow.AddDays(-20));
+            typeof(Issue).GetProperty(nameof(Issue.Labels))?.SetValue(issue, new List<Label> { label });
+
+            var repo = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+            typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repo, headRepoFullName);
+            var head = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
+            typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(head, "autoupdate/curl");
+            typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(head, $"sha-{number}");
+            typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(head, repo);
+
+            var pr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+            typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(pr, number);
+            typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(pr, user);
+            typeof(PullRequest).GetProperty(nameof(PullRequest.UpdatedAt))?.SetValue(pr, DateTimeOffset.UtcNow.AddDays(-20));
+            typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(pr, new[] { label });
+            typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(pr, head);
+            return (issue, pr);
+        }
+
+        var (sameRepoIssue, sameRepoPr) = MakeHumanAutoUpdatePr(901, "human-maintainer", "owner/repo", autoUpdateLabel);
+        var (forkIssue, forkPr) = MakeHumanAutoUpdatePr(902, "external-contributor", "external/repo", autoUpdateLabel);
+
+        gitHubMock.SearchStaleCandidatesAsync(
+            "owner", "repo", Arg.Any<DateTimeOffset>(), true, Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(new[] { sameRepoIssue, forkIssue });
+        gitHubMock.GetPullRequestAsync("owner", "repo", 901, Arg.Any<CancellationToken>()).Returns(sameRepoPr);
+        gitHubMock.GetPullRequestAsync("owner", "repo", 902, Arg.Any<CancellationToken>()).Returns(forkPr);
+
+        // Even if base repo's autoupdate/curl tip is a bot commit and remoteasset failed, neither human PR may touch it.
+        gitHubMock.GetBranchLatestCommitAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>())
+            .Returns(new BranchCommitInfo("sha-bot-base", "bump curl", "aqua-rium", "bot@example.com", "web-flow", ""));
+
+        var backfiller = Substitute.For<IRemoteAssetBackfiller>();
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            TargetRepository = "owner/repo",
+            BotLogin = "aqua-rium",
+            FailedPrTtlDays = 7,
+            MaxConsecutiveFailures = 1,
+            IssueOnGivingUp = true
+        });
+
+        var service = new PackageUpdateService(
+            gitHubMock,
+            Array.Empty<IUpdateCandidateSource>(),
+            Array.Empty<ISpecVersionRewriter>(),
+            Substitute.For<IPackageUpdatePublisher>(),
+            new ObsPostMergeVerifier(gitHubMock, Substitute.For<IObsBuildService>(), options),
+            Substitute.For<ISpecCatalog>(),
+            options,
+            backfiller);
+
+        await service.RunSweepAsync();
+
+        await gitHubMock.DidNotReceiveWithAnyArgs().ListWorkflowRunsAsync(default!, default!, default, default);
+        await gitHubMock.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default!, default);
+        await backfiller.DidNotReceiveWithAnyArgs().TryBackfillAsync(default!, default!, default!, default, default, default);
+        await gitHubMock.DidNotReceiveWithAnyArgs().CloseIssueAsync(default!, default!, default, default);
+        await gitHubMock.DidNotReceiveWithAnyArgs().CreateIssueAsync(default!, default!, default!, default!, default!, default);
+        await gitHubMock.DidNotReceiveWithAnyArgs().DeleteRefAsync(default!, default!, default!, default);
+    }
+
+    [Fact]
+    public async Task RunSweepAsync_ForkPrWithBotAuthorCollidingBaseBranch_NeverTriggersBackfill()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        gitHubMock.SearchStaleCandidatesAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), false, Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<Issue>());
+        gitHubMock.SearchMergedPullRequestsAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<PullRequest>());
+
+        var autoUpdateLabel = (Label)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Label));
+        typeof(Label).GetProperty(nameof(Label.Name))?.SetValue(autoUpdateLabel, GitHubLabels.AutoUpdate);
+        var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+
+        var forkRepo = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(forkRepo, "forker/repo");
+        var head = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
+        typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(head, "autoupdate/curl");
+        typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(head, "sha-fork");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(head, forkRepo);
+
+        var forkIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(forkIssue, 903);
+        typeof(Issue).GetProperty(nameof(Issue.User))?.SetValue(forkIssue, botUser);
+        typeof(Issue).GetProperty(nameof(Issue.UpdatedAt))?.SetValue(forkIssue, (DateTimeOffset?)DateTimeOffset.UtcNow);
+        typeof(Issue).GetProperty(nameof(Issue.Labels))?.SetValue(forkIssue, new List<Label> { autoUpdateLabel });
+
+        var forkPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(forkPr, 903);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(forkPr, botUser);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(forkPr, head);
+
+        gitHubMock.SearchStaleCandidatesAsync(
+            "owner", "repo", Arg.Any<DateTimeOffset>(), true, Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(new[] { forkIssue });
+        gitHubMock.GetPullRequestAsync("owner", "repo", 903, Arg.Any<CancellationToken>()).Returns(forkPr);
+
+        var backfiller = Substitute.For<IRemoteAssetBackfiller>();
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            TargetRepository = "owner/repo",
+            BotLogin = "aqua-rium"
+        });
+
+        var service = new PackageUpdateService(
+            gitHubMock,
+            Array.Empty<IUpdateCandidateSource>(),
+            Array.Empty<ISpecVersionRewriter>(),
+            Substitute.For<IPackageUpdatePublisher>(),
+            new ObsPostMergeVerifier(gitHubMock, Substitute.For<IObsBuildService>(), options),
+            Substitute.For<ISpecCatalog>(),
+            options,
+            backfiller);
+
+        await service.RunSweepAsync();
+
+        await backfiller.DidNotReceiveWithAnyArgs().TryBackfillAsync(default!, default!, default!, default, default, default);
+        await gitHubMock.DidNotReceiveWithAnyArgs().ListWorkflowRunsAsync(default!, default!, default, default);
+    }
+
+    [Fact]
+    public async Task RunSweepAsync_BotPrWhoseBranchTipShaMovedOrHasHumanCommit_SkipsBackfillAndClose_WhileCountingSlot()
+    {
+        var gitHubMock = Substitute.For<IGitHubService>();
+        gitHubMock.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+        gitHubMock.SearchStaleCandidatesAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), false, Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<Issue>());
+        gitHubMock.SearchMergedPullRequestsAsync(
+            Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<PullRequest>());
+
+        var autoUpdateLabel = (Label)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Label));
+        typeof(Label).GetProperty(nameof(Label.Name))?.SetValue(autoUpdateLabel, GitHubLabels.AutoUpdate);
+        var botUser = (User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(User));
+        typeof(User).GetProperty(nameof(User.Login))?.SetValue(botUser, "aqua-rium");
+        var repo = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+        typeof(Repository).GetProperty(nameof(Repository.FullName))?.SetValue(repo, "owner/repo");
+
+        var head = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
+        typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(head, "autoupdate/curl");
+        typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(head, "pr-head-sha");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(head, repo);
+
+        var prIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(prIssue, 904);
+        typeof(Issue).GetProperty(nameof(Issue.User))?.SetValue(prIssue, botUser);
+        typeof(Issue).GetProperty(nameof(Issue.UpdatedAt))?.SetValue(prIssue, (DateTimeOffset?)DateTimeOffset.UtcNow.AddDays(-20));
+        typeof(Issue).GetProperty(nameof(Issue.Labels))?.SetValue(prIssue, new List<Label> { autoUpdateLabel });
+
+        var pr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(pr, 904);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(pr, botUser);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.UpdatedAt))?.SetValue(pr, DateTimeOffset.UtcNow.AddDays(-20));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(pr, new[] { autoUpdateLabel });
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(pr, head);
+
+        gitHubMock.SearchStaleCandidatesAsync(
+            "owner", "repo", Arg.Any<DateTimeOffset>(), true, Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(new[] { prIssue });
+        gitHubMock.GetPullRequestAsync("owner", "repo", 904, Arg.Any<CancellationToken>()).Returns(pr);
+
+        var remoteAssetFailed = (WorkflowRun)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(WorkflowRun));
+        typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.Id))?.SetValue(remoteAssetFailed, 7777L);
+        typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.Name))?.SetValue(remoteAssetFailed, "RemoteAsset Verification");
+        typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.HeadSha))?.SetValue(remoteAssetFailed, "pr-head-sha");
+        typeof(WorkflowRun).GetProperty(nameof(WorkflowRun.Conclusion))?.SetValue(remoteAssetFailed, new StringEnum<WorkflowRunConclusion>(WorkflowRunConclusion.Failure));
+        gitHubMock.ListWorkflowRunsAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>())
+            .Returns(new[] { remoteAssetFailed });
+
+        // Branch tip SHA moved away from pr-head-sha (even though authored by bot), OR human commit on tip.
+        gitHubMock.GetBranchLatestCommitAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>())
+            .Returns(new BranchCommitInfo("different-sha", "bump curl", "aqua-rium", "bot@example.com", "web-flow", ""));
+
+        var sourceMock = Substitute.For<IUpdateCandidateSource>();
+        sourceMock.SourceName.Returns("Lookout");
+        sourceMock.GetCandidatesAsync(Arg.Any<CancellationToken>())
+            .Returns(new[] { new UpdateCandidate("zlib", "1.3", "1.4", CandidateOrigin.Lookout, "https://lookout/zlib") });
+
+        var specCatalog = Substitute.For<ISpecCatalog>();
+        specCatalog.GetSpecAsync("zlib", Arg.Any<CancellationToken>())
+            .Returns(new SpecContext("zlib", "zlib", "Name: zlib\nVersion: 1.3\n", "SPECS/zlib/zlib.spec"));
+
+        var publisher = Substitute.For<IPackageUpdatePublisher>();
+        var backfiller = Substitute.For<IRemoteAssetBackfiller>();
+
+        // Keep MaxConcurrentPullRequests = 2 with 1 healthy PR (#905) alongside failed PR #904 (total = 2)
+        // to verify PR #904 still occupies a concurrency slot while backfill and TTL closure stay blocked.
+        var healthyIssue = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+        typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(healthyIssue, 905);
+        typeof(Issue).GetProperty(nameof(Issue.User))?.SetValue(healthyIssue, botUser);
+        typeof(Issue).GetProperty(nameof(Issue.UpdatedAt))?.SetValue(healthyIssue, (DateTimeOffset?)DateTimeOffset.UtcNow);
+        typeof(Issue).GetProperty(nameof(Issue.Labels))?.SetValue(healthyIssue, new List<Label> { autoUpdateLabel });
+
+        var healthyHead = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
+        typeof(GitReference).GetProperty(nameof(GitReference.Ref))?.SetValue(healthyHead, "autoupdate/healthy");
+        typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(healthyHead, "healthy-sha");
+        typeof(GitReference).GetProperty(nameof(GitReference.Repository))?.SetValue(healthyHead, repo);
+        var healthyPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(healthyPr, 905);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.User))?.SetValue(healthyPr, botUser);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(healthyPr, healthyHead);
+
+        gitHubMock.SearchStaleCandidatesAsync(
+            "owner", "repo", Arg.Any<DateTimeOffset>(), true, Arg.Any<string?>(), Arg.Any<CancellationToken>())
+            .Returns(new[] { prIssue, healthyIssue });
+        gitHubMock.GetPullRequestAsync("owner", "repo", 905, Arg.Any<CancellationToken>()).Returns(healthyPr);
+        gitHubMock.ListWorkflowRunsAsync("owner", "repo", "autoupdate/healthy", Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<WorkflowRun>());
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            TargetRepository = "owner/repo",
+            BotLogin = "aqua-rium",
+            FailedPrTtlDays = 7,
+            MaxConcurrentPullRequests = 2,
+            CooldownHours = 0
+        });
+
+        var service = new PackageUpdateService(
+            gitHubMock,
+            new[] { sourceMock },
+            new ISpecVersionRewriter[] { new PlainSpecVersionRewriter() },
+            publisher,
+            new ObsPostMergeVerifier(gitHubMock, Substitute.For<IObsBuildService>(), options),
+            specCatalog,
+            options,
+            backfiller);
+
+        await service.RunSweepAsync();
+
+        await backfiller.DidNotReceiveWithAnyArgs().TryBackfillAsync(default!, default!, default!, default, default, default);
+        await gitHubMock.DidNotReceive().CloseIssueAsync("owner", "repo", 904, Arg.Any<CancellationToken>());
+        await gitHubMock.DidNotReceive().DeleteRefAsync("owner", "repo", "autoupdate/curl", Arg.Any<CancellationToken>());
+        // PR #904 was counted in failedActiveCount alongside healthy PR #905 (total = 2 >= MaxConcurrentPullRequests 2), so zlib is NOT published.
+        await publisher.DidNotReceiveWithAnyArgs().PublishUpdateAsync(default!, default!, default!, default!, default, default);
     }
 
     private sealed class FakeCursorCandidateSource(CandidateOrigin origin, IReadOnlyList<UpdateCandidate> items)
