@@ -7,45 +7,51 @@ namespace abaci_bot.Options;
 /// </summary>
 public class StaleLifecycleOptions
 {
-    /// <summary>
-    /// Master toggle for the background stale management worker.
-    /// Default is false to prevent unexpected destructive lifecycle operations upon deployment.
-    /// </summary>
+    [ConfigField(
+        Description = "Master toggle for the background stale management worker.",
+        TrueBehavior = "sweeps every CheckIntervalHours.",
+        FalseBehavior = "the worker logs that it is disabled and performs no scans.")]
     public bool Enabled { get; set; }
 
-    /// <summary>
-    /// When true, logs candidates that would be marked as stale or closed without mutating GitHub.
-    /// Default is true for safety. Must be explicitly set to false in configuration to execute real actions.
-    /// </summary>
+    [ConfigField(
+        Description = "Safety dry-run switch preventing live GitHub writes.",
+        TrueBehavior = "candidates are only logged without mutating GitHub.",
+        FalseBehavior = "stale labels, comments, and closures are applied to GitHub.")]
     public bool DryRun { get; set; } = true;
 
-    /// <summary>
-    /// Specific repositories monitored for stale cleanup in "owner/repo" format.
-    /// Requires explicit configuration; no repositories are processed if left empty.
-    /// </summary>
+    [ConfigField(
+        Description = "Repositories monitored for stale lifecycle sweeps.",
+        Format = "\"owner/repo\" entries",
+        EmptyBehavior = "no repository is scanned, so the worker is effectively idle.",
+        Example = "[\"openRuyi-Project/openRuyi\"]")]
     public List<string> MonitoredRepositories { get; set; } = new();
 
-    /// <summary>
-    /// Repositories explicitly excluded from stale management (e.g. archived or template repos).
-    /// </summary>
+    [ConfigField(
+        Description = "Repositories explicitly excluded from stale management (takes precedence over MonitoredRepositories).",
+        Format = "\"owner/repo\" entries",
+        EmptyBehavior = "nothing is excluded; entries here win over MonitoredRepositories.",
+        Example = "[\"openRuyi-Project/archive-repo\"]")]
     public List<string> ExcludedRepositories { get; set; } = new();
 
-    /// <summary>
-    /// Number of inactive days before an issue or PR is marked with Status: Stale.
-    /// Default is 30 days.
-    /// </summary>
+    [ConfigField(
+        Description = "Inactive days before an issue or PR is marked with Status: Stale (only used when Enabled=true and DryRun=false).",
+        Unit = "days",
+        Range = "> 0",
+        EmptyBehavior = "values <= 0 are rejected by startup validation.")]
     public int StaleDays { get; set; } = 30;
 
-    /// <summary>
-    /// Grace period in days after being marked as Status: Stale (and notified via comment)
-    /// before the issue or PR is eligible for automatic closure.
-    /// Default is 7 days.
-    /// </summary>
+    [ConfigField(
+        Description = "Grace period in days after Status: Stale before automatic closure (anchored by the stale comment).",
+        Unit = "days",
+        Range = "> 0",
+        EmptyBehavior = "values <= 0 are rejected by startup validation.")]
     public int CloseDays { get; set; } = 7;
 
-    /// <summary>
-    /// Labels that protect an issue or PR from ever being marked as stale.
-    /// </summary>
+    [ConfigField(
+        Description = "Labels that exempt an issue or PR from stale marking and closure.",
+        Format = "GitHub label names",
+        EmptyBehavior = "no label protects an item from stale processing.",
+        Example = "[\"Status: stale-exempt\", \"Workflow: Blocked\"]")]
     public List<string> ExemptLabels { get; set; } = new()
     {
         Services.GitHubLabels.StatusStaleExempt,
@@ -63,18 +69,16 @@ public class StaleLifecycleOptions
         "This issue or pull request was closed because it has been stalled for over {CloseDays} days with no activity after being marked as stale. " +
         "Feel free to reopen it or file a new one if you would like to continue the work.";
 
-    /// <summary>
-    /// Friendly message commented on an issue or PR when it is marked as Stale.
-    /// Posting this comment also refreshes the item's update timestamp on GitHub to anchor the grace period.
-    /// Supports {StaleDays} and {CloseDays} placeholders.
-    /// If left empty or whitespace, a safe formatted default notification will still be posted.
-    /// </summary>
+    [ConfigField(
+        Description = "Comment template posted when an issue or PR is marked with Status: Stale.",
+        Format = "Markdown text supporting {StaleDays} and {CloseDays} placeholders",
+        EmptyBehavior = "the built-in default stale notification message is posted.")]
     public string StaleCommentTemplate { get; set; } = DefaultStaleCommentTemplate;
 
-    /// <summary>
-    /// Friendly message commented when an object is automatically closed due to stale expiration.
-    /// Supports {CloseDays} placeholder.
-    /// </summary>
+    [ConfigField(
+        Description = "Comment template posted when a stale issue or PR is automatically closed.",
+        Format = "Markdown text supporting the {CloseDays} placeholder",
+        EmptyBehavior = "the built-in default close notification message is posted.")]
     public string CloseCommentTemplate { get; set; } = DefaultCloseCommentTemplate;
 
     /// <summary>
@@ -103,20 +107,24 @@ public class StaleLifecycleOptions
         return template.Replace("{CloseDays}", CloseDays.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>
-    /// Frequency interval in hours between stale scan executions.
-    /// Default is 24 hours.
-    /// </summary>
+    [ConfigField(
+        Description = "Execution interval controlling how often an enabled worker starts a new sweep.",
+        Unit = "hours",
+        Range = "> 0",
+        EmptyBehavior = "values <= 0 are rejected by startup validation.")]
     public int CheckIntervalHours { get; set; } = 24;
 
-    /// <summary>
-    /// Delay between processing individual candidates (in milliseconds) to prevent API burst throttling.
-    /// Default is 500 ms.
-    /// </summary>
+    [ConfigField(
+        Description = "Delay inserted between individual GitHub API candidate operations to prevent burst throttling.",
+        Unit = "milliseconds",
+        Range = ">= 0",
+        EmptyBehavior = "0 means no delay between GitHub API calls.")]
     public int RequestThrottleMilliseconds { get; set; } = 500;
 
-    /// <summary>
-    /// GitHub API remaining quota watermark. When quota drops below this, the service backs off with retries before aborting the current cycle.
-    /// </summary>
+    [ConfigField(
+        Description = "Minimum remaining GitHub API quota required before starting a stale sweep.",
+        Unit = "API requests remaining",
+        Range = ">= 0",
+        EmptyBehavior = "0 disables the quota gate so sweeps start regardless of remaining quota.")]
     public int MinRateLimitRemaining { get; set; } = 100;
 }

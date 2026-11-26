@@ -280,7 +280,7 @@ public class DocumentationContractTests
             }
 
             var name = match.Groups[1].Value;
-            var value = match.Groups[2].Value.Trim();
+            var value = match.Groups[2].Value.Trim().TrimEnd(',');
             if (value.StartsWith('{'))
             {
                 continue;

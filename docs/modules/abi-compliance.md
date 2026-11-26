@@ -35,7 +35,7 @@ flowchart TD
 ```
 
 ### Phase B: Per-Workflow-Run Comparison (`AbiComplianceModule`)
-When a CI build finishes, `AbiComplianceModule` executes the package diff:
+When a CI build finishes, `AbiComplianceModule` executes the package diff. If GitHub omits the `workflow_run.pull_requests` array for cross-repository fork PRs, `GitHubWebhookProcessor` resolves matching open fork PRs by `head_owner:head_branch` and `head_sha` via `IOpenPullRequestInventoryGateway.FindOpenPullRequestsByHeadShaAsync` (falling back to GitHub Search filtered by open state and exact `head_sha`) before evaluating staleness:
 
 ```mermaid
 flowchart TD

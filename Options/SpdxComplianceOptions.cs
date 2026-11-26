@@ -5,34 +5,41 @@ namespace abaci_bot.Options;
 /// </summary>
 public class SpdxComplianceOptions
 {
-    /// <summary>
-    /// Enables or disables the SPDX compliance scanning module.
-    /// </summary>
+    [ConfigField(
+        Description = "Enables or disables the SPDX license compliance scanning module.",
+        TrueBehavior = "spec file licenses are validated against the SPDX catalog on PR updates.",
+        FalseBehavior = "the module is skipped entirely with no spec license validation or label.")]
     public bool Enabled { get; set; } = true;
 
-    /// <summary>
-    /// Remote URL of the official SPDX licenses JSON index.
-    /// </summary>
+    [ConfigField(
+        Description = "Remote URL of the official SPDX licenses JSON index.",
+        Format = "absolute URL",
+        EmptyBehavior = "the embedded license list is used and no remote refresh is attempted.")]
     public string UpdateRemoteUrl { get; set; } = "https://spdx.org/licenses/licenses.json";
 
-    /// <summary>
-    /// Remote URL of the official SPDX exceptions JSON index.
-    /// </summary>
+    [ConfigField(
+        Description = "Remote URL of the official SPDX exceptions JSON index.",
+        Format = "absolute URL",
+        EmptyBehavior = "the embedded exception list is used and no remote refresh is attempted.")]
     public string UpdateExceptionsRemoteUrl { get; set; } = "https://spdx.org/licenses/exceptions.json";
 
-    /// <summary>
-    /// Periodic background update interval in hours. Set to 0 to disable remote polling.
-    /// </summary>
+    [ConfigField(
+        Description = "Periodic background update interval for SPDX data.",
+        Unit = "hours",
+        Range = ">= 0",
+        EmptyBehavior = "0 disables periodic refresh; the last loaded list remains in memory.")]
     public double AutoUpdateIntervalHours { get; set; } = 24;
 
-    /// <summary>
-    /// Whether to accept common RPM legacy license identifiers (e.g., GPLv2+, LGPLv2+).
-    /// </summary>
+    [ConfigField(
+        Description = "Whether known RPM legacy license aliases (GPLv2+, ASL 2.0, etc.) are accepted.",
+        TrueBehavior = "known legacy aliases are accepted as compliant.",
+        FalseBehavior = "legacy aliases are reported as Compliance: License Issue.")]
     public bool AllowLegacyAliases { get; set; } = true;
 
-    /// <summary>
-    /// Maximum degree of concurrent HTTP requests when fetching spec file contents for inspection.
-    /// Defaults to 8.
-    /// </summary>
+    [ConfigField(
+        Description = "Maximum concurrency used for parallel spec evaluation.",
+        Unit = "concurrent workers",
+        Range = ">= 1",
+        EmptyBehavior = "higher values use more CPU; values < 1 restrict parallelism to 1.")]
     public int MaxDegreeOfParallelism { get; set; } = 8;
 }

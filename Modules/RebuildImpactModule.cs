@@ -5,6 +5,7 @@ using abaci_bot.Pipelines;
 using abaci_bot.Services;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Octokit;
 using Octokit.Webhooks.Events.PullRequest;
 
 namespace abaci_bot.Modules;
@@ -15,9 +16,13 @@ namespace abaci_bot.Modules;
 /// </summary>
 public partial class RebuildImpactModule : IPullRequestModule
 {
+    internal const string RebuildGateCommentConfirmedOnRemoteItemKey = "RebuildImpact:GateCommentConfirmedOnRemote";
+
     private readonly IRpmDependencyService _dependencyService;
     private readonly RebuildImpactOptions _options;
     private readonly IRebuildVerificationOrchestrator _verificationOrchestrator;
+    private readonly IBotIdentityProvider? _botIdentity;
+    private readonly string? _configuredBotLogin;
     private readonly ILogger<RebuildImpactModule>? _logger;
 
     public string ModuleName => nameof(RebuildImpactModule);
@@ -45,11 +50,16 @@ public partial class RebuildImpactModule : IPullRequestModule
         IRpmDependencyService dependencyService,
         IOptions<RebuildImpactOptions> options,
         IRebuildVerificationOrchestrator verificationOrchestrator,
+        IBotIdentityProvider? botIdentity = null,
+        IOptions<PackageUpdateOptions>? packageUpdateOptions = null,
         ILogger<RebuildImpactModule>? logger = null)
     {
         _dependencyService = dependencyService ?? throw new ArgumentNullException(nameof(dependencyService));
         _options = (options ?? throw new ArgumentNullException(nameof(options))).Value;
         _verificationOrchestrator = verificationOrchestrator ?? throw new ArgumentNullException(nameof(verificationOrchestrator));
+        _botIdentity = botIdentity;
+        var pkgOpts = packageUpdateOptions?.Value;
+        _configuredBotLogin = !string.IsNullOrWhiteSpace(pkgOpts?.BotPat) ? pkgOpts.BotLogin : null;
         _logger = logger;
     }
 
@@ -176,9 +186,16 @@ public partial class RebuildImpactModule : IPullRequestModule
             {
                 context.LabelsToAdd.Add(GitHubLabels.WorkflowBlocked);
 
-                var suppressDuplicateManualGuide =
+                var hasExistingGateComment =
                     outcome.State == RebuildVerificationState.ManualVerificationRequired &&
-                    context.ExistingLabels.Contains(GitHubLabels.WorkflowBlocked);
+                    context.ExistingLabels.Contains(GitHubLabels.WorkflowBlocked) &&
+                    await HasExistingRebuildGateCommentAsync(context, cancellationToken);
+                if (hasExistingGateComment)
+                {
+                    context.Items[RebuildGateCommentConfirmedOnRemoteItemKey] = true;
+                }
+
+                var suppressDuplicateManualGuide = hasExistingGateComment;
 
                 if (!suppressDuplicateManualGuide &&
                     !string.IsNullOrWhiteSpace(outcome.AdvisoryComment))
@@ -218,6 +235,74 @@ public partial class RebuildImpactModule : IPullRequestModule
             context.LabelsToRemove.Add(GitHubLabels.WorkflowBlocked);
         }
     }
+
+    private async Task<bool> HasExistingRebuildGateCommentAsync(PullRequestContext context, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var comments = await context.IssueComments.Value;
+            if (comments == null || comments.Count == 0)
+            {
+                return false;
+            }
+
+            var ownBotLogins = await BotCommitOwnership.ResolveOwnBotLoginsAsync(
+                _botIdentity,
+                _configuredBotLogin,
+                requireLiveWhenProviderPresent: false,
+                cancellationToken);
+
+            foreach (var comment in comments)
+            {
+                if (comment is null || string.IsNullOrWhiteSpace(comment.Body))
+                {
+                    continue;
+                }
+
+                var body = comment.Body;
+                if (ownBotLogins.Count > 0)
+                {
+                    if (BotCommitOwnership.IsOwnBotLogin(comment.User?.Login, ownBotLogins) &&
+                        (body.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, StringComparison.Ordinal) ||
+                         IsLegacyRebuildGateHeading(body)))
+                    {
+                        return true;
+                    }
+
+                    continue;
+                }
+
+                // Fallback when neither live identity nor configured BotLogin is available: require explicit marker
+                // on a bot-typed account so legacy plain-text headings from unverified bots never suppress gate comments.
+                if (IsBotAccount(comment) &&
+                    body.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger?.LogDebug(ex, "Could not inspect existing rebuild gate comments on PR #{PrNumber}; posting explanatory comment to self-heal.", context.PrNumber);
+            return false;
+        }
+    }
+
+    private static bool IsBotAccount(IssueComment comment)
+    {
+        var author = comment.User;
+        return author?.Type == AccountType.Bot ||
+               (!string.IsNullOrEmpty(author?.Login) &&
+                author.Login.EndsWith("[bot]", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsLegacyRebuildGateHeading(string body) =>
+        body.Contains("Rebuild Impact Gate", StringComparison.Ordinal) ||
+        body.Contains("Rebuild Impact Hold", StringComparison.Ordinal) ||
+        body.Contains("Rebuild 规模准入", StringComparison.Ordinal) ||
+        body.Contains("Rebuild 影响范围暂缓合并", StringComparison.Ordinal);
 
     /// <summary>
     /// Evaluates whether a given label represents a rebuild tier that reaches or exceeds the block threshold.

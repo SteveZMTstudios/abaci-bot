@@ -194,7 +194,7 @@ public class SpdxComplianceModuleTests
 
         Assert.Contains(GitHubLabels.ComplianceLicenseIssue, context.LabelsToAdd);
         Assert.NotEmpty(context.PendingComments);
-        Assert.Contains("SPDX License Compliance Check Failed", context.PendingComments[0]);
+        Assert.Contains("SPDX License Tag Update Suggested", context.PendingComments[0]);
         Assert.Contains("ProprietaryNonStandard", context.PendingComments[0]);
     }
 

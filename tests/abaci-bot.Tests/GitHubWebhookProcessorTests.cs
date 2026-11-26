@@ -1712,7 +1712,9 @@ public class GitHubWebhookProcessorTests
     private static TestGitHubWebhookProcessor CreateAbiProcessor(
         FakeGitHubService github,
         IArtifactService? artifactService = null,
-        IAbiDiffService? abiDiffService = null)
+        IAbiDiffService? abiDiffService = null,
+        IWebhookDispatcher? dispatcher = null,
+        IOpenPullRequestInventoryGateway? prInventoryGateway = null)
     {
         var config = new ConfigurationManager
         {
@@ -1727,7 +1729,16 @@ public class GitHubWebhookProcessorTests
         var pipeline = new abaci_bot.Pipelines.PullRequestPipeline(new abaci_bot.Pipelines.IPullRequestModule[] { abiModule }, mutexEngine, github);
         var lockManager = new abaci_bot.Pipelines.PullRequestLockManager();
 
-        return new TestGitHubWebhookProcessor(github, config, pipeline, lockManager, mutexEngine, artifactService, abiDiffService);
+        return new TestGitHubWebhookProcessor(
+            github,
+            config,
+            pipeline,
+            lockManager,
+            mutexEngine,
+            artifactService,
+            abiDiffService,
+            dispatcher: dispatcher,
+            prInventoryGateway: prInventoryGateway);
     }
 
     #endregion
@@ -1903,8 +1914,10 @@ public class GitHubWebhookProcessorTests
             IArtifactService? artifactService = null,
             IAbiDiffService? abiDiffService = null,
             TimeProvider? timeProvider = null,
-            IBotIdentityProvider? botIdentity = null)
-            : base(github, config, pipeline, lockManager, mutexEngine, artifactService: artifactService, abiDiffService: abiDiffService, timeProvider: timeProvider, botIdentity: botIdentity)
+            IBotIdentityProvider? botIdentity = null,
+            IWebhookDispatcher? dispatcher = null,
+            IOpenPullRequestInventoryGateway? prInventoryGateway = null)
+            : base(github, config, pipeline, lockManager, mutexEngine, artifactService: artifactService, abiDiffService: abiDiffService, timeProvider: timeProvider, botIdentity: botIdentity, dispatcher: dispatcher, prInventoryGateway: prInventoryGateway)
         {
             _testGithub = github;
         }
@@ -1912,6 +1925,11 @@ public class GitHubWebhookProcessorTests
         public ValueTask ProcessWorkflowRunAsync(WorkflowRunEvent payload, WorkflowRunAction action)
         {
             return ProcessWorkflowRunWebhookAsync(null!, payload, action);
+        }
+
+        public ValueTask ProcessWorkflowRunAsync(WebhookHeaders? headers, WorkflowRunEvent payload, WorkflowRunAction action)
+        {
+            return ProcessWorkflowRunWebhookAsync(headers!, payload, action);
         }
 
         public ValueTask ProcessPullRequestAsync(PullRequestEvent payload, PullRequestAction action)
@@ -2746,11 +2764,613 @@ public class GitHubWebhookProcessorTests
 
             // Both comments must be submitted
             Assert.Contains(github.CreatedComments, c => c.Comment.Contains("ABI Breaking Change Detected"));
-            Assert.Contains(github.CreatedComments, c => c.Comment.Contains("ABI Compliance Check Incomplete"));
+            Assert.Contains(github.CreatedComments, c => c.Comment.Contains("ABI Comparison Not Completed"));
         }
         finally
         {
             if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ProcessWorkflowRunAsync_EmptyPullRequestsForForkPr_ResolvesViaHeadShaFallback_AndRunsAbiAnalysis()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"abaci-fork-abi-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var prRpm = Path.Combine(tempDir, "pkg-1.1-1.x86_64.rpm");
+            var baseRpm = Path.Combine(tempDir, "pkg-1.0-1.x86_64.rpm");
+            await File.WriteAllBytesAsync(prRpm, SyntheticRpmBytesWithSharedLib);
+            await File.WriteAllBytesAsync(baseRpm, SyntheticRpmBytesWithSharedLib);
+
+            var github = new FakeGitHubService();
+            var fullPr = CreateOctokitPullRequestWithUser("fork-contributor");
+            typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Number))?.SetValue(fullPr, 77);
+            var head = (Octokit.GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.GitReference));
+            typeof(Octokit.GitReference).GetProperty(nameof(Octokit.GitReference.Sha))?.SetValue(head, "fork-head-sha");
+            typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Head))?.SetValue(fullPr, head);
+            github.PullRequest = fullPr;
+
+            var prInventory = Substitute.For<IOpenPullRequestInventoryGateway>();
+            prInventory.FindOpenPullRequestsByHeadShaAsync("owner", "repo", "external-fork", "fix-abi", "fork-head-sha", Arg.Any<CancellationToken>())
+                .Returns(new[] { fullPr });
+
+            var artifactService = Substitute.For<IArtifactService>();
+            artifactService.DownloadRunRpmArtifactsAsync("owner", "repo", 9001L, Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult<IReadOnlyList<string>>(new[] { prRpm }));
+            artifactService.DownloadBaselineRpmAsync("pkg", Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult<string?>(baseRpm));
+
+            var abiDiffService = Substitute.For<IAbiDiffService>();
+            abiDiffService.CompareRpmsAsync(baseRpm, prRpm, Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult(new AbiDiffResult(Succeeded: true, HasAbiChange: true, IsBreakingChange: true, Details: "Fork PR Breaking Change")));
+
+            var processor = CreateAbiProcessor(github, artifactService, abiDiffService, prInventoryGateway: prInventory);
+
+            var repo = Create<WebhookRepository>(
+                (nameof(WebhookRepository.Name), "repo"),
+                (nameof(WebhookRepository.Owner), User("owner")));
+            var headRepo = Create<Octokit.Webhooks.Models.RepositoryLite>(
+                (nameof(Octokit.Webhooks.Models.RepositoryLite.Name), "repo"),
+                (nameof(Octokit.Webhooks.Models.RepositoryLite.FullName), "external-fork/repo"),
+                (nameof(Octokit.Webhooks.Models.RepositoryLite.Owner), User("external-fork")));
+            var workflowRun = Create<Octokit.Webhooks.Models.WorkflowRun>(
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Id), (object)9001L),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Name), (object?)"build"),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Event), (object)"pull_request"),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Conclusion), (object)new Octokit.Webhooks.Extensions.StringEnum<WorkflowRunConclusion>(WorkflowRunConclusion.Success)),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.HeadBranch), (object?)"fix-abi"),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.HeadSha), (object?)"fork-head-sha"),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.HeadRepository), (object)headRepo),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.PullRequests), (object)Array.Empty<Octokit.Webhooks.Models.WorkflowPullRequest>()));
+            var payload = Create<WorkflowRunCompletedEvent>(
+                (nameof(WorkflowRunCompletedEvent.WorkflowRun), workflowRun),
+                (nameof(WorkflowRunCompletedEvent.Repository), repo),
+                (nameof(WorkflowRunCompletedEvent.Sender), User("github-actions[bot]")));
+
+            await processor.ProcessWorkflowRunAsync(payload, WorkflowRunAction.Completed);
+
+            await prInventory.Received(1).FindOpenPullRequestsByHeadShaAsync(
+                "owner", "repo", "external-fork", "fix-abi", "fork-head-sha", Arg.Any<CancellationToken>());
+            Assert.Contains($"add:{GitHubLabels.ImpactBreakingChange}", github.LabelOperations);
+            Assert.Contains(github.CreatedComments, c => c.IssueNumber == 77 && c.Comment.Contains("ABI Breaking Change Detected"));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ProcessPullRequestAsync_WithDispatcher_EnqueuesAndReleasesDeliveryClaimOnPermanentFailure()
+    {
+        var github = new FakeGitHubService();
+        var config = new ConfigurationManager { ["GitHubApp:TeamName"] = "captains" };
+        var mutexEngine = new abaci_bot.Pipelines.LabelMutexEngine();
+        var lockManager = new abaci_bot.Pipelines.PullRequestLockManager();
+
+        var attempts = 0;
+        var secondAttemptDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var module = Substitute.For<abaci_bot.Pipelines.IPullRequestModule>();
+        module.Priority.Returns(10);
+        module.ShouldProcess(Arg.Any<abaci_bot.Contexts.PullRequestContext>()).Returns(true);
+        module.When(m => m.ProcessAsync(Arg.Any<abaci_bot.Contexts.PullRequestContext>(), Arg.Any<CancellationToken>()))
+            .Do(ci =>
+            {
+                attempts++;
+                if (attempts == 1)
+                {
+                    throw new ArgumentException("Simulated permanent failure");
+                }
+                ci.Arg<abaci_bot.Contexts.PullRequestContext>().LabelsToAdd.Add(GitHubLabels.WorkflowInReview);
+                secondAttemptDone.TrySetResult();
+            });
+
+        var pipeline = new abaci_bot.Pipelines.PullRequestPipeline(new[] { module }, mutexEngine, github);
+        var claimReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        using var realDispatcher = new WebhookDispatcher(maxConcurrency: 1, maxAttempts: 1);
+        await realDispatcher.StartAsync(CancellationToken.None);
+        var wrappedDispatcher = new SpyWebhookDispatcher(realDispatcher, claimReleased);
+
+        var processor = new TestGitHubWebhookProcessor(
+            github, config, pipeline, lockManager, mutexEngine, dispatcher: wrappedDispatcher);
+
+        var headers = new WebhookHeaders { Delivery = "del-async-perm-fail" };
+        var payload = CreatePREvent<PullRequestOpenedEvent>();
+
+        await processor.ProcessPullRequestAsync(headers, payload, PullRequestAction.Opened);
+        await claimReleased.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, attempts);
+
+        // Same delivery ID must succeed when GitHub redelivers because permanent failure released claim
+        await processor.ProcessPullRequestAsync(headers, payload, PullRequestAction.Opened);
+        await secondAttemptDone.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await realDispatcher.StopAsync(CancellationToken.None);
+
+        Assert.Equal(2, attempts);
+        Assert.Contains($"add:{GitHubLabels.WorkflowInReview}", github.LabelOperations);
+    }
+
+    [Fact]
+    public async Task ProcessPullRequestAsync_WhenDispatcherOverloaded_ReleasesDeliveryClaimAndThrowsOverloadedException()
+    {
+        var github = new FakeGitHubService();
+        var config = new ConfigurationManager { ["GitHubApp:TeamName"] = "captains" };
+        var mutexEngine = new abaci_bot.Pipelines.LabelMutexEngine();
+        var lockManager = new abaci_bot.Pipelines.PullRequestLockManager();
+        var pipeline = new abaci_bot.Pipelines.PullRequestPipeline(
+            Array.Empty<abaci_bot.Pipelines.IPullRequestModule>(), mutexEngine, github);
+
+        var dispatcher = Substitute.For<IWebhookDispatcher>();
+        dispatcher.TryEnqueue(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<Func<CancellationToken, ValueTask>>(), Arg.Any<Action?>())
+            .Returns(false, true);
+
+        var processor = new TestGitHubWebhookProcessor(
+            github, config, pipeline, lockManager, mutexEngine, dispatcher: dispatcher);
+
+        var headers = new WebhookHeaders { Delivery = "del-overloaded-503" };
+        var payload = CreatePREvent<PullRequestOpenedEvent>();
+
+        await Assert.ThrowsAsync<WebhookDispatcherOverloadedException>(() =>
+            processor.ProcessPullRequestAsync(headers, payload, PullRequestAction.Opened).AsTask());
+
+        // Redelivering same delivery ID must NOT be skipped as duplicate because 503 released the claim
+        await processor.ProcessPullRequestAsync(headers, payload, PullRequestAction.Opened);
+
+        dispatcher.Received(2).TryEnqueue(
+            "del-overloaded-503",
+            Arg.Any<string>(),
+            Arg.Any<Func<CancellationToken, ValueTask>>(),
+            Arg.Any<Action?>());
+    }
+
+    [Fact]
+    public async Task ProcessPullRequestAsync_WhenPostLockRefreshFailsTransiently_DispatcherRetriesExhaustsAndReleasesClaimForRedelivery()
+    {
+        var githubMock = Substitute.For<IGitHubService>();
+        var pr = new OctokitPullRequest();
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.State))?.SetValue(pr, new Octokit.StringEnum<Octokit.ItemState>(Octokit.ItemState.Open));
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Draft))?.SetValue(pr, true);
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Title))?.SetValue(pr, "Feature: refresh retry");
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Labels))?.SetValue(pr, Array.Empty<Octokit.Label>());
+
+        var refreshAttempts = 0;
+        var failRefresh = true;
+        var labelsAdded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        githubMock.GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                Interlocked.Increment(ref refreshAttempts);
+                if (Volatile.Read(ref failRefresh))
+                {
+                    return Task.FromException<OctokitPullRequest?>(
+                        new HttpRequestException("Upstream 503", null, System.Net.HttpStatusCode.ServiceUnavailable));
+                }
+
+                return Task.FromResult<OctokitPullRequest?>(pr);
+            });
+        githubMock.AddLabelsAsync("owner", "repo", 1, Arg.Any<string[]>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                labelsAdded.TrySetResult();
+                return Task.CompletedTask;
+            });
+
+        var config = new ConfigurationManager { ["GitHubApp:TeamName"] = "captains" };
+        var health = new RuntimeHealthState();
+        var mutexEngine = new abaci_bot.Pipelines.LabelMutexEngine();
+        var lockManager = new abaci_bot.Pipelines.PullRequestLockManager();
+        var pipeline = new abaci_bot.Pipelines.PullRequestPipeline(
+            new abaci_bot.Pipelines.IPullRequestModule[] { new WorkflowStateModule() },
+            mutexEngine,
+            githubMock,
+            runtimeHealth: health);
+
+        var claimReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var realDispatcher = new WebhookDispatcher(
+            runtimeHealth: health,
+            maxConcurrency: 1,
+            maxAttempts: 3,
+            retryDelaySelector: _ => TimeSpan.Zero);
+        await realDispatcher.StartAsync(CancellationToken.None);
+        var wrappedDispatcher = new SpyWebhookDispatcher(realDispatcher, claimReleased);
+
+        try
+        {
+            var processor = new TestGitHubWebhookProcessor(
+                githubMock, config, pipeline, lockManager, mutexEngine, dispatcher: wrappedDispatcher);
+
+            var payload = CreatePREvent<PullRequestOpenedEvent>(draft: true, title: "Feature: refresh retry");
+            var headers = new WebhookHeaders { Delivery = "del-postlock-refresh-transient" };
+
+            // 1. Initial delivery fails post-lock refresh transiently across 3 dispatcher attempts x 2 inline attempts = 6 calls
+            await processor.ProcessPullRequestAsync(headers, payload, PullRequestAction.Opened);
+            await claimReleased.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(6, Volatile.Read(ref refreshAttempts));
+            var (lastError, lastErrorAt) = health.GetLastError();
+            Assert.NotNull(lastError);
+            Assert.NotNull(lastErrorAt);
+            await githubMock.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default!, default);
+
+            // 2. Manual redelivery with identical X-GitHub-Delivery runs and applies label once upstream recovers
+            Volatile.Write(ref failRefresh, false);
+            await processor.ProcessPullRequestAsync(headers, payload, PullRequestAction.Opened);
+            await labelsAdded.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            await githubMock.Received(1).AddLabelsAsync(
+                "owner",
+                "repo",
+                1,
+                Arg.Is<string[]>(labels => labels.Contains(GitHubLabels.WorkflowInDev)),
+                Arg.Any<CancellationToken>());
+        }
+        finally
+        {
+            await realDispatcher.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task ProcessWorkflowRunAsync_WhenPerPrPipelineFailsTransiently_PropagatesToDispatcherForRetry()
+    {
+        var githubMock = Substitute.For<IGitHubService>();
+        var pr41 = new OctokitPullRequest();
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Number))?.SetValue(pr41, 41);
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.State))?.SetValue(pr41, new Octokit.StringEnum<Octokit.ItemState>(Octokit.ItemState.Open));
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Labels))?.SetValue(pr41, Array.Empty<Octokit.Label>());
+
+        var pr42 = new OctokitPullRequest();
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Number))?.SetValue(pr42, 42);
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.State))?.SetValue(pr42, new Octokit.StringEnum<Octokit.ItemState>(Octokit.ItemState.Open));
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Labels))?.SetValue(pr42, Array.Empty<Octokit.Label>());
+
+        githubMock.GetPullRequestAsync("owner", "repo", 41, Arg.Any<CancellationToken>()).Returns(pr41);
+        githubMock.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>()).Returns(pr42);
+
+        var pr42Attempts = 0;
+        var pr42Succeeded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var module = Substitute.For<abaci_bot.Pipelines.IPullRequestModule>();
+        module.Priority.Returns(85);
+        module.ShouldProcess(Arg.Any<abaci_bot.Contexts.PullRequestContext>()).Returns(true);
+        module.When(m => m.ProcessAsync(Arg.Any<abaci_bot.Contexts.PullRequestContext>(), Arg.Any<CancellationToken>()))
+            .Do(ci =>
+            {
+                var ctx = ci.Arg<abaci_bot.Contexts.PullRequestContext>();
+                if (ctx.PrNumber == 41)
+                {
+                    throw new ArgumentException("Non-retriable per-PR defect");
+                }
+
+                pr42Attempts++;
+                if (pr42Attempts == 1)
+                {
+                    throw new HttpRequestException("Transient 503", null, System.Net.HttpStatusCode.ServiceUnavailable);
+                }
+
+                ctx.LabelsToAdd.Add(GitHubLabels.ImpactAbi);
+            });
+
+        githubMock.AddLabelsAsync("owner", "repo", 42, Arg.Any<string[]>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                pr42Succeeded.TrySetResult();
+                return Task.CompletedTask;
+            });
+
+        var config = new ConfigurationManager { ["GitHubApp:TeamName"] = "captains" };
+        var health = new RuntimeHealthState();
+        var mutexEngine = new abaci_bot.Pipelines.LabelMutexEngine();
+        var lockManager = new abaci_bot.Pipelines.PullRequestLockManager();
+        var pipeline = new abaci_bot.Pipelines.PullRequestPipeline(new[] { module }, mutexEngine, githubMock, runtimeHealth: health);
+
+        using var dispatcher = new WebhookDispatcher(
+            runtimeHealth: health,
+            maxConcurrency: 1,
+            maxAttempts: 2,
+            retryDelaySelector: _ => TimeSpan.Zero);
+        await dispatcher.StartAsync(CancellationToken.None);
+
+        try
+        {
+            var artifactService = Substitute.For<IArtifactService>();
+            artifactService.DownloadRunRpmArtifactsAsync("owner", "repo", 777L, Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(Array.Empty<string>());
+
+            var processor = new TestGitHubWebhookProcessor(
+                githubMock, config, pipeline, lockManager, mutexEngine, artifactService: artifactService, dispatcher: dispatcher);
+
+            var repo = Create<WebhookRepository>(
+                (nameof(WebhookRepository.Name), "repo"),
+                (nameof(WebhookRepository.Owner), User("owner")));
+            var wpr41 = Create<Octokit.Webhooks.Models.WorkflowPullRequest>(
+                (nameof(Octokit.Webhooks.Models.WorkflowPullRequest.Number), (object)41L));
+            var wpr42 = Create<Octokit.Webhooks.Models.WorkflowPullRequest>(
+                (nameof(Octokit.Webhooks.Models.WorkflowPullRequest.Number), (object)42L));
+            var workflowRun = Create<Octokit.Webhooks.Models.WorkflowRun>(
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Id), (object)777L),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Name), (object?)"build"),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Conclusion), (object)new Octokit.Webhooks.Extensions.StringEnum<WorkflowRunConclusion>(WorkflowRunConclusion.Success)),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.PullRequests), (object)new[] { wpr41, wpr42 }));
+            var payload = Create<WorkflowRunCompletedEvent>(
+                (nameof(WorkflowRunCompletedEvent.WorkflowRun), workflowRun),
+                (nameof(WorkflowRunCompletedEvent.Repository), repo),
+                (nameof(WorkflowRunCompletedEvent.Sender), User("github-actions[bot]")));
+
+            var headers = new WebhookHeaders { Delivery = "del-workflow-run-transient" };
+            await processor.ProcessWorkflowRunAsync(headers, payload, WorkflowRunAction.Completed);
+            await pr42Succeeded.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(2, pr42Attempts);
+            await githubMock.Received(1).AddLabelsAsync(
+                "owner",
+                "repo",
+                42,
+                Arg.Is<string[]>(labels => labels.Contains(GitHubLabels.ImpactAbi)),
+                Arg.Any<CancellationToken>());
+        }
+        finally
+        {
+            await dispatcher.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task ProcessWorkflowRunAsync_WhenAllPrsFailNonRetriably_DoesNotRetryAndReleasesClaimForRedelivery()
+    {
+        var githubMock = Substitute.For<IGitHubService>();
+        var pr41 = new OctokitPullRequest();
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Number))?.SetValue(pr41, 41);
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.State))?.SetValue(pr41, new Octokit.StringEnum<Octokit.ItemState>(Octokit.ItemState.Open));
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Labels))?.SetValue(pr41, Array.Empty<Octokit.Label>());
+
+        var pr42 = new OctokitPullRequest();
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Number))?.SetValue(pr42, 42);
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.State))?.SetValue(pr42, new Octokit.StringEnum<Octokit.ItemState>(Octokit.ItemState.Open));
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Labels))?.SetValue(pr42, Array.Empty<Octokit.Label>());
+
+        var forbiddenResponse = Substitute.For<Octokit.IResponse>();
+        forbiddenResponse.StatusCode.Returns(System.Net.HttpStatusCode.Forbidden);
+        forbiddenResponse.Headers.Returns(new Dictionary<string, string>());
+        var forbiddenEx = new Octokit.ForbiddenException(forbiddenResponse);
+
+        var pr41Calls = 0;
+        var pr42Calls = 0;
+        var failRefresh = true;
+        githubMock.GetPullRequestAsync("owner", "repo", 41, Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                var call = Interlocked.Increment(ref pr41Calls);
+                // Calls 1 (pre-filter) & 2 (under-lock re-fetch) succeed; Call 3 (Pipeline.RefreshAsync) hits 403 while blocked.
+                if (Volatile.Read(ref failRefresh) && call == 3)
+                {
+                    return Task.FromException<OctokitPullRequest?>(forbiddenEx);
+                }
+
+                return Task.FromResult<OctokitPullRequest?>(pr41);
+            });
+        githubMock.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                var call = Interlocked.Increment(ref pr42Calls);
+                if (Volatile.Read(ref failRefresh) && call == 3)
+                {
+                    return Task.FromException<OctokitPullRequest?>(forbiddenEx);
+                }
+
+                return Task.FromResult<OctokitPullRequest?>(pr42);
+            });
+
+        var module = Substitute.For<abaci_bot.Pipelines.IPullRequestModule>();
+        module.Priority.Returns(85);
+        module.ShouldProcess(Arg.Any<abaci_bot.Contexts.PullRequestContext>()).Returns(true);
+        module.When(m => m.ProcessAsync(Arg.Any<abaci_bot.Contexts.PullRequestContext>(), Arg.Any<CancellationToken>()))
+            .Do(ci => ci.Arg<abaci_bot.Contexts.PullRequestContext>().LabelsToAdd.Add(GitHubLabels.ImpactAbi));
+
+        using var recoveredBoth = new CountdownEvent(2);
+        githubMock.AddLabelsAsync("owner", "repo", Arg.Any<int>(), Arg.Any<string[]>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                recoveredBoth.Signal();
+                return Task.CompletedTask;
+            });
+
+        var config = new ConfigurationManager { ["GitHubApp:TeamName"] = "captains" };
+        var health = new RuntimeHealthState();
+        var mutexEngine = new abaci_bot.Pipelines.LabelMutexEngine();
+        var lockManager = new abaci_bot.Pipelines.PullRequestLockManager();
+        var pipeline = new abaci_bot.Pipelines.PullRequestPipeline(new[] { module }, mutexEngine, githubMock, runtimeHealth: health);
+
+        var claimReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var realDispatcher = new WebhookDispatcher(
+            runtimeHealth: health,
+            maxConcurrency: 1,
+            maxAttempts: 3,
+            retryDelaySelector: _ => TimeSpan.Zero);
+        await realDispatcher.StartAsync(CancellationToken.None);
+        var wrappedDispatcher = new SpyWebhookDispatcher(realDispatcher, claimReleased);
+
+        try
+        {
+            var artifactService = Substitute.For<IArtifactService>();
+            artifactService.DownloadRunRpmArtifactsAsync("owner", "repo", 778L, Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(Array.Empty<string>());
+
+            var processor = new TestGitHubWebhookProcessor(
+                githubMock, config, pipeline, lockManager, mutexEngine, artifactService: artifactService, dispatcher: wrappedDispatcher);
+
+            var repo = Create<WebhookRepository>(
+                (nameof(WebhookRepository.Name), "repo"),
+                (nameof(WebhookRepository.Owner), User("owner")));
+            var wpr41 = Create<Octokit.Webhooks.Models.WorkflowPullRequest>(
+                (nameof(Octokit.Webhooks.Models.WorkflowPullRequest.Number), (object)41L));
+            var wpr42 = Create<Octokit.Webhooks.Models.WorkflowPullRequest>(
+                (nameof(Octokit.Webhooks.Models.WorkflowPullRequest.Number), (object)42L));
+            var workflowRun = Create<Octokit.Webhooks.Models.WorkflowRun>(
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Id), (object)778L),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Name), (object?)"build"),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Conclusion), (object)new Octokit.Webhooks.Extensions.StringEnum<WorkflowRunConclusion>(WorkflowRunConclusion.Success)),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.PullRequests), (object)new[] { wpr41, wpr42 }));
+            var payload = Create<WorkflowRunCompletedEvent>(
+                (nameof(WorkflowRunCompletedEvent.WorkflowRun), workflowRun),
+                (nameof(WorkflowRunCompletedEvent.Repository), repo),
+                (nameof(WorkflowRunCompletedEvent.Sender), User("github-actions[bot]")));
+
+            var headers = new WebhookHeaders { Delivery = "del-workflow-run-nonretriable-all" };
+            await processor.ProcessWorkflowRunAsync(headers, payload, WorkflowRunAction.Completed);
+            await claimReleased.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            // Zero dispatcher retries: each PR attempted once (3 GetPullRequestAsync calls per PR: pre-check, lock fetch, RefreshAsync).
+            Assert.Equal(3, Volatile.Read(ref pr41Calls));
+            Assert.Equal(3, Volatile.Read(ref pr42Calls));
+            await githubMock.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default!, default);
+
+            // Once operator resolves permissions, manual redelivery with identical X-GitHub-Delivery runs cleanly.
+            Volatile.Write(ref failRefresh, false);
+            await processor.ProcessWorkflowRunAsync(headers, payload, WorkflowRunAction.Completed);
+            Assert.True(recoveredBoth.Wait(TimeSpan.FromSeconds(5)));
+
+            await githubMock.Received(1).AddLabelsAsync(
+                "owner", "repo", 41, Arg.Is<string[]>(labels => labels.Contains(GitHubLabels.ImpactAbi)), Arg.Any<CancellationToken>());
+            await githubMock.Received(1).AddLabelsAsync(
+                "owner", "repo", 42, Arg.Is<string[]>(labels => labels.Contains(GitHubLabels.ImpactAbi)), Arg.Any<CancellationToken>());
+        }
+        finally
+        {
+            await realDispatcher.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task ProcessWorkflowRunAsync_WhenOnePrFailsNonRetriablyAndAnotherSucceeds_ProcessesHealthyPrAndReleasesClaimWithoutRetrying()
+    {
+        var githubMock = Substitute.For<IGitHubService>();
+        var pr41 = new OctokitPullRequest();
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Number))?.SetValue(pr41, 41);
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.State))?.SetValue(pr41, new Octokit.StringEnum<Octokit.ItemState>(Octokit.ItemState.Open));
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Labels))?.SetValue(pr41, Array.Empty<Octokit.Label>());
+
+        var pr42 = new OctokitPullRequest();
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Number))?.SetValue(pr42, 42);
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.State))?.SetValue(pr42, new Octokit.StringEnum<Octokit.ItemState>(Octokit.ItemState.Open));
+        typeof(OctokitPullRequest).GetProperty(nameof(OctokitPullRequest.Labels))?.SetValue(pr42, Array.Empty<Octokit.Label>());
+
+        var forbiddenResponse = Substitute.For<Octokit.IResponse>();
+        forbiddenResponse.StatusCode.Returns(System.Net.HttpStatusCode.Forbidden);
+        forbiddenResponse.Headers.Returns(new Dictionary<string, string>());
+        var forbiddenEx = new Octokit.ForbiddenException(forbiddenResponse);
+
+        var pr41Calls = 0;
+        var pr42Calls = 0;
+        githubMock.GetPullRequestAsync("owner", "repo", 41, Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                if (Interlocked.Increment(ref pr41Calls) == 3)
+                {
+                    return Task.FromException<OctokitPullRequest?>(forbiddenEx);
+                }
+
+                return Task.FromResult<OctokitPullRequest?>(pr41);
+            });
+        githubMock.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                Interlocked.Increment(ref pr42Calls);
+                return Task.FromResult<OctokitPullRequest?>(pr42);
+            });
+
+        var module = Substitute.For<abaci_bot.Pipelines.IPullRequestModule>();
+        module.Priority.Returns(85);
+        module.ShouldProcess(Arg.Any<abaci_bot.Contexts.PullRequestContext>()).Returns(true);
+        module.When(m => m.ProcessAsync(Arg.Any<abaci_bot.Contexts.PullRequestContext>(), Arg.Any<CancellationToken>()))
+            .Do(ci => ci.Arg<abaci_bot.Contexts.PullRequestContext>().LabelsToAdd.Add(GitHubLabels.ImpactAbi));
+
+        var config = new ConfigurationManager { ["GitHubApp:TeamName"] = "captains" };
+        var health = new RuntimeHealthState();
+        var mutexEngine = new abaci_bot.Pipelines.LabelMutexEngine();
+        var lockManager = new abaci_bot.Pipelines.PullRequestLockManager();
+        var pipeline = new abaci_bot.Pipelines.PullRequestPipeline(new[] { module }, mutexEngine, githubMock, runtimeHealth: health);
+
+        var claimReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var realDispatcher = new WebhookDispatcher(
+            runtimeHealth: health,
+            maxConcurrency: 1,
+            maxAttempts: 3,
+            retryDelaySelector: _ => TimeSpan.Zero);
+        await realDispatcher.StartAsync(CancellationToken.None);
+        var wrappedDispatcher = new SpyWebhookDispatcher(realDispatcher, claimReleased);
+
+        try
+        {
+            var artifactService = Substitute.For<IArtifactService>();
+            artifactService.DownloadRunRpmArtifactsAsync("owner", "repo", 779L, Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(Array.Empty<string>());
+
+            var processor = new TestGitHubWebhookProcessor(
+                githubMock, config, pipeline, lockManager, mutexEngine, artifactService: artifactService, dispatcher: wrappedDispatcher);
+
+            var repo = Create<WebhookRepository>(
+                (nameof(WebhookRepository.Name), "repo"),
+                (nameof(WebhookRepository.Owner), User("owner")));
+            var wpr41 = Create<Octokit.Webhooks.Models.WorkflowPullRequest>(
+                (nameof(Octokit.Webhooks.Models.WorkflowPullRequest.Number), (object)41L));
+            var wpr42 = Create<Octokit.Webhooks.Models.WorkflowPullRequest>(
+                (nameof(Octokit.Webhooks.Models.WorkflowPullRequest.Number), (object)42L));
+            var workflowRun = Create<Octokit.Webhooks.Models.WorkflowRun>(
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Id), (object)779L),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Name), (object?)"build"),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.Conclusion), (object)new Octokit.Webhooks.Extensions.StringEnum<WorkflowRunConclusion>(WorkflowRunConclusion.Success)),
+                (nameof(Octokit.Webhooks.Models.WorkflowRun.PullRequests), (object)new[] { wpr41, wpr42 }));
+            var payload = Create<WorkflowRunCompletedEvent>(
+                (nameof(WorkflowRunCompletedEvent.WorkflowRun), workflowRun),
+                (nameof(WorkflowRunCompletedEvent.Repository), repo),
+                (nameof(WorkflowRunCompletedEvent.Sender), User("github-actions[bot]")));
+
+            var headers = new WebhookHeaders { Delivery = "del-workflow-run-mixed-nonretriable" };
+            await processor.ProcessWorkflowRunAsync(headers, payload, WorkflowRunAction.Completed);
+            await claimReleased.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(3, Volatile.Read(ref pr41Calls));
+            Assert.Equal(3, Volatile.Read(ref pr42Calls));
+            await githubMock.DidNotReceive().AddLabelsAsync("owner", "repo", 41, Arg.Any<string[]>(), Arg.Any<CancellationToken>());
+            await githubMock.Received(1).AddLabelsAsync(
+                "owner", "repo", 42, Arg.Is<string[]>(labels => labels.Contains(GitHubLabels.ImpactAbi)), Arg.Any<CancellationToken>());
+        }
+        finally
+        {
+            await realDispatcher.StopAsync(CancellationToken.None);
+        }
+    }
+
+    private sealed class SpyWebhookDispatcher : IWebhookDispatcher
+    {
+        private readonly IWebhookDispatcher _inner;
+        private readonly TaskCompletionSource _onClaimReleased;
+
+        public SpyWebhookDispatcher(IWebhookDispatcher inner, TaskCompletionSource onClaimReleased)
+        {
+            _inner = inner;
+            _onClaimReleased = onClaimReleased;
+        }
+
+        public bool TryEnqueue(
+            string deliveryId,
+            string eventSummary,
+            Func<CancellationToken, ValueTask> work,
+            Action? onPermanentFailure = null)
+        {
+            return _inner.TryEnqueue(
+                deliveryId,
+                eventSummary,
+                work,
+                () =>
+                {
+                    onPermanentFailure?.Invoke();
+                    _onClaimReleased.TrySetResult();
+                });
         }
     }
 

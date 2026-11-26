@@ -1,3 +1,4 @@
+using System.Net;
 using abaci_bot.Options;
 using abaci_bot.Pipelines;
 using abaci_bot.Services;
@@ -1322,6 +1323,149 @@ public class StaleLifecycleServiceTests
 
         await _gitHub.Received(1).AddLabelsAsync("openRuyi-Project", "openRuyi", 302, Arg.Is<string[]>(a => a.SequenceEqual(new[] { GitHubLabels.StatusStale })), Arg.Any<CancellationToken>());
         await _gitHub.DidNotReceive().RemoveLabelAsync("openRuyi-Project", "openRuyi", 302, Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task RunLifecycleSweepAsync_WhenMarkingStale_RemovesConflictingStatusNewBeforeAddingStatusStale()
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
+        {
+            MonitoredRepositories = new List<string> { "openRuyi-Project/openRuyi" },
+            MinRateLimitRemaining = 100,
+            RequestThrottleMilliseconds = 0,
+            StaleDays = 30,
+            CloseDays = 7,
+            DryRun = false
+        });
+
+        var prWithNew = CreateMockPullRequestFromIssuesApi(310, "Old Untriaged PR", DateTimeOffset.UtcNow.AddDays(-35), GitHubLabels.StatusNew);
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: true, Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue> { prWithNew });
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Is<string?>(s => s != null && s.StartsWith("label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+
+        var callOrder = new List<string>();
+        _gitHub.When(g => g.RemoveLabelAsync("openRuyi-Project", "openRuyi", 310, Arg.Any<string>(), Arg.Any<CancellationToken>()))
+            .Do(ci => callOrder.Add($"remove:{ci.ArgAt<string>(3)}"));
+        _gitHub.When(g => g.AddLabelsAsync("openRuyi-Project", "openRuyi", 310, Arg.Any<string[]>(), Arg.Any<CancellationToken>()))
+            .Do(ci => callOrder.Add($"add:{string.Join(",", ci.ArgAt<string[]>(3))}"));
+
+        var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
+        await service.RunLifecycleSweepAsync();
+
+        Assert.Equal(new[] { $"remove:{GitHubLabels.StatusNew}", $"add:{GitHubLabels.StatusStale}" }, callOrder);
+    }
+
+    [Fact]
+    public async Task RunLifecycleSweepAsync_WhenAutoClosingStaleWithStatusNew_RemovesConflictingStatusNewAndPreservesStatusStale()
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
+        {
+            MonitoredRepositories = new List<string> { "openRuyi-Project/openRuyi" },
+            MinRateLimitRemaining = 100,
+            RequestThrottleMilliseconds = 0,
+            StaleDays = 30,
+            CloseDays = 7,
+            DryRun = false
+        });
+
+        var conflictedStaleIssue = CreateMockIssue(
+            311,
+            "Conflicted Stale Issue",
+            DateTimeOffset.UtcNow.AddDays(-10),
+            GitHubLabels.StatusStale,
+            GitHubLabels.StatusNew);
+
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Is<string?>(s => s != null && s.StartsWith("label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue> { conflictedStaleIssue });
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: true, Arg.Is<string?>(s => s != null && s.StartsWith("label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+
+        var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
+        await service.RunLifecycleSweepAsync();
+
+        await _gitHub.Received(1).CloseIssueAsync("openRuyi-Project", "openRuyi", 311, Arg.Any<CancellationToken>());
+        await _gitHub.Received(1).RemoveLabelAsync("openRuyi-Project", "openRuyi", 311, GitHubLabels.StatusNew, Arg.Any<CancellationToken>());
+        await _gitHub.DidNotReceive().RemoveLabelAsync("openRuyi-Project", "openRuyi", 311, GitHubLabels.StatusStale, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task RunLifecycleSweepAsync_WhenAutoCloseConflictRemovalFails_DefersClosingIssue()
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
+        {
+            MonitoredRepositories = new List<string> { "openRuyi-Project/openRuyi" },
+            MinRateLimitRemaining = 100,
+            RequestThrottleMilliseconds = 0,
+            StaleDays = 30,
+            CloseDays = 7,
+            DryRun = false
+        });
+
+        var conflictedStaleIssue = CreateMockIssue(
+            312,
+            "Conflicted Stale Issue 500",
+            DateTimeOffset.UtcNow.AddDays(-10),
+            GitHubLabels.StatusStale,
+            GitHubLabels.StatusNew);
+
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Is<string?>(s => s != null && s.StartsWith("label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue> { conflictedStaleIssue });
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: true, Arg.Is<string?>(s => s != null && s.StartsWith("label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+
+        _gitHub.RemoveLabelAsync("openRuyi-Project", "openRuyi", 312, GitHubLabels.StatusNew, Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new HttpRequestException("transient 500", null, HttpStatusCode.InternalServerError));
+
+        var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
+        await service.RunLifecycleSweepAsync();
+
+        await _gitHub.DidNotReceive().CloseIssueAsync("openRuyi-Project", "openRuyi", 312, Arg.Any<CancellationToken>());
+        await _gitHub.DidNotReceive().CreateCommentAsync("openRuyi-Project", "openRuyi", 312, Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task RunLifecycleSweepAsync_WhenAutoCloseConflictRemovalReturns404_StillClosesIssue()
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(new StaleLifecycleOptions
+        {
+            MonitoredRepositories = new List<string> { "openRuyi-Project/openRuyi" },
+            MinRateLimitRemaining = 100,
+            RequestThrottleMilliseconds = 0,
+            StaleDays = 30,
+            CloseDays = 7,
+            DryRun = false
+        });
+
+        var conflictedStaleIssue = CreateMockIssue(
+            313,
+            "Conflicted Stale Issue 404",
+            DateTimeOffset.UtcNow.AddDays(-10),
+            GitHubLabels.StatusStale,
+            GitHubLabels.StatusNew);
+
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Is<string?>(s => s != null && s.Contains("-label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: false, Arg.Is<string?>(s => s != null && s.StartsWith("label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue> { conflictedStaleIssue });
+        _gitHub.SearchStaleCandidatesAsync("openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), isPr: true, Arg.Is<string?>(s => s != null && s.StartsWith("label:")), Arg.Any<CancellationToken>())
+            .Returns(new List<Issue>());
+
+        var notFoundResp = Substitute.For<IResponse>();
+        notFoundResp.StatusCode.Returns(HttpStatusCode.NotFound);
+        _gitHub.RemoveLabelAsync("openRuyi-Project", "openRuyi", 313, GitHubLabels.StatusNew, Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new NotFoundException(notFoundResp));
+
+        var service = new StaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance);
+        await service.RunLifecycleSweepAsync();
+
+        await _gitHub.Received(1).CloseIssueAsync("openRuyi-Project", "openRuyi", 313, Arg.Any<CancellationToken>());
     }
 
     private class TestableStaleLifecycleService : StaleLifecycleService

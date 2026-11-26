@@ -5,10 +5,11 @@ namespace abaci_bot.Options;
 /// </summary>
 public class FileCacheOptions
 {
-    /// <summary>
-    /// Maximum total bytes allowed in the in-memory file content cache before LRU eviction.
-    /// Defaults to 50 MB (52,428,800 bytes).
-    /// </summary>
+    [ConfigField(
+        Description = "Maximum total bytes retained in the in-memory Git blob/file content cache before LRU eviction (50 MiB).",
+        Unit = "bytes",
+        Range = ">= 0",
+        EmptyBehavior = "0 evicts every entry immediately, effectively disabling the cache.")]
     public long MaxSizeBytes { get; set; } = 50 * 1024 * 1024;
 }
 

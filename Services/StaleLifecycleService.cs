@@ -247,20 +247,7 @@ public class StaleLifecycleService : BackgroundService
                     await _gitHub.CreateCommentAsync(owner, repo, item.Number, staleComment, cancellationToken);
 
                     var existingLabels = latest.Labels?.Select(l => l.Name) ?? Array.Empty<string>();
-                    var labelDiff = _mutexEngine.ComputeDiff(
-                        existingLabels,
-                        new[] { GitHubLabels.StatusStale },
-                        Array.Empty<string>());
-
-                    if (labelDiff.LabelsToAdd.Count > 0)
-                    {
-                        await _gitHub.AddLabelsAsync(owner, repo, item.Number, labelDiff.LabelsToAdd.ToArray(), cancellationToken);
-                    }
-
-                    foreach (var labelToRemove in labelDiff.LabelsToRemove)
-                    {
-                        await _gitHub.RemoveLabelAsync(owner, repo, item.Number, labelToRemove, cancellationToken);
-                    }
+                    await ApplyStaleLabelMutexSafeAsync(owner, repo, item.Number, existingLabels, cancellationToken);
                 }
             }
             catch (Exception ex) when (IsRateLimitOrAbuse(ex, out var retryAfter, out var rateLimitType))
@@ -327,6 +314,37 @@ public class StaleLifecycleService : BackgroundService
 
                     _logger.LogInformation("Auto-closing expired stale object {Owner}/{Repo}#{Number}", owner, repo, item.Number);
 
+                    // Reconcile any pre-existing Group 7 mutex conflicts (e.g. Status: New + Status: Stale) before closing
+                    var closeLabelDiff = _mutexEngine.ComputeDiff(
+                        latest.Labels?.Select(l => l.Name) ?? Array.Empty<string>(),
+                        new[] { GitHubLabels.StatusStale },
+                        Array.Empty<string>());
+                    var conflictRemovalFailed = false;
+                    foreach (var conflictingLabel in closeLabelDiff.LabelsToRemove)
+                    {
+                        try
+                        {
+                            await _gitHub.RemoveLabelAsync(owner, repo, item.Number, conflictingLabel, cancellationToken);
+                        }
+                        catch (Octokit.NotFoundException)
+                        {
+                            // Conflict label already absent; treat as idempotent success.
+                        }
+                        catch (Exception ex) when (ex is not OperationCanceledException && !IsRateLimitOrAbuse(ex, out _, out _))
+                        {
+                            _logger.LogWarning(ex,
+                                "Failed to remove conflicting label '{Label}' while closing stale object {Owner}/{Repo}#{Number}; deferring auto-close.",
+                                conflictingLabel, owner, repo, item.Number);
+                            conflictRemovalFailed = true;
+                            break;
+                        }
+                    }
+
+                    if (conflictRemovalFailed)
+                    {
+                        continue;
+                    }
+
                     // Auto-close object first: prevents infinite comment-posting loops if close succeeds and comment fails
                     await _gitHub.CloseIssueAsync(owner, repo, item.Number, cancellationToken);
 
@@ -390,6 +408,63 @@ public class StaleLifecycleService : BackgroundService
         return latest;
     }
 
+    private async Task ApplyStaleLabelMutexSafeAsync(
+        string owner,
+        string repo,
+        int number,
+        IEnumerable<string> initialExistingLabels,
+        CancellationToken cancellationToken)
+    {
+        var labelDiff = _mutexEngine.ComputeDiff(
+            initialExistingLabels,
+            new[] { GitHubLabels.StatusStale },
+            Array.Empty<string>());
+
+        var wroteAny = false;
+        try
+        {
+            // Remove conflicting Group 7 labels (e.g. Status: New) BEFORE adding Status: Stale so partial errors never leave mutex conflicts.
+            foreach (var labelToRemove in labelDiff.LabelsToRemove)
+            {
+                await _gitHub.RemoveLabelAsync(owner, repo, number, labelToRemove, cancellationToken);
+                wroteAny = true;
+            }
+
+            if (labelDiff.LabelsToAdd.Count > 0)
+            {
+                await _gitHub.AddLabelsAsync(owner, repo, number, labelDiff.LabelsToAdd.ToArray(), cancellationToken);
+                wroteAny = true;
+            }
+        }
+        catch (Exception ex) when (wroteAny && ex is not OperationCanceledException && !IsRateLimitOrAbuse(ex, out _, out _))
+        {
+            _logger.LogWarning(ex,
+                "Partial failure updating stale labels on {Owner}/{Repo}#{Number}; attempting one mutex recovery pass.",
+                owner, repo, number);
+
+            var freshIssue = await _gitHub.GetIssueAsync(owner, repo, number, cancellationToken);
+            if (freshIssue == null)
+            {
+                throw;
+            }
+
+            var recoveryDiff = _mutexEngine.ComputeDiff(
+                freshIssue.Labels?.Select(l => l.Name) ?? Array.Empty<string>(),
+                new[] { GitHubLabels.StatusStale },
+                Array.Empty<string>());
+
+            foreach (var labelToRemove in recoveryDiff.LabelsToRemove)
+            {
+                await _gitHub.RemoveLabelAsync(owner, repo, number, labelToRemove, cancellationToken);
+            }
+
+            if (recoveryDiff.LabelsToAdd.Count > 0)
+            {
+                await _gitHub.AddLabelsAsync(owner, repo, number, recoveryDiff.LabelsToAdd.ToArray(), cancellationToken);
+            }
+        }
+    }
+
     internal static DateTimeOffset? SelectBackoffTarget(bool isCoreHealthy, bool isSearchHealthy, GitHubRateLimitSnapshot snapshot)
     {
         if (isCoreHealthy && isSearchHealthy)
@@ -406,46 +481,8 @@ public class StaleLifecycleService : BackgroundService
         return !isCoreHealthy ? snapshot.CoreReset : snapshot.SearchReset;
     }
 
-    internal static bool IsRateLimitOrAbuse(Exception ex, out TimeSpan? retryAfter, out string rateLimitType)
-    {
-        if (ex is RateLimitExceededException rle)
-        {
-            rateLimitType = "Core";
-            DateTimeOffset? reset = null;
-            try { reset = rle.Reset; } catch (NullReferenceException) { }
-            retryAfter = reset.HasValue ? reset.Value - DateTimeOffset.UtcNow : null;
-            return true;
-        }
-
-        if (ex is AbuseException abuse)
-        {
-            rateLimitType = "Abuse";
-            int? seconds = null;
-            try { seconds = abuse.RetryAfterSeconds; } catch (NullReferenceException) { }
-            retryAfter = seconds.HasValue
-                ? TimeSpan.FromSeconds(Math.Max(60, seconds.Value))
-                : TimeSpan.FromSeconds(60);
-            return true;
-        }
-
-        if (ex is SecondaryRateLimitExceededException)
-        {
-            rateLimitType = "Secondary";
-            retryAfter = TimeSpan.FromSeconds(60);
-            return true;
-        }
-
-        if (ex is ApiException apiEx && apiEx.StatusCode == HttpStatusCode.TooManyRequests)
-        {
-            rateLimitType = "HTTP 429";
-            retryAfter = TimeSpan.FromSeconds(60);
-            return true;
-        }
-
-        rateLimitType = string.Empty;
-        retryAfter = null;
-        return false;
-    }
+    internal static bool IsRateLimitOrAbuse(Exception ex, out TimeSpan? retryAfter, out string rateLimitType) =>
+        TransientErrorPolicy.TryGetRateLimitInfo(ex, out retryAfter, out rateLimitType);
 
     private static bool IsExempt(Octokit.Issue item, StaleLifecycleOptions options)
     {

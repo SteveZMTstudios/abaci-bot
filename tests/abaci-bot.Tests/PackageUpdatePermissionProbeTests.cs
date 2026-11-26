@@ -338,4 +338,34 @@ public class PackageUpdatePermissionProbeTests
         Assert.Equal("verified", healthA.GetCapabilityStatus("packageUpdatePermission"));
         Assert.Equal("disabled", healthB.GetCapabilityStatus("packageUpdatePermission"));
     }
+
+    [Fact]
+    public async Task StartAsync_WhenFineGrainedPatReturnsPartial_SetsPartialStatusAndPublishesHealth()
+    {
+        _gateway.ClearReceivedCalls();
+        _gateway.VerifyPackageUpdateWritePermissionAsync("openRuyi-Project", "openRuyi", Arg.Any<CancellationToken>())
+            .Returns("partial");
+        _gateway.VerifyBotPatTeamReadPermissionAsync("openRuyi-Project", "openRuyi", "captains", Arg.Any<CancellationToken>())
+            .Returns(Task.CompletedTask);
+
+        var health = new RuntimeHealthState();
+        var probe = new PackageUpdatePermissionProbe(
+            Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+            {
+                Enabled = true,
+                DryRun = false,
+                BotPat = "github_pat_finegrained",
+                TargetRepository = "openRuyi-Project/openRuyi"
+            }),
+            Microsoft.Extensions.Options.Options.Create(new ConversationGuardOptions { Enabled = false }),
+            BuildConfig("captains"),
+            _gateway,
+            NullLogger<PackageUpdatePermissionProbe>.Instance,
+            health);
+
+        await probe.StartAsync(CancellationToken.None);
+
+        Assert.Equal("partial", probe.Status);
+        Assert.Equal("partial", health.GetCapabilityStatus("packageUpdatePermission"));
+    }
 }

@@ -106,7 +106,7 @@ public class AbiComplianceModuleTests
         Assert.DoesNotContain(GitHubLabels.ImpactAbi, context.LabelsToAdd);
         Assert.DoesNotContain(GitHubLabels.ImpactBreakingChange, context.LabelsToAdd);
         Assert.NotEmpty(context.PendingComments);
-        Assert.Contains("ABI Compliance Check Incomplete", context.PendingComments[0]);
+        Assert.Contains("ABI Comparison Not Completed", context.PendingComments[0]);
         Assert.Contains("abidiff binary not available", context.PendingComments[0]);
     }
 
@@ -133,7 +133,7 @@ public class AbiComplianceModuleTests
         Assert.DoesNotContain(GitHubLabels.ImpactAbi, context.LabelsToAdd);
 
         Assert.Equal(2, context.PendingComments.Count);
-        Assert.Contains(context.PendingComments, c => c.Contains("ABI Compliance Check Incomplete") && c.Contains("Baseline package missing"));
+        Assert.Contains(context.PendingComments, c => c.Contains("ABI Comparison Not Completed") && c.Contains("Baseline package missing"));
         Assert.Contains(context.PendingComments, c => c.Contains("ABI Breaking Change Detected") && c.Contains("SONAME changed"));
     }
 

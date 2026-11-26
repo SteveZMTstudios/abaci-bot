@@ -5,59 +5,52 @@ namespace abaci_bot.Options;
 /// </summary>
 public class ConversationGuardOptions
 {
-    /// <summary>
-    /// Whether conversation guard mention command moderation (<c>@&lt;bot&gt; lock</c>, <c>unlock</c>, <c>hide</c>, <c>archive</c>) is enabled.
-    /// Default: false.
-    /// </summary>
+    [ConfigField(
+        Description = "Enables or disables conversation guard mention commands and closed PR locking.",
+        TrueBehavior = "mention commands are processed and closed PRs exceeding InactiveCloseDays are locked.",
+        FalseBehavior = "conversation guard module and background lock sweep are disabled.")]
     public bool Enabled { get; set; }
 
-    /// <summary>
-    /// When true, moderation actions are logged without applying lock, minimize, or archive on GitHub.
-    /// Default: true.
-    /// </summary>
+    [ConfigField(
+        Description = "Safety dry-run switch for conversation moderation actions.",
+        TrueBehavior = "moderation actions are logged without applying locks, minimization, or archiving on GitHub.",
+        FalseBehavior = "moderation actions are executed live on the remote repository.")]
     public bool DryRun { get; set; } = true;
 
-    /// <summary>
-    /// Repository whitelist for conversation guard moderation formatted as 'owner/repo'.
-    /// If empty, conversation moderation is disabled globally.
-    /// Default: empty list.
-    /// </summary>
+    [ConfigField(
+        Description = "Repository whitelist eligible for conversation guard moderation and inactive lock sweeps.",
+        Format = "array of \"owner/repo\" strings",
+        EmptyBehavior = "conversation moderation is disabled globally across all repositories.",
+        Example = "[\"openRuyi-Project/openRuyi\"]")]
     public List<string> RepositoryAllowList { get; set; } = new();
 
-    /// <summary>
-    /// Independent safety switch for pull request level archiving (<c>@&lt;bot&gt; archive</c>).
-    /// GitHub's <c>archivePullRequest</c> GraphQL mutation requires a <c>triage</c>+ user PAT (<c>PackageUpdate:BotPat</c>) and
-    /// always returns FORBIDDEN for GitHub App installation tokens, so enabling this in App-only mode fails fast on startup.
-    /// Archived pull requests are strictly read-only and reject all new comments; unarchiving must be performed out-of-band via the GitHub Web UI or <c>gh api graphql</c>.
-    /// Default: false.
-    /// </summary>
+    [ConfigField(
+        Description = "Independent safety switch enabling pull request archiving via GraphQL (@<bot> archive; strictly read-only until unarchived out-of-band).",
+        TrueBehavior = "pull request archiving via GraphQL is enabled (requires PackageUpdate:BotPat with triage+ user PAT; App-only mode fails fast on startup).",
+        FalseBehavior = "archive commands are rejected (recommended for GitHub App-only deployments).")]
     public bool ArchiveEnabled { get; set; }
 
-    /// <summary>
-    /// Inactivity threshold in days based on closed_at after which closed PRs are automatically locked to prevent post-closure harassment.
-    /// Bound to 7..365.
-    /// Default: 60.
-    /// </summary>
+    [ConfigField(
+        Description = "Threshold based on closed_at after which inactive closed PRs are automatically locked.",
+        Unit = "days",
+        Range = "7..365")]
     public int InactiveCloseDays { get; set; } = 60;
 
-    /// <summary>
-    /// Execution interval in hours for the background closed PR lock sweep service.
-    /// Bound to 1..72.
-    /// Default: 12.
-    /// </summary>
+    [ConfigField(
+        Description = "Execution interval for the background closed PR lock sweep service.",
+        Unit = "hours",
+        Range = "1..72")]
     public int SweepIntervalHours { get; set; } = 12;
 
-    /// <summary>
-    /// Time window in minutes for the PR author to reply with <c>@&lt;bot&gt; lock confirm</c> (or <c>@&lt;bot&gt; archive confirm</c>) before the confirmation request expires.
-    /// Bound to 1..60.
-    /// Default: 15.
-    /// </summary>
+    [ConfigField(
+        Description = "Time window for the PR author to reply with @<bot> lock confirm (or archive confirm) before expiry.",
+        Unit = "minutes",
+        Range = "1..60")]
     public int AuthorLockConfirmTimeoutMinutes { get; set; } = 15;
 
-    /// <summary>
-    /// Maximum number of inactive closed pull requests locked per repository in a single sweep cycle.
-    /// Remaining eligible pull requests are deferred to subsequent sweeps.
-    /// Bound to 1..500. Default: 50.
-    /// </summary>
+    [ConfigField(
+        Description = "Maximum inactive closed PRs locked per repository per sweep (500 is the search transport cap; remaining PRs defer to the next sweep).",
+        Unit = "pull requests per repository per sweep",
+        Range = "1..500")]
     public int MaxLocksPerSweep { get; set; } = 50;
 }

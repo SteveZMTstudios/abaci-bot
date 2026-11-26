@@ -484,7 +484,7 @@ public class BotControlPlaneAndLocaleTests
 
         var result = await orchestrator.RequestVerificationAsync(request);
         Assert.Equal(RebuildVerificationState.ManualVerificationRequired, result.State);
-        Assert.Contains("Rebuild 规模准入拦截", result.AdvisoryComment, StringComparison.Ordinal);
+        Assert.Contains("Rebuild 影响范围暂缓合并", result.AdvisoryComment, StringComparison.Ordinal);
     }
 
     [Fact]

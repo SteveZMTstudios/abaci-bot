@@ -248,7 +248,20 @@ public class PackageUpdateServiceTests
     [Fact]
     public async Task Publisher_AttachesStatusStaleExempt_WhenPublishingPr()
     {
-        var gitHubMock = Substitute.For<IGitHubService>();
+        var gitHubMock = Substitute.For<IGitHubService, IOptimisticFileContentGateway>();
+        var casMock = (IOptimisticFileContentGateway)gitHubMock;
+        casMock.GetFileContentWithShaAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(async ci =>
+            {
+                var content = await gitHubMock.GetFileContentAsync(
+                    ci.ArgAt<string>(0), ci.ArgAt<string>(1), ci.ArgAt<string>(2), ci.ArgAt<string>(3), ci.ArgAt<CancellationToken>(4));
+                return string.IsNullOrEmpty(content) ? null : new RepositoryFileContent(content, "mock-blob-sha");
+            });
+        casMock.UpdateFileContentIfUnchangedAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(async ci => await gitHubMock.UpdateFileContentAsync(
+                ci.ArgAt<string>(0), ci.ArgAt<string>(1), ci.ArgAt<string>(2), ci.ArgAt<string>(3), ci.ArgAt<string>(4), ci.ArgAt<string>(5), ci.ArgAt<CancellationToken>(7)));
         var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
         {
             DryRun = false,

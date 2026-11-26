@@ -1,5 +1,7 @@
+using System.Net;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
+using Octokit;
 
 namespace abaci_bot.Services;
 
@@ -14,13 +16,20 @@ public class RemoteAssetBackfiller : IRemoteAssetBackfiller
         RegexOptions.Compiled);
 
     private readonly IGitHubService _gitHubService;
+    private readonly IOptimisticFileContentGateway _optimisticFileGateway;
     private readonly ILogger<RemoteAssetBackfiller>? _logger;
 
     public RemoteAssetBackfiller(
         IGitHubService gitHubService,
-        ILogger<RemoteAssetBackfiller>? logger = null)
+        ILogger<RemoteAssetBackfiller>? logger = null,
+        IOptimisticFileContentGateway? optimisticFileGateway = null)
     {
         _gitHubService = gitHubService ?? throw new ArgumentNullException(nameof(gitHubService));
+        _optimisticFileGateway = optimisticFileGateway
+            ?? gitHubService as IOptimisticFileContentGateway
+            ?? throw new ArgumentException(
+                "IGitHubService must implement IOptimisticFileContentGateway or an explicit optimisticFileGateway must be provided.",
+                nameof(optimisticFileGateway));
         _logger = logger;
     }
 
@@ -99,10 +108,13 @@ public class RemoteAssetBackfiller : IRemoteAssetBackfiller
                 if (changes.Count == 0)
                     continue;
 
-                string currentSpec;
+                string? currentSpec = null;
+                string? expectedBlobSha = null;
                 try
                 {
-                    currentSpec = await _gitHubService.GetFileContentAsync(owner, repo, specPath, branchName, ct);
+                    var fileSnapshot = await _optimisticFileGateway.GetFileContentWithShaAsync(owner, repo, specPath, branchName, ct);
+                    currentSpec = fileSnapshot?.Content;
+                    expectedBlobSha = fileSnapshot?.BlobSha;
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
@@ -122,9 +134,26 @@ public class RemoteAssetBackfiller : IRemoteAssetBackfiller
                 if (!string.Equals(updatedSpec, currentSpec, StringComparison.Ordinal))
                 {
                     _logger?.LogInformation("Backfilling updated #!RemoteAsset checksums to branch {Branch} for PR #{PrNumber}", branchName, prNumber);
-                    await _gitHubService.UpdateFileContentAsync(
-                        owner, repo, specPath, "chore: update #!RemoteAsset sha256 checksums", updatedSpec, branchName, ct);
-                    backfilledAny = true;
+                    if (string.IsNullOrWhiteSpace(expectedBlobSha))
+                    {
+                        _logger?.LogWarning("Expected blob SHA unavailable for {Path} on branch {Branch}; skipping backfill fail-closed",
+                            specPath, branchName);
+                        continue;
+                    }
+
+                    try
+                    {
+                        await _optimisticFileGateway.UpdateFileContentIfUnchangedAsync(
+                            owner, repo, specPath, "chore: update #!RemoteAsset sha256 checksums", updatedSpec, branchName, expectedBlobSha, ct);
+                        backfilledAny = true;
+                    }
+                    catch (ApiException ex) when (ex.StatusCode is HttpStatusCode.Conflict or HttpStatusCode.UnprocessableEntity)
+                    {
+                        _logger?.LogWarning(
+                            ex,
+                            "Optimistic concurrency conflict backfilling #!RemoteAsset for {Path} on branch {Branch} (expectedBlobSha={ExpectedSha}); skipping",
+                            specPath, branchName, expectedBlobSha);
+                    }
                 }
             }
 

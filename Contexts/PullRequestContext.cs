@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Net;
 using abaci_bot.Services;
 using Octokit;
 using Octokit.Webhooks;
@@ -23,6 +24,28 @@ public enum PullRequestEventType
     IssueComment,
     ReviewComment,
     WorkflowRun
+}
+
+/// <summary>
+/// Categorizes the outcome of a post-lock <see cref="PullRequestContext.RefreshAsync"/> call.
+/// </summary>
+public enum RefreshOutcome
+{
+    Unknown = 0,
+    Refreshed,
+    Gone,
+    NonRetriableFailure,
+    InvalidState,
+    TransientFailure
+}
+
+/// <summary>
+/// Typed outcome returned by <see cref="PullRequestContext.RefreshAsync"/> so callers can distinguish
+/// expected 404 removals, non-retriable client/state errors, and transient infrastructure failures.
+/// </summary>
+public readonly record struct RefreshResult(RefreshOutcome Outcome, Exception? Error = null)
+{
+    public bool IsRefreshed => Outcome == RefreshOutcome.Refreshed;
 }
 
 /// <summary>
@@ -189,15 +212,25 @@ public class PullRequestContext
     public bool AuthorEmailLookupFailed { get; private set; }
 
     /// <summary>
-    /// Holds the exception encountered during the most recent call to <see cref="RefreshAsync"/>, if any.
-    /// Used by the pipeline orchestrator to classify non-retriable errors.
+    /// Holds the typed outcome from the most recent call to <see cref="RefreshAsync"/>, if any.
     /// </summary>
-    public Exception? LastRefreshException { get; private set; }
+    public RefreshResult? LastRefreshResult { get; private set; }
+
+    /// <summary>
+    /// Holds the exception encountered during the most recent call to <see cref="RefreshAsync"/>, if any.
+    /// Derived from <see cref="LastRefreshResult"/> to preserve a single source of truth.
+    /// </summary>
+    public Exception? LastRefreshException => LastRefreshResult?.Error;
 
     /// <summary>
     /// Lazily fetches the captain team member logins for authorization checks.
     /// </summary>
     public Lazy<Task<HashSet<string>>> TeamCaptains { get; }
+
+    /// <summary>
+    /// Lazily fetches existing issue/PR comments for idempotent self-healing comment checks.
+    /// </summary>
+    public Lazy<Task<IReadOnlyList<IssueComment>>> IssueComments { get; }
 
     /// <summary>
     /// Lazily fetches the fresh, authoritative remote pull request object from the GitHub API.
@@ -382,6 +415,9 @@ public class PullRequestContext
             var members = await _gitHubService.GetTeamMembersAsync(Owner, teamName, CancellationToken);
             return new HashSet<string>(members, StringComparer.OrdinalIgnoreCase);
         });
+
+        IssueComments = new Lazy<Task<IReadOnlyList<IssueComment>>>(() =>
+            _gitHubService.GetIssueCommentsAsync(Owner, Repo, PrNumber, CancellationToken));
 
         // Invariant assertion: PullRequestPipeline aborts before executing modules if RefreshAsync fails or returns 404.
         // This guard guarantees downstream modules receive an authoritative non-null PullRequest instance.
@@ -794,36 +830,56 @@ public class PullRequestContext
     /// <summary>
     /// Refreshes the pull request state and existing labels from GitHub after acquiring the concurrency lock.
     /// Ensures that modules and mutex calculation evaluate against current remote state rather than stale webhook payloads.
-    /// Returns true if remote state was refreshed successfully; false if remote pull request was not found (404) or a failure occurred (in which case <see cref="LastRefreshException"/> is populated and webhook payload state is retained).
+    /// Returns a typed <see cref="RefreshResult"/> distinguishing authoritative refresh, 404 <see cref="RefreshOutcome.Gone"/>,
+    /// non-retriable failures, invalid remote payloads, and transient infrastructure failures (in which case
+    /// <see cref="LastRefreshException"/> is populated and webhook payload state is retained).
     /// </summary>
-    public async Task<bool> RefreshAsync(CancellationToken cancellationToken = default)
+    public async Task<RefreshResult> RefreshAsync(CancellationToken cancellationToken = default)
     {
+        RefreshResult Record(RefreshResult result)
+        {
+            LastRefreshResult = result;
+            return result;
+        }
+
         var token = cancellationToken != default ? cancellationToken : CancellationToken;
         PullRequest? freshPr;
         try
         {
             freshPr = await _gitHubService.GetPullRequestAsync(Owner, Repo, PrNumber, token);
-            LastRefreshException = null;
         }
         catch (OperationCanceledException)
         {
             throw;
         }
+        catch (NotFoundException ex)
+        {
+            return Record(new RefreshResult(RefreshOutcome.Gone, ex));
+        }
+        catch (ApiException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return Record(new RefreshResult(RefreshOutcome.Gone, ex));
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return Record(new RefreshResult(RefreshOutcome.Gone, ex));
+        }
         catch (Exception ex)
         {
-            // If remote refresh fails due to transient error, record exception and retain webhook payload state
-            LastRefreshException = ex;
-            return false;
+            var outcome = TransientErrorPolicy.IsNonRetriable(ex)
+                ? RefreshOutcome.NonRetriableFailure
+                : RefreshOutcome.TransientFailure;
+            return Record(new RefreshResult(outcome, ex));
         }
 
         if (freshPr == null)
-            return false;
+            return Record(new RefreshResult(RefreshOutcome.Gone));
 
         if (freshPr.Labels == null)
         {
-            LastRefreshException = new InvalidOperationException(
+            var invalidEx = new InvalidOperationException(
                 $"Refresh for {Owner}/{Repo}#{PrNumber} returned a pull request without a Labels collection.");
-            return false;
+            return Record(new RefreshResult(RefreshOutcome.InvalidState, invalidEx));
         }
 
         ExistingLabels.Clear();
@@ -851,7 +907,7 @@ public class PullRequestContext
             BaseBranch = freshPr.Base.Ref;
 
         PullRequest = new Lazy<Task<PullRequest>>(() => Task.FromResult(freshPr));
-        return true;
+        return Record(new RefreshResult(RefreshOutcome.Refreshed));
     }
 
     /// <summary>

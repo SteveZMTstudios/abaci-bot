@@ -16,15 +16,18 @@ namespace abaci_bot.Services;
 public class RustCrateVersionSource : IUpdateCandidateSource, ICandidateSweepCursor
 {
     public const string CursorStateKey = "rust-crates";
+    public const string PoisonStateKey = "rust-crates-poison";
 
     private readonly HttpClient _httpClient;
     private readonly RustCratePollerOptions _options;
+    private readonly bool _dryRun;
     private readonly ILogger<RustCrateVersionSource>? _logger;
     private readonly ISpecCatalog? _specCatalog;
     private readonly Func<CancellationToken, Task<IReadOnlyList<SpecContext>>>? _specCatalogProvider;
     private readonly RuntimeHealthState? _healthState;
     private readonly IBotStateStore? _stateStore;
     private readonly string _cursorStateKey;
+    private readonly string _poisonStateKey;
     private string? _lastWatermark;
     private string? _pendingSweepWatermark;
     private bool _hasPendingSweepCommit;
@@ -42,6 +45,11 @@ public class RustCrateVersionSource : IUpdateCandidateSource, ICandidateSweepCur
             ? CursorStateKey
             : $"{CursorStateKey}:{targetRepository.Trim().ToLowerInvariant()}";
 
+    public static string GetPoisonStateKey(string? targetRepository) =>
+        string.IsNullOrWhiteSpace(targetRepository)
+            ? PoisonStateKey
+            : $"{PoisonStateKey}:{targetRepository.Trim().ToLowerInvariant()}";
+
     public RustCrateVersionSource(
         HttpClient httpClient,
         IOptions<PackageUpdateOptions> options,
@@ -53,12 +61,14 @@ public class RustCrateVersionSource : IUpdateCandidateSource, ICandidateSweepCur
     {
         _httpClient = httpClient;
         _options = options.Value.RustCratePoller;
+        _dryRun = options.Value.DryRun;
         _logger = logger;
         _specCatalog = specCatalog;
         _specCatalogProvider = specCatalogProvider;
         _healthState = healthState;
         _stateStore = stateStore;
         _cursorStateKey = GetCursorStateKey(options.Value.TargetRepository);
+        _poisonStateKey = GetPoisonStateKey(options.Value.TargetRepository);
     }
 
     /// <summary>
@@ -288,17 +298,24 @@ public class RustCrateVersionSource : IUpdateCandidateSource, ICandidateSweepCur
     }
 
     private const int MaxConsecutiveRewindsPerCandidate = 3;
-    private readonly Dictionary<string, int> _consecutiveRewinds = new(StringComparer.OrdinalIgnoreCase);
+    private bool _poisonStateLoaded;
+    private bool _hasPersistedPoisonState;
+    private string? _lastPoisonPackage;
+    private int _lastPoisonRewindCount;
 
     public void CompleteSweep(
         IReadOnlySet<string> processedPackageNames,
         IReadOnlySet<string>? failedPackageNames = null)
     {
+        EnsurePoisonStateLoaded();
+
         if (_lastCandidateNames.Count > 0 && _allSortedNames.Count > 0)
         {
-            foreach (var processed in processedPackageNames)
+            if (_lastPoisonPackage != null && processedPackageNames.Contains(_lastPoisonPackage))
             {
-                _consecutiveRewinds.Remove(processed);
+                _lastPoisonPackage = null;
+                _lastPoisonRewindCount = 0;
+                TryPersistPoisonState(null, 0);
             }
 
             var earliestUnprocessedIndex = -1;
@@ -319,15 +336,26 @@ public class RustCrateVersionSource : IUpdateCandidateSource, ICandidateSweepCur
                     break;
                 }
 
-                var attempts = _consecutiveRewinds.GetValueOrDefault(item.Name) + 1;
-                _consecutiveRewinds[item.Name] = attempts;
+                var attempts = string.Equals(_lastPoisonPackage, item.Name, StringComparison.OrdinalIgnoreCase)
+                    ? _lastPoisonRewindCount + 1
+                    : 1;
+
                 if (attempts < MaxConsecutiveRewindsPerCandidate)
                 {
+                    _lastPoisonPackage = item.Name;
+                    _lastPoisonRewindCount = attempts;
+                    TryPersistPoisonState(item.Name, attempts);
                     earliestUnprocessedIndex = item.Index;
                     break;
                 }
 
-                _consecutiveRewinds.Remove(item.Name);
+                if (string.Equals(_lastPoisonPackage, item.Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    _lastPoisonPackage = null;
+                    _lastPoisonRewindCount = 0;
+                    TryPersistPoisonState(null, 0);
+                }
+
                 _logger?.LogWarning(
                     "Rust crates poller skipped poison candidate {Package} after {Attempts} consecutive failed publish attempts to prevent cursor starvation",
                     item.Name, attempts);
@@ -362,8 +390,74 @@ public class RustCrateVersionSource : IUpdateCandidateSource, ICandidateSweepCur
         _hasPendingSweepCommit = false;
     }
 
+    private void EnsurePoisonStateLoaded()
+    {
+        if (_poisonStateLoaded)
+        {
+            return;
+        }
+
+        _poisonStateLoaded = true;
+        var raw = _stateStore?.GetCursorWatermark(_poisonStateKey);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return;
+        }
+
+        var separatorIdx = raw.LastIndexOf('|');
+        if (separatorIdx <= 0 || separatorIdx >= raw.Length - 1)
+        {
+            return;
+        }
+
+        if (int.TryParse(raw[(separatorIdx + 1)..], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var parsedAttempts) &&
+            parsedAttempts > 0)
+        {
+            _lastPoisonPackage = raw[..separatorIdx].Trim();
+            _lastPoisonRewindCount = parsedAttempts;
+            _hasPersistedPoisonState = !string.IsNullOrEmpty(_lastPoisonPackage);
+        }
+    }
+
+    private void TryPersistPoisonState(string? packageName, int attempts)
+    {
+        if (_dryRun || _stateStore == null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (string.IsNullOrWhiteSpace(packageName) || attempts <= 0)
+            {
+                if (!_hasPersistedPoisonState)
+                {
+                    return;
+                }
+
+                _stateStore.SetCursorWatermark(_poisonStateKey, null);
+                _hasPersistedPoisonState = false;
+                return;
+            }
+
+            _stateStore.SetCursorWatermark(
+                _poisonStateKey,
+                $"{packageName}|{attempts.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+            _hasPersistedPoisonState = true;
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Failed to persist Rust crates poison-pill state for package '{Package}'", packageName ?? "<clear>");
+        }
+    }
+
     private void TryPersistWatermark(string? watermark)
     {
+        if (_dryRun)
+        {
+            return;
+        }
+
         try
         {
             _stateStore?.SetCursorWatermark(_cursorStateKey, watermark);

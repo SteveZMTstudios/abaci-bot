@@ -19,6 +19,12 @@ public interface IGovernanceCommentFormatter
     string FormatConsolidatedHeader(string? locale = null);
 
     /// <summary>
+    /// Formats the top-level consolidated governance comment header using a dynamic bot display name.
+    /// </summary>
+    string FormatConsolidatedHeader(string? locale, string? botDisplayName) =>
+        FormatConsolidatedHeader(locale);
+
+    /// <summary>
     /// Formats an SPDX license compliance check failure notice using GFM [!WARNING].
     /// </summary>
     string FormatSpdxLicenseIssue(IReadOnlyList<(string File, string Expression, string Details)> issues, string? locale = null);

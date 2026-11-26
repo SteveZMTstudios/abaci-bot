@@ -15,48 +15,49 @@ public enum EphemeralReplyAction
 /// </summary>
 public class BotStateOptions
 {
-    /// <summary>
-    /// Optional directory where persistent bot state files (<c>bot-state.json</c> and default
-    /// <c>lookout-first-seen.json</c>) are stored. When empty, defaults to
-    /// <c>abaci-bot</c> under the local application data directory.
-    /// </summary>
+    [ConfigField(
+        Description = "Absolute local directory path for persisting bot-state.json and default lookout-first-seen.json (relative paths fail startup validation).",
+        Format = "absolute local directory path",
+        EmptyBehavior = "resolves LocalApplicationData -> XDG_DATA_HOME -> $HOME/.local/share/abaci-bot -> temp directory (with warning).")]
     public string StateDirectory { get; set; } = string.Empty;
 
-    /// <summary>
-    /// Retention period in days for user language preferences before inactive entries are pruned.
-    /// Must be positive. Default: 180.
-    /// </summary>
+    [ConfigField(
+        Description = "Retention period for user language preferences before inactive entries are pruned.",
+        Unit = "days",
+        Range = ">= 1")]
     public int LocaleRetentionDays { get; set; } = 180;
 
-    /// <summary>
-    /// Global fallback locale used when neither repository policy nor user preference is set.
-    /// Supported values: <c>"en"</c>, <c>"zh"</c>. Default: <c>"en"</c>.
-    /// </summary>
+    [ConfigField(
+        Description = "Global fallback locale used when neither repository policy nor user preference is set.",
+        AllowedValues = "\"en\", \"zh\", and \"en-*\" / \"zh-*\" locale tags (normalized on validation)",
+        EmptyBehavior = "empty or unrecognized values fail startup validation.")]
     public string DefaultLocale { get; set; } = "en";
 
-    /// <summary>
-    /// Per-repository forced locales keyed by <c>"owner/repo"</c> (values: <c>"en"</c> or <c>"zh"</c>).
-    /// When configured for a repository, user language selection commands are disabled for that repository.
-    /// </summary>
+    [ConfigField(
+        Description = "Per-repository forced locales disabling user language overrides for matched repositories.",
+        EmptyBehavior = "no repositories force a global language; users may select their preferred language.",
+        Example = "{\"openRuyi-Project/openRuyi\": \"zh\"}",
+        MapKeyFormat = "\"owner/repo\"",
+        MapValueFormat = "\"en\", \"zh\", or \"en-*\" / \"zh-*\" locale tag")]
     public Dictionary<string, string> RepositoryForcedLocales { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>
-    /// Per-repository default locales keyed by <c>"owner/repo"</c> (values: <c>"en"</c> or <c>"zh"</c>).
-    /// Used as fallback when a user has not selected a personal language preference.
-    /// </summary>
+    [ConfigField(
+        Description = "Per-repository default locales applied when a user has no personal preference.",
+        EmptyBehavior = "repositories fall back to DefaultLocale when a user has no personal preference.",
+        Example = "{\"openRuyi-Project/openRuyi\": \"zh\"}",
+        MapKeyFormat = "\"owner/repo\"",
+        MapValueFormat = "\"en\", \"zh\", or \"en-*\" / \"zh-*\" locale tag")]
     public Dictionary<string, string> RepositoryDefaultLocales { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>
-    /// Delay in minutes before ephemeral bot usage and rejection replies are processed.
-    /// Range: 0..1440. Setting 0 disables automatic cleanup. Default: 5.
-    /// </summary>
+    [ConfigField(
+        Description = "Delay before ephemeral bot usage and rejection replies are cleaned up.",
+        Unit = "minutes",
+        Range = "0..1440",
+        EmptyBehavior = "0 disables automatic cleanup of ephemeral replies.")]
     public int EphemeralReplyDeleteMinutes { get; set; } = 5;
 
-    /// <summary>
-    /// Action taken when an ephemeral bot reply expires.
-    /// Allowed values: <see cref="EphemeralReplyAction.Delete"/> (deletes the comment) or
-    /// <see cref="EphemeralReplyAction.Minimize"/> (minimizes as <c>OUTDATED</c>).
-    /// Default: <see cref="EphemeralReplyAction.Delete"/>.
-    /// </summary>
+    [ConfigField(
+        Description = "Cleanup action executed when an ephemeral bot reply exceeds EphemeralReplyDeleteMinutes.",
+        AllowedValues = "\"Delete\" (deletes via REST API) or \"Minimize\" (folds as OUTDATED via GraphQL API)")]
     public EphemeralReplyAction EphemeralReplyAction { get; set; } = EphemeralReplyAction.Delete;
 }

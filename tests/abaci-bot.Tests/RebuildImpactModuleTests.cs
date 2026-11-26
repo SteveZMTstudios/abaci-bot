@@ -21,11 +21,18 @@ public class RebuildImpactModuleTests
     private static RebuildImpactModule CreateModule(
         IRpmDependencyService dependencyService,
         IOptions<RebuildImpactOptions> options,
-        IRebuildVerificationOrchestrator? verificationOrchestrator = null)
+        IRebuildVerificationOrchestrator? verificationOrchestrator = null,
+        IBotIdentityProvider? botIdentity = null,
+        IOptions<PackageUpdateOptions>? packageUpdateOptions = null)
     {
         var orchestrator = verificationOrchestrator
             ?? new ManualGuideRebuildVerificationOrchestrator(new GovernanceCommentFormatter(), options);
-        return new RebuildImpactModule(dependencyService, options, orchestrator);
+        return new RebuildImpactModule(
+            dependencyService,
+            options,
+            orchestrator,
+            botIdentity: botIdentity,
+            packageUpdateOptions: packageUpdateOptions);
     }
 
     private static PullRequestFile CreateFile(string filename)
@@ -204,15 +211,17 @@ public class RebuildImpactModuleTests
         Assert.Contains(GitHubLabels.Rebuild1001To2500, context.LabelsToAdd);
         Assert.Contains(GitHubLabels.WorkflowBlocked, context.LabelsToAdd);
         Assert.NotEmpty(context.PendingComments);
-        Assert.Contains("Rebuild Impact Gate: Merge Blocked", context.PendingComments[0]);
+        Assert.Contains("Rebuild Impact Hold", context.PendingComments[0]);
         Assert.Contains("1200", context.PendingComments[0]);
-        Assert.Contains("OBS personal subproject", context.PendingComments[0]);
-        Assert.Contains("linkedbuild=\"localdep\"", context.PendingComments[0]);
+        Assert.Contains("we place merges to `Rolling` on hold", context.PendingComments[0]);
+        Assert.Contains("Maintainers will coordinate isolated downstream rebuild verification", context.PendingComments[0]);
+        Assert.DoesNotContain("OBS", context.PendingComments[0], StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0]);
         Assert.DoesNotContain("Staging", context.PendingComments[0]);
     }
 
     [Fact]
-    public async Task ProcessAsync_HighImpactOnRolling_AlreadyBlocked_DoesNotDuplicateComment()
+    public async Task ProcessAsync_HighImpactOnRolling_AlreadyBlocked_WithExistingMarkerComment_DoesNotDuplicateComment()
     {
         var dependencyService = Substitute.For<IRpmDependencyService>();
         dependencyService.IsMetadataLoaded.Returns(true);
@@ -222,6 +231,18 @@ public class RebuildImpactModuleTests
 
         var options = Microsoft.Extensions.Options.Options.Create(new RebuildImpactOptions { BlockThreshold = 1001 });
         var module = CreateModule(dependencyService, options);
+
+        var botUser = (Octokit.User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.User));
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Login))?.SetValue(botUser, "abaci-bot[bot]");
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Type))?.SetValue(botUser, Octokit.AccountType.Bot);
+
+        var existingComment = (IssueComment)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(IssueComment));
+        typeof(IssueComment).GetProperty(nameof(IssueComment.User))?.SetValue(existingComment, botUser);
+        typeof(IssueComment).GetProperty(nameof(IssueComment.Body))?.SetValue(
+            existingComment,
+            "## abaci-bot Review Notes\n\n> [!IMPORTANT]\n" + GovernanceCommentFormatter.RebuildGateCommentMarker);
+        _gitHub.GetIssueCommentsAsync("openRuyi-Project", "openRuyi", 55, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { existingComment });
 
         var file = CreateFile("SPECS/glibc/glibc.spec");
         var context = CreateContext(
@@ -235,6 +256,342 @@ public class RebuildImpactModuleTests
         Assert.Contains(GitHubLabels.Rebuild1001To2500, context.LabelsToAdd);
         Assert.Contains(GitHubLabels.WorkflowBlocked, context.LabelsToAdd);
         Assert.Empty(context.PendingComments);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_HighImpactOnRolling_AlreadyBlockedWithoutAdvisoryComment_SelfHealsAndEmitsComment()
+    {
+        var dependencyService = Substitute.For<IRpmDependencyService>();
+        dependencyService.IsMetadataLoaded.Returns(true);
+        var largeSet = Enumerable.Range(1, 1200).Select(i => $"pkg-{i}").ToHashSet();
+        dependencyService.GetAffectedPackages("glibc", Arg.Any<int?>()).Returns(largeSet);
+        dependencyService.MapAffectedCountToRebuildLabel(1200).Returns(GitHubLabels.Rebuild1001To2500);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new RebuildImpactOptions { BlockThreshold = 1001 });
+        var module = CreateModule(dependencyService, options);
+
+        _gitHub.GetIssueCommentsAsync("openRuyi-Project", "openRuyi", 55, Arg.Any<CancellationToken>())
+            .Returns(Array.Empty<IssueComment>());
+
+        var file = CreateFile("SPECS/glibc/glibc.spec");
+        var context = CreateContext(
+            new[] { file },
+            baseBranch: "main",
+            existingLabels: new[] { GitHubLabels.WorkflowBlocked, GitHubLabels.Rebuild1001To2500 },
+            prAction: PullRequestAction.Synchronize);
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Contains(GitHubLabels.WorkflowBlocked, context.LabelsToAdd);
+        Assert.Single(context.PendingComments);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0]);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_HumanCommentMentioningRebuildImpactHold_DoesNotSuppressBotGateComment()
+    {
+        var dependencyService = Substitute.For<IRpmDependencyService>();
+        dependencyService.IsMetadataLoaded.Returns(true);
+        var largeSet = Enumerable.Range(1, 1200).Select(i => $"pkg-{i}").ToHashSet();
+        dependencyService.GetAffectedPackages("glibc", Arg.Any<int?>()).Returns(largeSet);
+        dependencyService.MapAffectedCountToRebuildLabel(1200).Returns(GitHubLabels.Rebuild1001To2500);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new RebuildImpactOptions { BlockThreshold = 1001 });
+        var module = CreateModule(dependencyService, options);
+
+        var humanUser = (Octokit.User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.User));
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Login))?.SetValue(humanUser, "alice");
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Type))?.SetValue(humanUser, Octokit.AccountType.User);
+
+        var humanComment = (IssueComment)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(IssueComment));
+        typeof(IssueComment).GetProperty(nameof(IssueComment.User))?.SetValue(humanComment, humanUser);
+        typeof(IssueComment).GetProperty(nameof(IssueComment.Body))?.SetValue(
+            humanComment,
+            "Why did Rebuild Impact Hold appear on this PR?");
+
+        _gitHub.GetIssueCommentsAsync("openRuyi-Project", "openRuyi", 55, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { humanComment });
+
+        var file = CreateFile("SPECS/glibc/glibc.spec");
+        var context = CreateContext(
+            new[] { file },
+            baseBranch: "main",
+            existingLabels: new[] { GitHubLabels.WorkflowBlocked, GitHubLabels.Rebuild1001To2500 },
+            prAction: PullRequestAction.Synchronize);
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        // Human comment quoting legacy text must NOT suppress the bot's explanatory gate comment
+        Assert.Single(context.PendingComments);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0]);
+
+        // Legacy text authored by our own bot account DOES suppress duplicate posting when identity is known
+        var ownBotIdentity = Substitute.For<IBotIdentityProvider>();
+        ownBotIdentity.GetBotLoginAsync(Arg.Any<CancellationToken>()).Returns("abaci-bot");
+        var ownIdentityModule = CreateModule(
+            dependencyService,
+            options,
+            botIdentity: ownBotIdentity);
+        var botUser = (Octokit.User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.User));
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Login))?.SetValue(botUser, "abaci-bot[bot]");
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Type))?.SetValue(botUser, Octokit.AccountType.Bot);
+        var legacyBotComment = (IssueComment)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(IssueComment));
+        typeof(IssueComment).GetProperty(nameof(IssueComment.User))?.SetValue(legacyBotComment, botUser);
+        typeof(IssueComment).GetProperty(nameof(IssueComment.Body))?.SetValue(
+            legacyBotComment,
+            "### Rebuild Impact Hold");
+        _gitHub.GetIssueCommentsAsync("openRuyi-Project", "openRuyi", 55, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { legacyBotComment });
+
+        var contextWithBotComment = CreateContext(
+            new[] { file },
+            baseBranch: "main",
+            existingLabels: new[] { GitHubLabels.WorkflowBlocked, GitHubLabels.Rebuild1001To2500 },
+            prAction: PullRequestAction.Edited);
+        await ownIdentityModule.ProcessAsync(contextWithBotComment, CancellationToken.None);
+        Assert.Empty(contextWithBotComment.PendingComments);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_WhenBotIdentityLookupFails_AcceptsBotMarkerOnlyAndRejectsLegacyHeading()
+    {
+        var dependencyService = Substitute.For<IRpmDependencyService>();
+        dependencyService.IsMetadataLoaded.Returns(true);
+        var largeSet = Enumerable.Range(1, 1200).Select(i => $"pkg-{i}").ToHashSet();
+        dependencyService.GetAffectedPackages("glibc", Arg.Any<int?>()).Returns(largeSet);
+        dependencyService.MapAffectedCountToRebuildLabel(1200).Returns(GitHubLabels.Rebuild1001To2500);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new RebuildImpactOptions { BlockThreshold = 1001 });
+        var failingIdentityProvider = Substitute.For<IBotIdentityProvider>();
+        failingIdentityProvider.GetBotLoginAsync(Arg.Any<CancellationToken>())
+            .Returns<string>(_ => throw new HttpRequestException("Transient /app failure", null, System.Net.HttpStatusCode.BadGateway));
+        var module = CreateModule(dependencyService, options, botIdentity: failingIdentityProvider);
+
+        var unverifiedBotUser = (Octokit.User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.User));
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Login))?.SetValue(unverifiedBotUser, "other-bot[bot]");
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Type))?.SetValue(unverifiedBotUser, Octokit.AccountType.Bot);
+
+        var legacyOnlyComment = (IssueComment)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(IssueComment));
+        typeof(IssueComment).GetProperty(nameof(IssueComment.User))?.SetValue(legacyOnlyComment, unverifiedBotUser);
+        typeof(IssueComment).GetProperty(nameof(IssueComment.Body))?.SetValue(legacyOnlyComment, "### Rebuild Impact Hold");
+        _gitHub.GetIssueCommentsAsync("openRuyi-Project", "openRuyi", 55, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { legacyOnlyComment });
+
+        var file = CreateFile("SPECS/glibc/glibc.spec");
+        var contextLegacy = CreateContext(
+            new[] { file },
+            baseBranch: "main",
+            existingLabels: new[] { GitHubLabels.WorkflowBlocked, GitHubLabels.Rebuild1001To2500 },
+            prAction: PullRequestAction.Synchronize);
+
+        await module.ProcessAsync(contextLegacy, CancellationToken.None);
+
+        // Plain-text legacy heading without hidden marker must NOT suppress when own identity cannot be resolved.
+        Assert.Single(contextLegacy.PendingComments);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, contextLegacy.PendingComments[0]);
+
+        var markerComment = (IssueComment)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(IssueComment));
+        typeof(IssueComment).GetProperty(nameof(IssueComment.User))?.SetValue(markerComment, unverifiedBotUser);
+        typeof(IssueComment).GetProperty(nameof(IssueComment.Body))?.SetValue(
+            markerComment,
+            "## abaci-bot Review Notes\n\n" + GovernanceCommentFormatter.RebuildGateCommentMarker);
+        _gitHub.GetIssueCommentsAsync("openRuyi-Project", "openRuyi", 55, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { markerComment });
+
+        var contextMarker = CreateContext(
+            new[] { file },
+            baseBranch: "main",
+            existingLabels: new[] { GitHubLabels.WorkflowBlocked, GitHubLabels.Rebuild1001To2500 },
+            prAction: PullRequestAction.Synchronize);
+
+        await module.ProcessAsync(contextMarker, CancellationToken.None);
+
+        // Explicit gate marker on a bot account still prevents duplicate comment spam during transient identity outages.
+        Assert.Empty(contextMarker.PendingComments);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_HumanCommentContainingRebuildGateMarker_DoesNotSuppressBotGateComment()
+    {
+        var dependencyService = Substitute.For<IRpmDependencyService>();
+        dependencyService.IsMetadataLoaded.Returns(true);
+        var largeSet = Enumerable.Range(1, 1200).Select(i => $"pkg-{i}").ToHashSet();
+        dependencyService.GetAffectedPackages("glibc", Arg.Any<int?>()).Returns(largeSet);
+        dependencyService.MapAffectedCountToRebuildLabel(1200).Returns(GitHubLabels.Rebuild1001To2500);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new RebuildImpactOptions { BlockThreshold = 1001 });
+        var module = CreateModule(dependencyService, options);
+
+        var humanUser = (Octokit.User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.User));
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Login))?.SetValue(humanUser, "alice");
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Type))?.SetValue(humanUser, Octokit.AccountType.User);
+
+        var humanComment = (IssueComment)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(IssueComment));
+        typeof(IssueComment).GetProperty(nameof(IssueComment.User))?.SetValue(humanComment, humanUser);
+        typeof(IssueComment).GetProperty(nameof(IssueComment.Body))?.SetValue(
+            humanComment,
+            "Quoting bot note: " + GovernanceCommentFormatter.RebuildGateCommentMarker);
+
+        _gitHub.GetIssueCommentsAsync("openRuyi-Project", "openRuyi", 55, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { humanComment });
+
+        var file = CreateFile("SPECS/glibc/glibc.spec");
+        var context = CreateContext(
+            new[] { file },
+            baseBranch: "main",
+            existingLabels: new[] { GitHubLabels.WorkflowBlocked, GitHubLabels.Rebuild1001To2500 },
+            prAction: PullRequestAction.Synchronize);
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Single(context.PendingComments);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0]);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_PatUserBotCommentWithMarker_SuppressesDuplicateGateComment()
+    {
+        var dependencyService = Substitute.For<IRpmDependencyService>();
+        dependencyService.IsMetadataLoaded.Returns(true);
+        var largeSet = Enumerable.Range(1, 1200).Select(i => $"pkg-{i}").ToHashSet();
+        dependencyService.GetAffectedPackages("glibc", Arg.Any<int?>()).Returns(largeSet);
+        dependencyService.MapAffectedCountToRebuildLabel(1200).Returns(GitHubLabels.Rebuild1001To2500);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new RebuildImpactOptions { BlockThreshold = 1001 });
+        var pkgOptions = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            BotPat = "ghp_test_pat",
+            BotLogin = "openruyi-bot"
+        });
+        var module = CreateModule(dependencyService, options, packageUpdateOptions: pkgOptions);
+
+        var patBotUser = (Octokit.User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.User));
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Login))?.SetValue(patBotUser, "openruyi-bot");
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Type))?.SetValue(patBotUser, Octokit.AccountType.User);
+
+        var patBotComment = (IssueComment)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(IssueComment));
+        typeof(IssueComment).GetProperty(nameof(IssueComment.User))?.SetValue(patBotComment, patBotUser);
+        typeof(IssueComment).GetProperty(nameof(IssueComment.Body))?.SetValue(
+            patBotComment,
+            "## abaci-bot Review Notes\n\n" + GovernanceCommentFormatter.RebuildGateCommentMarker);
+
+        _gitHub.GetIssueCommentsAsync("openRuyi-Project", "openRuyi", 55, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { patBotComment });
+
+        var file = CreateFile("SPECS/glibc/glibc.spec");
+        var context = CreateContext(
+            new[] { file },
+            baseBranch: "main",
+            existingLabels: new[] { GitHubLabels.WorkflowBlocked, GitHubLabels.Rebuild1001To2500 },
+            prAction: PullRequestAction.Synchronize);
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Empty(context.PendingComments);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_ThirdPartyBotCommentWithMarker_DoesNotSuppressOwnBotGateComment()
+    {
+        var dependencyService = Substitute.For<IRpmDependencyService>();
+        dependencyService.IsMetadataLoaded.Returns(true);
+        var largeSet = Enumerable.Range(1, 1200).Select(i => $"pkg-{i}").ToHashSet();
+        dependencyService.GetAffectedPackages("glibc", Arg.Any<int?>()).Returns(largeSet);
+        dependencyService.MapAffectedCountToRebuildLabel(1200).Returns(GitHubLabels.Rebuild1001To2500);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new RebuildImpactOptions { BlockThreshold = 1001 });
+        var botIdentity = Substitute.For<IBotIdentityProvider>();
+        botIdentity.GetBotLoginAsync(Arg.Any<CancellationToken>()).Returns("openruyi-bot");
+        var module = CreateModule(dependencyService, options, botIdentity: botIdentity);
+
+        var thirdPartyBot = (Octokit.User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.User));
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Login))?.SetValue(thirdPartyBot, "dependabot[bot]");
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Type))?.SetValue(thirdPartyBot, Octokit.AccountType.Bot);
+
+        var thirdPartyComment = (IssueComment)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(IssueComment));
+        typeof(IssueComment).GetProperty(nameof(IssueComment.User))?.SetValue(thirdPartyComment, thirdPartyBot);
+        typeof(IssueComment).GetProperty(nameof(IssueComment.Body))?.SetValue(
+            thirdPartyComment,
+            "Third-party bot copied: " + GovernanceCommentFormatter.RebuildGateCommentMarker);
+
+        _gitHub.GetIssueCommentsAsync("openRuyi-Project", "openRuyi", 55, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { thirdPartyComment });
+
+        var file = CreateFile("SPECS/glibc/glibc.spec");
+        var context = CreateContext(
+            new[] { file },
+            baseBranch: "main",
+            existingLabels: new[] { GitHubLabels.WorkflowBlocked, GitHubLabels.Rebuild1001To2500 },
+            prAction: PullRequestAction.Synchronize);
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Single(context.PendingComments);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0]);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_DefaultAppModeWithDefaultPackageUpdateOptions_WhenIdentityLookupFails_UsesMarkerOnlyFallback()
+    {
+        var dependencyService = Substitute.For<IRpmDependencyService>();
+        dependencyService.IsMetadataLoaded.Returns(true);
+        var largeSet = Enumerable.Range(1, 1200).Select(i => $"pkg-{i}").ToHashSet();
+        dependencyService.GetAffectedPackages("glibc", Arg.Any<int?>()).Returns(largeSet);
+        dependencyService.MapAffectedCountToRebuildLabel(1200).Returns(GitHubLabels.Rebuild1001To2500);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new RebuildImpactOptions { BlockThreshold = 1001 });
+        // Default PackageUpdateOptions has BotLogin = "aqua-rium" and BotPat = null (App mode).
+        var defaultPkgOptions = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions());
+        var failingIdentityProvider = Substitute.For<IBotIdentityProvider>();
+        failingIdentityProvider.GetBotLoginAsync(Arg.Any<CancellationToken>())
+            .Returns<string>(_ => throw new HttpRequestException("Transient /app outage", null, System.Net.HttpStatusCode.BadGateway));
+
+        var module = CreateModule(
+            dependencyService,
+            options,
+            botIdentity: failingIdentityProvider,
+            packageUpdateOptions: defaultPkgOptions);
+
+        var appBotUser = (Octokit.User)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.User));
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Login))?.SetValue(appBotUser, "abaci-bot-test[bot]");
+        typeof(Octokit.User).GetProperty(nameof(Octokit.User.Type))?.SetValue(appBotUser, Octokit.AccountType.Bot);
+
+        var markerComment = (IssueComment)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(IssueComment));
+        typeof(IssueComment).GetProperty(nameof(IssueComment.User))?.SetValue(markerComment, appBotUser);
+        typeof(IssueComment).GetProperty(nameof(IssueComment.Body))?.SetValue(
+            markerComment,
+            "## abaci-bot Review Notes\n\n" + GovernanceCommentFormatter.RebuildGateCommentMarker);
+        _gitHub.GetIssueCommentsAsync("openRuyi-Project", "openRuyi", 55, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { markerComment });
+
+        var file = CreateFile("SPECS/glibc/glibc.spec");
+        var contextWithMarker = CreateContext(
+            new[] { file },
+            baseBranch: "main",
+            existingLabels: new[] { GitHubLabels.WorkflowBlocked, GitHubLabels.Rebuild1001To2500 },
+            prAction: PullRequestAction.Synchronize);
+
+        await module.ProcessAsync(contextWithMarker, CancellationToken.None);
+
+        // Even with default BotLogin="aqua-rium", App mode ignores BotLogin and suppresses abaci-bot-test[bot]'s marker.
+        Assert.Empty(contextWithMarker.PendingComments);
+
+        var legacyOnlyComment = (IssueComment)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(IssueComment));
+        typeof(IssueComment).GetProperty(nameof(IssueComment.User))?.SetValue(legacyOnlyComment, appBotUser);
+        typeof(IssueComment).GetProperty(nameof(IssueComment.Body))?.SetValue(legacyOnlyComment, "### Rebuild Impact Hold");
+        _gitHub.GetIssueCommentsAsync("openRuyi-Project", "openRuyi", 55, Arg.Any<CancellationToken>())
+            .Returns(new List<IssueComment> { legacyOnlyComment });
+
+        var contextLegacyOnly = CreateContext(
+            new[] { file },
+            baseBranch: "main",
+            existingLabels: new[] { GitHubLabels.WorkflowBlocked, GitHubLabels.Rebuild1001To2500 },
+            prAction: PullRequestAction.Synchronize);
+
+        await module.ProcessAsync(contextLegacyOnly, CancellationToken.None);
+
+        // Legacy prose heading without hidden marker still does not suppress during identity outage.
+        Assert.Single(contextLegacyOnly.PendingComments);
     }
 
     [Fact]
@@ -1062,7 +1419,7 @@ public class RebuildImpactModuleTests
 
         Assert.Contains(GitHubLabels.WorkflowBlocked, context.LabelsToAdd);
         Assert.Single(context.PendingComments);
-        Assert.Contains("Rebuild 规模准入拦截", context.PendingComments[0], StringComparison.Ordinal);
+        Assert.Contains("Rebuild 影响范围暂缓合并", context.PendingComments[0], StringComparison.Ordinal);
     }
 
     private sealed class HttpHandlerStub : HttpMessageHandler

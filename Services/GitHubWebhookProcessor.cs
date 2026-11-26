@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using abaci_bot.Contexts;
 using abaci_bot.Modules;
 using abaci_bot.Options;
@@ -41,6 +42,8 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
     private readonly IFileContentCache? _fileCache;
     private readonly TimeProvider _timeProvider;
     private readonly IBotIdentityProvider? _botIdentity;
+    private readonly IWebhookDispatcher? _dispatcher;
+    private readonly IOpenPullRequestInventoryGateway? _prInventoryGateway;
     private readonly object _deliveryLock = new();
     private readonly Dictionary<string, DateTimeOffset> _seenDeliveries = new(StringComparer.OrdinalIgnoreCase);
 
@@ -58,7 +61,9 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         IOptions<AbiComplianceOptions>? abiOptions = null,
         TimeProvider? timeProvider = null,
         IBotIdentityProvider? botIdentity = null,
-        IOptions<PackageUpdateOptions>? packageUpdateOptions = null)
+        IOptions<PackageUpdateOptions>? packageUpdateOptions = null,
+        IWebhookDispatcher? dispatcher = null,
+        IOpenPullRequestInventoryGateway? prInventoryGateway = null)
     {
         _github = github;
         _config = config;
@@ -80,6 +85,8 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         _fileCache = fileCache;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _botIdentity = botIdentity ?? github as IBotIdentityProvider;
+        _dispatcher = dispatcher;
+        _prInventoryGateway = prInventoryGateway ?? github as IOpenPullRequestInventoryGateway;
     }
 
     /// <summary>
@@ -112,19 +119,19 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         PullRequestAction action,
         CancellationToken cancellationToken = default)
     {
-        return ExecuteWithDeliveryDedupAsync(headers, async () =>
+        return ExecuteWithDeliveryDedupAsync(headers, $"pull_request.{action}", async ct =>
         {
             if (!TryGetRepositoryContext(pullRequestEvent.Repository, out var owner, out var repo))
                 return;
 
             var teamName = _config["GitHubApp:TeamName"] ?? string.Empty;
-            var context = PullRequestContext.FromPullRequestEvent(_github, teamName, headers, pullRequestEvent, action, _fileCache, cancellationToken);
+            var context = PullRequestContext.FromPullRequestEvent(_github, teamName, headers, pullRequestEvent, action, _fileCache, ct);
 
-            using (await _lockManager.AcquireLockAsync(owner, repo, context.PrNumber, cancellationToken))
+            using (await _lockManager.AcquireLockAsync(owner, repo, context.PrNumber, ct))
             {
-                await _pipeline.ExecuteAsync(context, cancellationToken);
+                await _pipeline.ExecuteAsync(context, ct);
             }
-        });
+        }, cancellationToken);
     }
 
     protected override ValueTask ProcessPullRequestReviewWebhookAsync(
@@ -133,7 +140,7 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         PullRequestReviewAction action,
         CancellationToken cancellationToken = default)
     {
-        return ExecuteWithDeliveryDedupAsync(headers, async () =>
+        return ExecuteWithDeliveryDedupAsync(headers, $"pull_request_review.{action}", async ct =>
         {
             // Ignore non-Submitted review actions (e.g. Dismissed, Edited) to prevent unintended state transitions
             if (action != PullRequestReviewAction.Submitted)
@@ -146,13 +153,13 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
                 return;
 
             var teamName = _config["GitHubApp:TeamName"] ?? string.Empty;
-            var context = PullRequestContext.FromReviewEvent(_github, teamName, headers, pullRequestReviewEvent, action, _fileCache, cancellationToken);
+            var context = PullRequestContext.FromReviewEvent(_github, teamName, headers, pullRequestReviewEvent, action, _fileCache, ct);
 
-            using (await _lockManager.AcquireLockAsync(owner, repo, context.PrNumber, cancellationToken))
+            using (await _lockManager.AcquireLockAsync(owner, repo, context.PrNumber, ct))
             {
-                await _pipeline.ExecuteAsync(context, cancellationToken);
+                await _pipeline.ExecuteAsync(context, ct);
             }
-        });
+        }, cancellationToken);
     }
 
     protected override ValueTask ProcessPullRequestReviewCommentWebhookAsync(
@@ -161,7 +168,7 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         PullRequestReviewCommentAction action,
         CancellationToken cancellationToken = default)
     {
-        return ExecuteWithDeliveryDedupAsync(headers, async () =>
+        return ExecuteWithDeliveryDedupAsync(headers, $"pull_request_review_comment.{action}", async ct =>
         {
             // Only react to newly created inline review comments; ignore edits and deletions
             if (action != PullRequestReviewCommentAction.Created)
@@ -174,13 +181,13 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
                 return;
 
             var teamName = _config["GitHubApp:TeamName"] ?? string.Empty;
-            var context = PullRequestContext.FromReviewCommentEvent(_github, teamName, headers, pullRequestReviewCommentEvent, action, _fileCache, cancellationToken);
+            var context = PullRequestContext.FromReviewCommentEvent(_github, teamName, headers, pullRequestReviewCommentEvent, action, _fileCache, ct);
 
-            using (await _lockManager.AcquireLockAsync(owner, repo, context.PrNumber, cancellationToken))
+            using (await _lockManager.AcquireLockAsync(owner, repo, context.PrNumber, ct))
             {
-                await _pipeline.ExecuteAsync(context, cancellationToken);
+                await _pipeline.ExecuteAsync(context, ct);
             }
-        });
+        }, cancellationToken);
     }
 
     protected override ValueTask ProcessIssueCommentWebhookAsync(
@@ -189,7 +196,7 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         IssueCommentAction action,
         CancellationToken cancellationToken = default)
     {
-        return ExecuteWithDeliveryDedupAsync(headers, async () =>
+        return ExecuteWithDeliveryDedupAsync(headers, $"issue_comment.{action}", async ct =>
         {
             // Only react to newly created comments; ignore edits and deletions
             if (action != IssueCommentAction.Created)
@@ -211,13 +218,13 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
                     var senderType = issueCommentEvent.Sender.Type?.ToString();
 
                     if (!BotDetectionHelper.IsBot(senderLogin, senderType, _botOptions.Whitelist) &&
-                        !await BotCommitOwnership.IsOwnBotLoginAsync(_botIdentity, senderLogin, _packageUpdateOptions.BotLogin, cancellationToken))
+                        !await BotCommitOwnership.IsOwnBotLoginAsync(_botIdentity, senderLogin, _packageUpdateOptions.BotLogin, ct))
                     {
-                        using (await _lockManager.AcquireLockAsync(issueOwner, issueRepo, (int)issueCommentEvent.Issue.Number, cancellationToken))
+                        using (await _lockManager.AcquireLockAsync(issueOwner, issueRepo, (int)issueCommentEvent.Issue.Number, ct))
                         {
                             try
                             {
-                                await _github.RemoveLabelAsync(issueOwner, issueRepo, (int)issueCommentEvent.Issue.Number, GitHubLabels.StatusStale, cancellationToken);
+                                await _github.RemoveLabelAsync(issueOwner, issueRepo, (int)issueCommentEvent.Issue.Number, GitHubLabels.StatusStale, ct);
                             }
                             catch (Exception ex)
                             {
@@ -234,13 +241,13 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
                 return;
 
             var teamName = _config["GitHubApp:TeamName"] ?? string.Empty;
-            var context = PullRequestContext.FromIssueCommentEvent(_github, teamName, headers, issueCommentEvent, action, _fileCache, cancellationToken);
+            var context = PullRequestContext.FromIssueCommentEvent(_github, teamName, headers, issueCommentEvent, action, _fileCache, ct);
 
-            using (await _lockManager.AcquireLockAsync(owner, repo, context.PrNumber, cancellationToken))
+            using (await _lockManager.AcquireLockAsync(owner, repo, context.PrNumber, ct))
             {
-                await _pipeline.ExecuteAsync(context, cancellationToken);
+                await _pipeline.ExecuteAsync(context, ct);
             }
-        });
+        }, cancellationToken);
     }
 
     protected override ValueTask ProcessWorkflowRunWebhookAsync(
@@ -251,15 +258,63 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
     {
         return ExecuteWithDeliveryDedupAsync(
             headers,
-            () => ProcessWorkflowRunCoreAsync(headers, workflowRunEvent, action, cancellationToken));
+            $"workflow_run.{action}",
+            ct => ProcessWorkflowRunCoreAsync(headers, workflowRunEvent, action, ct),
+            cancellationToken);
     }
 
-    private async ValueTask ExecuteWithDeliveryDedupAsync(WebhookHeaders? headers, Func<ValueTask> action)
+    private async ValueTask ExecuteWithDeliveryDedupAsync(
+        WebhookHeaders? headers,
+        string eventSummary,
+        Func<CancellationToken, ValueTask> action,
+        CancellationToken httpCancellationToken)
     {
         var deliveryId = headers?.Delivery;
+        if (_dispatcher != null)
+        {
+            if (!string.IsNullOrWhiteSpace(deliveryId) && !TryClaimDelivery(deliveryId))
+            {
+                _logger?.LogInformation("Skipping duplicate GitHub webhook delivery {DeliveryId}", deliveryId);
+                return;
+            }
+
+            try
+            {
+                var accepted = _dispatcher.TryEnqueue(
+                    deliveryId ?? "<no-delivery-id>",
+                    eventSummary,
+                    action,
+                    onPermanentFailure: !string.IsNullOrWhiteSpace(deliveryId)
+                        ? () => ReleaseDelivery(deliveryId)
+                        : null);
+                if (!accepted)
+                {
+                    if (!string.IsNullOrWhiteSpace(deliveryId))
+                    {
+                        ReleaseDelivery(deliveryId);
+                    }
+
+                    _logger?.LogWarning(
+                        "Webhook dispatcher queue is full; rejecting delivery '{DeliveryId}' ({EventSummary}) with HTTP 503.",
+                        deliveryId ?? "<no-delivery-id>", eventSummary);
+                    throw new WebhookDispatcherOverloadedException(
+                        $"Webhook dispatcher queue is full for event '{eventSummary}'.");
+                }
+            }
+            catch
+            {
+                if (!string.IsNullOrWhiteSpace(deliveryId))
+                {
+                    ReleaseDelivery(deliveryId);
+                }
+                throw;
+            }
+            return;
+        }
+
         if (string.IsNullOrWhiteSpace(deliveryId))
         {
-            await action();
+            await action(httpCancellationToken);
             return;
         }
 
@@ -271,7 +326,7 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
 
         try
         {
-            await action();
+            await action(httpCancellationToken);
         }
         catch
         {
@@ -337,37 +392,81 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         if (!TryGetRepositoryContext(workflowRunEvent.Repository, out var owner, out var repo))
             return;
 
-        var pullRequests = workflowRunEvent.WorkflowRun?.PullRequests;
-        if (pullRequests == null || pullRequests.Count == 0)
-            return;
-
         var runId = workflowRunEvent.WorkflowRun?.Id ?? 0;
         var teamName = _config["GitHubApp:TeamName"] ?? string.Empty;
         var runHeadSha = workflowRunEvent.WorkflowRun?.HeadSha;
+        var pullRequests = workflowRunEvent.WorkflowRun?.PullRequests;
 
         // Pre-fetch PRs and guard against outdated runs before performing heavy artifact downloads
         var validPrs = new List<Octokit.PullRequest>();
-        foreach (var pr in pullRequests)
+        if (pullRequests is { Count: > 0 })
         {
-            var prNumber = (int)pr.Number;
-            var fullPr = await _github.GetPullRequestAsync(owner, repo, prNumber, cancellationToken);
-            if (fullPr == null)
+            foreach (var pr in pullRequests)
             {
-                _logger?.LogWarning("PR #{PrNumber} not found in {Owner}/{Repo} during workflow_run processing; skipping", prNumber, owner, repo);
-                continue;
+                var prNumber = (int)pr.Number;
+                var fullPr = await _github.GetPullRequestAsync(owner, repo, prNumber, cancellationToken);
+                if (fullPr == null)
+                {
+                    _logger?.LogWarning("PR #{PrNumber} not found in {Owner}/{Repo} during workflow_run processing; skipping", prNumber, owner, repo);
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(runHeadSha) &&
+                    !string.IsNullOrWhiteSpace(fullPr.Head?.Sha) &&
+                    !string.Equals(runHeadSha, fullPr.Head.Sha, StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger?.LogInformation(
+                        "Workflow run {RunId} head SHA '{RunHeadSha}' does not match PR #{PrNumber} current HEAD '{PrHeadSha}'; skipping outdated run to prevent stale overwrite",
+                        runId, runHeadSha, prNumber, fullPr.Head.Sha);
+                    continue;
+                }
+
+                validPrs.Add(fullPr);
+            }
+        }
+        else
+        {
+            var runEvent = workflowRunEvent.WorkflowRun?.Event;
+            var headOwner = workflowRunEvent.WorkflowRun?.HeadRepository?.Owner?.Login;
+            var headBranch = workflowRunEvent.WorkflowRun?.HeadBranch;
+            var headRepoFullName = workflowRunEvent.WorkflowRun?.HeadRepository?.FullName;
+            var isPullRequestOrForkRun =
+                string.Equals(runEvent, "pull_request", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(runEvent, "pull_request_target", StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrWhiteSpace(headRepoFullName) &&
+                 !string.Equals(headRepoFullName, $"{owner}/{repo}", StringComparison.OrdinalIgnoreCase));
+
+            if (!isPullRequestOrForkRun || string.IsNullOrWhiteSpace(runHeadSha) || _prInventoryGateway == null)
+            {
+                return;
             }
 
-            if (!string.IsNullOrWhiteSpace(runHeadSha) &&
-                !string.IsNullOrWhiteSpace(fullPr.Head?.Sha) &&
-                !string.Equals(runHeadSha, fullPr.Head.Sha, StringComparison.OrdinalIgnoreCase))
+            var resolvedPrs = await _prInventoryGateway.FindOpenPullRequestsByHeadShaAsync(
+                owner,
+                repo,
+                headOwner,
+                headBranch,
+                runHeadSha,
+                cancellationToken);
+
+            foreach (var resolvedPr in resolvedPrs)
+            {
+                validPrs.Add(resolvedPr);
+            }
+
+            if (validPrs.Count > 0)
             {
                 _logger?.LogInformation(
-                    "Workflow run {RunId} head SHA '{RunHeadSha}' does not match PR #{PrNumber} current HEAD '{PrHeadSha}'; skipping outdated run to prevent stale overwrite",
-                    runId, runHeadSha, prNumber, fullPr.Head.Sha);
-                continue;
+                    "Resolved {Count} open PR(s) via head SHA fallback for workflow run {RunId} (event={Event}, head={HeadOwner}:{HeadBranch}@{HeadSha})",
+                    validPrs.Count, runId, runEvent ?? "<unknown>", headOwner ?? "<unknown>", headBranch ?? "<unknown>", runHeadSha);
             }
-
-            validPrs.Add(fullPr);
+            else
+            {
+                _logger?.LogWarning(
+                    "Workflow run {RunId} (event={Event}, head={HeadOwner}:{HeadBranch}@{HeadSha}) had empty pull_requests and matched no open PR in {Owner}/{Repo}; skipping ABI analysis",
+                    runId, runEvent ?? "<unknown>", headOwner ?? "<unknown>", headBranch ?? "<unknown>", runHeadSha, owner, repo);
+                return;
+            }
         }
 
         if (validPrs.Count == 0)
@@ -527,12 +626,14 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
                     }
                 }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger?.LogWarning(ex, "Failed to perform ABI diff analysis for run {RunId} in {Owner}/{Repo}", runId, owner, repo);
             }
         }
 
+        List<Exception>? transientFailures = null;
+        List<Exception>? nonRetriableFailures = null;
         foreach (var pr in validPrs)
         {
             var prNumber = pr.Number;
@@ -561,12 +662,46 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
                     var context = PullRequestContext.FromWorkflowRun(_github, teamName, owner, repo, currentPr, abiResult, headers, _fileCache, cancellationToken);
                     await _pipeline.ExecuteAsync(context, cancellationToken);
                 }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (TransientErrorPolicy.IsNonRetriable(ex))
+                {
+                    _logger?.LogError(ex, "Non-retriable failure processing workflow run for PR #{PrNumber} in {Owner}/{Repo}",
+                        prNumber, owner, repo);
+                    nonRetriableFailures ??= new List<Exception>();
+                    nonRetriableFailures.Add(ex);
+                }
                 catch (Exception ex)
                 {
-                    _logger?.LogError(ex, "Failed to process workflow run for PR #{PrNumber} in {Owner}/{Repo}",
+                    _logger?.LogError(ex, "Transient failure processing workflow run for PR #{PrNumber} in {Owner}/{Repo}; will propagate for retry.",
                         prNumber, owner, repo);
+                    transientFailures ??= new List<Exception>();
+                    transientFailures.Add(ex);
                 }
             }
+        }
+
+        if (transientFailures is { Count: 1 })
+        {
+            ExceptionDispatchInfo.Capture(transientFailures[0]).Throw();
+        }
+        else if (transientFailures is { Count: > 1 })
+        {
+            throw new AggregateException(
+                $"One or more pull requests encountered transient errors while processing workflow run {runId} in {owner}/{repo}.",
+                transientFailures);
+        }
+        else if (nonRetriableFailures is { Count: 1 })
+        {
+            ExceptionDispatchInfo.Capture(nonRetriableFailures[0]).Throw();
+        }
+        else if (nonRetriableFailures is { Count: > 1 })
+        {
+            throw new AggregateException(
+                $"One or more pull requests encountered non-retriable errors while processing workflow run {runId} in {owner}/{repo}.",
+                nonRetriableFailures);
         }
     }
 

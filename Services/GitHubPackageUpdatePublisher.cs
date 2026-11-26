@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text.RegularExpressions;
 using abaci_bot.Options;
 using Microsoft.Extensions.Logging;
@@ -18,6 +19,7 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         RegexOptions.Compiled | RegexOptions.Multiline | RegexOptions.IgnoreCase);
 
     private readonly IGitHubService _gitHubService;
+    private readonly IOptimisticFileContentGateway _optimisticFileGateway;
     private readonly PackageUpdateOptions _options;
     private readonly IBotIdentityProvider? _botIdentity;
     private readonly ILocaleResolver? _localeResolver;
@@ -30,9 +32,15 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         ILogger<GitHubPackageUpdatePublisher>? logger = null,
         IBotIdentityProvider? botIdentity = null,
         ILocaleResolver? localeResolver = null,
-        IEnumerable<ISpecVersionRewriter>? specRewriters = null)
+        IEnumerable<ISpecVersionRewriter>? specRewriters = null,
+        IOptimisticFileContentGateway? optimisticFileGateway = null)
     {
-        _gitHubService = gitHubService;
+        _gitHubService = gitHubService ?? throw new ArgumentNullException(nameof(gitHubService));
+        _optimisticFileGateway = optimisticFileGateway
+            ?? gitHubService as IOptimisticFileContentGateway
+            ?? throw new ArgumentException(
+                "IGitHubService must implement IOptimisticFileContentGateway or an explicit optimisticFileGateway must be provided.",
+                nameof(optimisticFileGateway));
         _options = options.Value;
         _logger = logger;
         _botIdentity = botIdentity ?? gitHubService as IBotIdentityProvider;
@@ -89,6 +97,7 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         var effectiveContent = rewriteResult.UpdatedContent;
         var effectiveCandidate = candidate;
         var needsBranchCommit = true;
+        string? targetBranchBlobSha = null;
 
         var existingBranchSha = await _gitHubService.GetRefShaAsync(owner, repo, branchName, ct);
         var existingPr = await _gitHubService.FindOpenPullRequestByHeadAsync(owner, repo, branchName, ct);
@@ -166,7 +175,16 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
             var branchAlreadyAtTarget = false;
             try
             {
-                branchSpecContent = await _gitHubService.GetFileContentAsync(owner, repo, finalSpecPath, branchName, ct);
+                var branchFile = await _optimisticFileGateway.GetFileContentWithShaAsync(owner, repo, finalSpecPath, branchName, ct);
+                if (branchFile == null || string.IsNullOrWhiteSpace(branchFile.BlobSha))
+                {
+                    _logger?.LogWarning("Could not retrieve blob SHA for existing SPEC {SpecPath} on branch {Branch}; failing closed",
+                        finalSpecPath, branchName);
+                    return new PublishResult(false, false, $"Failed to resolve blob SHA on branch '{branchName}' (fail-closed)");
+                }
+
+                branchSpecContent = branchFile.Content;
+                targetBranchBlobSha = branchFile.BlobSha;
                 if (UpdateAdmission.IsVersionAtTarget(branchSpecContent, candidate.TargetVersion))
                 {
                     if (existingPr != null)
@@ -226,6 +244,7 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
             }
             effectiveContent = baseCheck.EffectiveContent;
             effectiveCandidate = baseCheck.EffectiveCandidate;
+            targetBranchBlobSha = baseCheck.BaseBlobSha;
 
             if (!_options.DryRun)
             {
@@ -259,9 +278,30 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
                 }
             }
 
-            // Commit updated SPEC to branch
-            await _gitHubService.UpdateFileContentAsync(
-                owner, repo, finalSpecPath, commitMessage, effectiveContent, branchName, ct);
+            // Commit updated SPEC to branch using mandatory optimistic CAS
+            if (string.IsNullOrWhiteSpace(targetBranchBlobSha))
+            {
+                _logger?.LogWarning("Expected blob SHA missing before committing SPEC {SpecPath} on branch {Branch}; failing closed",
+                    finalSpecPath, branchName);
+                return new PublishResult(false, false, $"Missing expected blob SHA for branch '{branchName}' (fail-closed)");
+            }
+
+            try
+            {
+                await _optimisticFileGateway.UpdateFileContentIfUnchangedAsync(
+                    owner, repo, finalSpecPath, commitMessage, effectiveContent, branchName, targetBranchBlobSha, ct);
+            }
+            catch (ApiException ex) when (ex.StatusCode is HttpStatusCode.Conflict or HttpStatusCode.UnprocessableEntity)
+            {
+                _logger?.LogWarning(
+                    ex,
+                    "Optimistic concurrency conflict updating {SpecPath} on branch {Branch} (expectedBlobSha={ExpectedSha}); failing closed",
+                    finalSpecPath, branchName, targetBranchBlobSha);
+                return new PublishResult(
+                    false,
+                    false,
+                    $"SPEC file '{finalSpecPath}' changed concurrently on branch '{branchName}' (optimistic concurrency conflict)");
+            }
         }
 
         var requiredLabels = GetRequiredLabels(effectiveCandidate);
@@ -296,7 +336,7 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         return new PublishResult(true, false, null, pr.Number, pr.HtmlUrl);
     }
 
-    private async Task<(PublishResult? AbortResult, string EffectiveContent, UpdateCandidate EffectiveCandidate)> VerifyLiveBaseSpecAsync(
+    private async Task<(PublishResult? AbortResult, string EffectiveContent, UpdateCandidate EffectiveCandidate, string? BaseBlobSha)> VerifyLiveBaseSpecAsync(
         string owner,
         string repo,
         string finalSpecPath,
@@ -306,22 +346,25 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         CancellationToken ct)
     {
         string? liveBaseSpec;
+        string? liveBaseBlobSha = null;
         try
         {
-            liveBaseSpec = await _gitHubService.GetFileContentAsync(owner, repo, finalSpecPath, baseRefOrSha, ct);
+            var liveFile = await _optimisticFileGateway.GetFileContentWithShaAsync(owner, repo, finalSpecPath, baseRefOrSha, ct);
+            liveBaseSpec = liveFile?.Content;
+            liveBaseBlobSha = liveFile?.BlobSha;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger?.LogWarning(ex, "Could not read live base SPEC {SpecPath} at {BaseRef}; failing closed", finalSpecPath, baseRefOrSha);
             return (new PublishResult(false, false, $"Failed to read live base spec at '{baseRefOrSha}' (fail-closed)"),
-                rewriteResult.UpdatedContent, candidate);
+                rewriteResult.UpdatedContent, candidate, null);
         }
 
         if (string.IsNullOrWhiteSpace(liveBaseSpec))
         {
             _logger?.LogWarning("Live base SPEC {SpecPath} at {BaseRef} is empty or missing; failing closed", finalSpecPath, baseRefOrSha);
             return (new PublishResult(false, false, $"Live base SPEC '{finalSpecPath}' at '{baseRefOrSha}' is empty or missing (fail-closed)"),
-                rewriteResult.UpdatedContent, candidate);
+                rewriteResult.UpdatedContent, candidate, null);
         }
 
         if (NoAutoUpdateMarker.HasNoAutoUpdate(liveBaseSpec, out var liveNoAutoReason))
@@ -330,7 +373,7 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
                 "Live base SPEC {SpecPath} at {BaseRef} contains #!NoAutoUpdate ({Reason}); skipping update for {Package}",
                 finalSpecPath, baseRefOrSha, liveNoAutoReason ?? "no reason", candidate.PackageName);
             return (new PublishResult(true, true, "Live base SPEC has #!NoAutoUpdate"),
-                rewriteResult.UpdatedContent, candidate);
+                rewriteResult.UpdatedContent, candidate, null);
         }
 
         if (UpdateAdmission.IsVersionAtOrPastTarget(liveBaseSpec, candidate.TargetVersion))
@@ -339,7 +382,7 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
                 "Live base SPEC {SpecPath} at {BaseRef} is already at or past target version {Version}; skipping update for {Package}",
                 finalSpecPath, baseRefOrSha, candidate.TargetVersion, candidate.PackageName);
             return (new PublishResult(true, true, $"Live base SPEC already at or past target version {candidate.TargetVersion}"),
-                rewriteResult.UpdatedContent, candidate);
+                rewriteResult.UpdatedContent, candidate, null);
         }
 
         if (_options.SkipPackagesWithPatches && PatchDirectiveRegex.IsMatch(liveBaseSpec))
@@ -348,7 +391,7 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
                 "Live base SPEC {SpecPath} at {BaseRef} contains downstream Patch directives and SkipPackagesWithPatches=true; skipping {Package}",
                 finalSpecPath, baseRefOrSha, candidate.PackageName);
             return (new PublishResult(true, true, "Live base SPEC contains Patch directives and SkipPackagesWithPatches=true"),
-                rewriteResult.UpdatedContent, candidate);
+                rewriteResult.UpdatedContent, candidate, null);
         }
 
         var effectiveCandidate = UpdateAdmission.TryExtractCurrentVersion(liveBaseSpec, out var liveVersion)
@@ -362,14 +405,14 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
                 "Live base SPEC {SpecPath} at {BaseRef} would cross major version boundary ({Current} -> {Target}); skipping {Package}",
                 finalSpecPath, baseRefOrSha, effectiveCandidate.CurrentVersion, effectiveCandidate.TargetVersion, effectiveCandidate.PackageName);
             return (new PublishResult(true, true, "Live base SPEC crosses major version boundary and AllowCrossMajorVersion=false"),
-                rewriteResult.UpdatedContent, effectiveCandidate);
+                rewriteResult.UpdatedContent, effectiveCandidate, null);
         }
 
         if (_specRewriters.Count == 0)
         {
             _logger?.LogWarning("No spec rewriters configured to re-rewrite live base SPEC {SpecPath}; failing closed", finalSpecPath);
             return (new PublishResult(false, false, "No spec rewriters configured to re-rewrite live base SPEC (fail-closed)"),
-                rewriteResult.UpdatedContent, effectiveCandidate);
+                rewriteResult.UpdatedContent, effectiveCandidate, null);
         }
 
         var normalizedDir = Path.GetDirectoryName(finalSpecPath.Replace('\\', '/'))?.Replace('\\', '/');
@@ -381,7 +424,7 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         if (rewriter == null)
         {
             return (new PublishResult(true, true, "Live base SPEC has no compatible automated rewriter"),
-                rewriteResult.UpdatedContent, effectiveCandidate);
+                rewriteResult.UpdatedContent, effectiveCandidate, null);
         }
 
         var liveRewrite = rewriter.Rewrite(liveContext, effectiveCandidate.TargetVersion);
@@ -389,10 +432,10 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
         {
             return (new PublishResult(true, true,
                     $"Live base SPEC rewrite produced no change or failed: {liveRewrite.ErrorMessage ?? "no-op"}"),
-                rewriteResult.UpdatedContent, effectiveCandidate);
+                rewriteResult.UpdatedContent, effectiveCandidate, null);
         }
 
-        return (null, liveRewrite.UpdatedContent, effectiveCandidate);
+        return (null, liveRewrite.UpdatedContent, effectiveCandidate, liveBaseBlobSha);
     }
 
     internal static string[] GetRequiredLabels(UpdateCandidate candidate)

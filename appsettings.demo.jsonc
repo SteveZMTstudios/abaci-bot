@@ -1,187 +1,302 @@
 /*
- * Reference configuration for abaci-bot.
+ * abaci-bot full reference configuration (appsettings.demo.jsonc).
  *
- * Comment convention used in this file:
- *   - whole-line comments only; no trailing comments after a value
- *   - every setting states its unit or format, allowed range, default, and what
- *     happens when it is empty, zero, false, or null
- *   - "Defaults source" names the Options class (or startup code) that owns the default
+ * Generated deterministically from Options/*Options.cs ([ConfigField] metadata)
+ * and Services/ConfigSchemaCatalog.cs. Do not hand-edit this file; update the
+ * metadata source and regenerate with:
+ *   PowerShell: $env:UPDATE_DEMO_CONFIG='1'; dotnet test --filter GeneratedDemo_MatchesRepositoryFile; Remove-Item Env:UPDATE_DEMO_CONFIG
+ *   POSIX:      UPDATE_DEMO_CONFIG=1 dotnet test --filter GeneratedDemo_MatchesRepositoryFile
  *
- * Copy this file to appsettings.json before deployment, then replace the
- * placeholder credentials and any deployment-specific values.
+ * Production appsettings.json should remain minimal and override only settings that
+ * differ from code defaults. Replace placeholders in GitHubApp before startup,
+ * and store secrets (PrivateKey, WebhookSecret) in environment variables or a
+ * secret manager.
  */
-
 {
-  // ==============================================================================
-  // GitHub App authentication
-  // Defaults source: none of these values has a code default; Program.cs validates
-  // them at startup and exits with a configuration error when any is missing.
-  // ==============================================================================
+  // =========================================================================
+  // GitHubApp -- GitHub App identity and webhook authentication
+  // Defaults source: none (validated by Program.cs at startup; no code defaults)
+  // =========================================================================
   "GitHubApp": {
-    // Format: positive integer.
-    // Missing or 0: startup aborts.
-    // Required: no default.
+    // GitHub App numeric application ID.
+    // Format: positive GitHub App integer ID.
+    // Range: >= 1.
+    // Empty/0/null: missing or 0 causes startup abort.
+    // Required: true (no code default; placeholder shown below).
     "AppId": 123456,
-    // Format: positive integer.
-    // Missing or 0: startup aborts. Environment override GitHubApp__InstallationId
-    // takes precedence and is the usual way to repoint an existing install.
-    // Required: no default.
+
+    // GitHub App installation ID for the target repository or organization.
+    // Format: positive GitHub App installation ID.
+    // Range: >= 1.
+    // Empty/0/null: missing or 0 causes startup abort; environment override GitHubApp__InstallationId takes precedence.
+    // Required: true (no code default; placeholder shown below).
     "InstallationId": 78901234,
-    // Format: PEM-encoded RSA private key. Literal "\n" sequences are converted to
-    // newlines at startup.
-    // Missing or unparsable: startup aborts.
-    // Required: no default.
+
+    // GitHub App RSA private key used to sign installation access tokens.
+    // Format: PEM-encoded RSA private key (literal "\n" sequences are converted to newlines at startup).
+    // Secret: provide via environment variables or a secret manager rather than committing real credentials.
+    // Multiline: encode embedded line breaks as literal \n sequences inside the JSON string.
+    // Empty/0/null: missing or unparsable value aborts startup.
+    // Required: true (no code default; placeholder shown below).
     "PrivateKey": "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----",
+
+    // Shared HMAC secret used to verify incoming GitHub webhook payloads.
     // Format: the secret configured on the GitHub App webhook.
-    // Missing: startup aborts. Wrong value: every delivery is rejected with 400.
-    // Required: no default.
+    // Secret: provide via environment variables or a secret manager rather than committing real credentials.
+    // Empty/0/null: missing aborts startup; wrong value rejects every webhook delivery with HTTP 400.
+    // Required: true (no code default; placeholder shown below).
     "WebhookSecret": "webhook_secret",
+
+    // GitHub organization team slug whose members hold captain privileges.
     // Format: organization team slug.
-    // Missing: startup aborts. Unknown team: captain-only transitions fail.
-    // Required: no default.
+    // Empty/0/null: missing aborts startup; unknown team causes captain-only transitions to fail.
+    // Required: true (no code default; placeholder shown below).
     "TeamName": "captains"
   },
 
-  // ==============================================================================
-  // Kestrel listener
-  // Defaults source: ASP.NET Core defaults, overridden by ASPNETCORE_HTTP_PORTS and
-  // the Docker image (port 3456).
-  // ==============================================================================
+  // =========================================================================
+  // Kestrel -- HTTP server (Kestrel)
+  // Defaults source: ASP.NET Core defaults, overridden by ASPNETCORE_HTTP_PORTS and the Docker image (port 3456)
+  // =========================================================================
   "Kestrel": {
+    // Named Kestrel endpoint bindings.
     "Endpoints": {
+      // Primary HTTP webhook listener endpoint.
       "Http": {
+        // Listening URL bound by Kestrel for webhook HTTP traffic.
         // Format: scheme://host:port.
-        // 0.0.0.0 is reachable through a container port mapping; 127.0.0.1 is
-        // loopback-only and will not be reachable from outside the container.
-        // Default: http://0.0.0.0:3456 in the container.
+        // Empty/0/null: 0.0.0.0 is reachable through container port mapping; 127.0.0.1 is loopback-only. Defaults to http://0.0.0.0:3456 in container.
+        // Default: "http://0.0.0.0:3456"
         "Url": "http://0.0.0.0:3456"
       }
     }
   },
 
-  // ==============================================================================
-  // Target branch classification
+  // =========================================================================
+  // TargetClassification -- Target branch classification
   // Defaults source: Options/TargetClassificationOptions.cs
-  // ==============================================================================
+  // =========================================================================
   "TargetClassification": {
-    // Format: repository names ("owner/repo" or bare name).
-    // Empty: LTS is decided only by LtsBranchPrefixes.
-    // Default: [] (no dedicated LTS repository).
+    // Optional repositories dedicated exclusively to LTS releases.
+    // Format: repository names ("owner/repo" or bare repository name).
+    // Empty/0/null: LTS classification is decided solely by LtsBranchPrefixes.
+    // Example: ["openRuyi-LTS"]
+    // Default: []
     "LtsRepositories": [],
+
+    // Base branch name prefixes indicating LTS tracking.
     // Format: branch name prefixes.
-    // Empty: no branch is classified as LTS by prefix.
-    // Default: ["lts/", "lts-"].
-    "LtsBranchPrefixes": [ "lts/", "lts-" ],
+    // Empty/0/null: no branch is classified as LTS by prefix.
+    // Example: ["lts/", "lts-"]
+    // Default: ["lts/", "lts-"]
+    "LtsBranchPrefixes": [
+      "lts/",
+      "lts-"
+    ],
+
+    // Exact base branch names representing the standard Rolling track.
     // Format: exact base branch names.
-    // Empty: no branch is explicitly Rolling; DefaultTarget applies.
-    // Default: ["main", "master", "rolling"].
-    "RollingBranches": [ "main", "master", "rolling" ],
+    // Empty/0/null: no branch is explicitly Rolling; DefaultTarget applies.
+    // Example: ["main", "master", "rolling"]
+    // Default: ["main", "master", "rolling"]
+    "RollingBranches": [
+      "main",
+      "master",
+      "rolling"
+    ],
+
+    // Fallback target classification when a base branch matches neither RollingBranches nor LtsBranchPrefixes.
     // Allowed values: "Rolling", "LTS", or null.
-    // Null or unrecognized: an unmatched branch receives no Target label.
-    // Default: "Rolling".
+    // Empty/0/null: null or unrecognized values leave unmatched branches without a Target label.
+    // Default: "Rolling"
     "DefaultTarget": "Rolling"
   },
 
-  // ==============================================================================
-  // Change type classification
+  // =========================================================================
+  // ChangeTypeClassification -- Change type classification
   // Defaults source: Options/ChangeTypeClassificationOptions.cs
-  // ==============================================================================
+  // =========================================================================
   "ChangeTypeClassification": {
+    // File extensions recognized as purely documentation.
     // Format: file extensions including the leading dot.
-    // Empty: extension-based documentation detection is disabled.
-    // Default: [".md", ".txt", ".rst"].
-    "DocumentationExtensions": [ ".md", ".txt", ".rst" ],
+    // Empty/0/null: extension-based documentation detection is disabled.
+    // Example: [".md", ".txt", ".rst"]
+    // Default: [".md", ".txt", ".rst"]
+    "DocumentationExtensions": [
+      ".md",
+      ".txt",
+      ".rst"
+    ],
+
+    // Directory prefixes recognized as documentation directories.
     // Format: directory prefixes including the trailing slash.
-    // Empty: directory-based documentation detection is disabled.
-    // Default: ["docs/", "doc/"].
-    "DocumentationDirectories": [ "docs/", "doc/" ],
+    // Empty/0/null: directory-based documentation detection is disabled.
+    // Example: ["docs/", "doc/"]
+    // Default: ["docs/", "doc/"]
+    "DocumentationDirectories": [
+      "docs/",
+      "doc/"
+    ],
+
+    // File extensions recognized as RPM packaging changes.
     // Format: file extensions including the leading dot.
-    // Empty: extension-based packaging detection is disabled.
-    // Default: [".spec", ".patch", ".diff"].
-    "PackagingExtensions": [ ".spec", ".patch", ".diff" ],
+    // Empty/0/null: extension-based packaging detection is disabled.
+    // Example: [".spec", ".patch", ".diff"]
+    // Default: [".spec", ".patch", ".diff"]
+    "PackagingExtensions": [
+      ".spec",
+      ".patch",
+      ".diff"
+    ],
+
+    // Directory prefixes recognized as RPM packaging areas.
     // Format: directory prefixes including the trailing slash.
-    // Empty: directory-based packaging detection is disabled.
-    // Default: ["SPECS/", "SOURCES/"].
-    "PackagingDirectories": [ "SPECS/", "SOURCES/" ],
+    // Empty/0/null: directory-based packaging detection is disabled.
+    // Example: ["SPECS/", "SOURCES/"]
+    // Default: ["SPECS/", "SOURCES/"]
+    "PackagingDirectories": [
+      "SPECS/",
+      "SOURCES/"
+    ],
+
+    // File extensions recognized as frontend code (evaluated only for HomepageRepositories).
     // Format: file extensions including the leading dot.
-    // Only evaluated for repositories in HomepageRepositories.
-    // Empty: Type: Frontend is never applied.
-    // Default: the extension list below.
-    "FrontendExtensions": [ ".vue", ".ts", ".js", ".jsx", ".tsx", ".html", ".css", ".scss", ".less" ],
+    // Empty/0/null: Type: Frontend is never applied.
+    // Example: [".vue", ".ts", ".js"]
+    // Default: [".vue", ".ts", ".js", ".jsx", ".tsx", ".html", ".css", ".scss", ".less"]
+    "FrontendExtensions": [
+      ".vue",
+      ".ts",
+      ".js",
+      ".jsx",
+      ".tsx",
+      ".html",
+      ".css",
+      ".scss",
+      ".less"
+    ],
+
+    // Repository names using the package strategy (others fall back to documentation/CI heuristics).
     // Format: repository names.
-    // Empty: no repository uses the package strategy; unlisted repositories fall
-    // back to the generic strategy (documentation/CI heuristics).
-    // Default: ["openRuyi"].
-    "PackageRepositories": [ "openRuyi" ],
+    // Empty/0/null: no repository uses the package strategy; unlisted repositories use the generic strategy.
+    // Example: ["openRuyi"]
+    // Default: ["openRuyi"]
+    "PackageRepositories": [
+      "openRuyi"
+    ],
+
+    // Repository names using frontend change-type detection rules.
     // Format: repository names.
-    // Empty: frontend rules never apply to any repository.
-    // Default: ["homepage"].
-    "HomepageRepositories": [ "homepage" ]
+    // Empty/0/null: frontend rules never apply to any repository.
+    // Example: ["homepage"]
+    // Default: ["homepage"]
+    "HomepageRepositories": [
+      "homepage"
+    ]
   },
 
-  // ==============================================================================
-  // Stale lifecycle worker
+  // =========================================================================
+  // StaleLifecycle -- Stale lifecycle worker
   // Defaults source: Options/StaleLifecycleOptions.cs
   // Bounds checked by: Options/StaleLifecycleOptionsValidator.cs
-  // ==============================================================================
+  // =========================================================================
   "StaleLifecycle": {
-    // Default: false.
-    // false: the worker logs that it is disabled and performs no scans;
+    // Master toggle for the background stale management worker.
     // true: sweeps every CheckIntervalHours.
+    // false: the worker logs that it is disabled and performs no scans.
+    // Default: false
     "Enabled": false,
-    // Default: true.
-    // true: candidates are only logged; false: labels, comments, and closes are applied.
+
+    // Safety dry-run switch preventing live GitHub writes.
+    // true: candidates are only logged without mutating GitHub.
+    // false: stale labels, comments, and closures are applied to GitHub.
+    // Default: true
     "DryRun": true,
+
+    // Repositories monitored for stale lifecycle sweeps.
     // Format: "owner/repo" entries.
-    // Empty: no repository is scanned, so the worker is effectively idle.
-    // Default: [] (no repository is scanned).
+    // Empty/0/null: no repository is scanned, so the worker is effectively idle.
+    // Example: ["openRuyi-Project/openRuyi"]
+    // Default: []
     "MonitoredRepositories": [],
+
+    // Repositories explicitly excluded from stale management (takes precedence over MonitoredRepositories).
     // Format: "owner/repo" entries.
-    // Empty: nothing is excluded; entries here win over MonitoredRepositories.
-    // Default: [] (nothing is excluded).
+    // Empty/0/null: nothing is excluded; entries here win over MonitoredRepositories.
+    // Example: ["openRuyi-Project/archive-repo"]
+    // Default: []
     "ExcludedRepositories": [],
-    // Unit: days. Range: > 0. Default: 30.
-    // Only used when Enabled=true and DryRun=false.
+
+    // Inactive days before an issue or PR is marked with Status: Stale (only used when Enabled=true and DryRun=false).
+    // Unit: days.
+    // Range: > 0.
+    // Empty/0/null: values <= 0 are rejected by startup validation.
+    // Default: 30
     "StaleDays": 30,
-    // Unit: days. Range: > 0. Default: 7.
-    // Only used after Status: Stale was applied; the stale comment anchors the timer.
+
+    // Grace period in days after Status: Stale before automatic closure (anchored by the stale comment).
+    // Unit: days.
+    // Range: > 0.
+    // Empty/0/null: values <= 0 are rejected by startup validation.
+    // Default: 7
     "CloseDays": 7,
-    // Default: Status: stale-exempt, Workflow: Blocked, Security, Epic.
-    // Empty: no label protects an item from stale processing.
+
+    // Labels that exempt an issue or PR from stale marking and closure.
+    // Format: GitHub label names.
+    // Empty/0/null: no label protects an item from stale processing.
+    // Example: ["Status: stale-exempt", "Workflow: Blocked"]
+    // Default: ["Status: stale-exempt", "Workflow: Blocked", "Security", "Epic"]
     "ExemptLabels": [
       "Status: stale-exempt",
       "Workflow: Blocked",
       "Security",
       "Epic"
     ],
-    // Placeholders: {StaleDays}, {CloseDays}.
-    // Empty: the built-in default message is posted.
-    // Default: the built-in message in Options/StaleLifecycleOptions.cs.
+
+    // Comment template posted when an issue or PR is marked with Status: Stale.
+    // Format: Markdown text supporting {StaleDays} and {CloseDays} placeholders.
+    // Empty/0/null: the built-in default stale notification message is posted.
+    // Default: "This issue or pull request has been automatically marked as stale because it has not had recent activity within the last {StaleDays} days. It will be closed in {CloseDays} days if no further activity occurs. If this is still relevant, please comment or push a commit to keep it active. Thank you for your contributions!"
     "StaleCommentTemplate": "This issue or pull request has been automatically marked as stale because it has not had recent activity within the last {StaleDays} days. It will be closed in {CloseDays} days if no further activity occurs. If this is still relevant, please comment or push a commit to keep it active. Thank you for your contributions!",
-    // Placeholders: {CloseDays}.
-    // Empty: the built-in default message is posted.
-    // Default: the built-in message in Options/StaleLifecycleOptions.cs.
+
+    // Comment template posted when a stale issue or PR is automatically closed.
+    // Format: Markdown text supporting the {CloseDays} placeholder.
+    // Empty/0/null: the built-in default close notification message is posted.
+    // Default: "This issue or pull request was closed because it has been stalled for over {CloseDays} days with no activity after being marked as stale. Feel free to reopen it or file a new one if you would like to continue the work."
     "CloseCommentTemplate": "This issue or pull request was closed because it has been stalled for over {CloseDays} days with no activity after being marked as stale. Feel free to reopen it or file a new one if you would like to continue the work.",
-    // Unit: hours. Range: > 0. Default: 24.
-    // Controls how often an enabled worker starts a new sweep.
+
+    // Execution interval controlling how often an enabled worker starts a new sweep.
+    // Unit: hours.
+    // Range: > 0.
+    // Empty/0/null: values <= 0 are rejected by startup validation.
+    // Default: 24
     "CheckIntervalHours": 24,
-    // Unit: milliseconds. Range: >= 0. Default: 500.
-    // 0: no delay between GitHub API calls.
+
+    // Delay inserted between individual GitHub API candidate operations to prevent burst throttling.
+    // Unit: milliseconds.
+    // Range: >= 0.
+    // Empty/0/null: 0 means no delay between GitHub API calls.
+    // Default: 500
     "RequestThrottleMilliseconds": 500,
-    // Unit: API requests remaining. Range: >= 0. Default: 100.
-    // 0: the quota gate is disabled and a sweep starts regardless of remaining quota.
+
+    // Minimum remaining GitHub API quota required before starting a stale sweep.
+    // Unit: API requests remaining.
+    // Range: >= 0.
+    // Empty/0/null: 0 disables the quota gate so sweeps start regardless of remaining quota.
+    // Default: 100
     "MinRateLimitRemaining": 100
   },
 
-  // ==============================================================================
-  // Bot detection and triage whitelist
+  // =========================================================================
+  // BotDetection -- Bot detection and triage whitelist
   // Defaults source: Options/BotDetectionOptions.cs
-  // ==============================================================================
+  // =========================================================================
   "BotDetection": {
+    // Explicit GitHub logins or "[bot]" slugs treated as bots when guarding human triage transitions.
     // Format: GitHub logins or "[bot]" slugs.
-    // Empty: only GitHub's own bot markers ("type=Bot" and the "[bot]" suffix) are
-    // recognized; listed accounts no longer suppress triage-label removal.
-    // Default: the accounts listed below.
+    // Empty/0/null: only GitHub's own bot markers ("type=Bot" and the "[bot]" suffix) are recognized; listed accounts no longer suppress triage-label removal.
+    // Example: ["github-actions", "abaci-bot[bot]"]
+    // Default: ["github-actions", "github-actions[bot]", "abaci-bot", "abaci-bot[bot]", "dependabot", "dependabot[bot]"]
     "Whitelist": [
       "github-actions",
       "github-actions[bot]",
@@ -192,438 +307,715 @@
     ]
   },
 
-  // ==============================================================================
-  // SPDX license compliance
+  // =========================================================================
+  // SpdxCompliance -- SPDX license compliance
   // Defaults source: Options/SpdxComplianceOptions.cs
-  // ==============================================================================
+  // =========================================================================
   "SpdxCompliance": {
-    // Default: true.
-    // false: the module is skipped entirely; no spec license validation or label.
+    // Enables or disables the SPDX license compliance scanning module.
+    // true: spec file licenses are validated against the SPDX catalog on PR updates.
+    // false: the module is skipped entirely with no spec license validation or label.
+    // Default: true
     "Enabled": true,
+
+    // Remote URL of the official SPDX licenses JSON index.
     // Format: absolute URL.
-    // Empty: the embedded license list is used and no remote refresh is attempted.
-    // Default: https://spdx.org/licenses/licenses.json.
+    // Empty/0/null: the embedded license list is used and no remote refresh is attempted.
+    // Default: "https://spdx.org/licenses/licenses.json"
     "UpdateRemoteUrl": "https://spdx.org/licenses/licenses.json",
+
+    // Remote URL of the official SPDX exceptions JSON index.
     // Format: absolute URL.
-    // Empty: the embedded exception list is used and no remote refresh is attempted.
-    // Default: https://spdx.org/licenses/exceptions.json.
+    // Empty/0/null: the embedded exception list is used and no remote refresh is attempted.
+    // Default: "https://spdx.org/licenses/exceptions.json"
     "UpdateExceptionsRemoteUrl": "https://spdx.org/licenses/exceptions.json",
-    // Unit: hours. Range: > 0. Default: 24.
-    // 0: periodic refresh is disabled; the last loaded list stays in memory.
+
+    // Periodic background update interval for SPDX data.
+    // Unit: hours.
+    // Range: >= 0.
+    // Empty/0/null: 0 disables periodic refresh; the last loaded list remains in memory.
+    // Default: 24
     "AutoUpdateIntervalHours": 24,
-    // Default: true.
-    // true: known legacy aliases (GPLv2+, ASL 2.0, ...) are accepted;
+
+    // Whether known RPM legacy license aliases (GPLv2+, ASL 2.0, etc.) are accepted.
+    // true: known legacy aliases are accepted as compliant.
     // false: legacy aliases are reported as Compliance: License Issue.
+    // Default: true
     "AllowLegacyAliases": true,
-    // Range: >= 1. Default: 8.
-    // Controls parallel spec evaluation; higher values use more CPU.
+
+    // Maximum concurrency used for parallel spec evaluation.
+    // Unit: concurrent workers.
+    // Range: >= 1.
+    // Empty/0/null: higher values use more CPU; values < 1 restrict parallelism to 1.
+    // Default: 8
     "MaxDegreeOfParallelism": 8
   },
 
-  // ==============================================================================
-  // CVE detection and lifecycle
+  // =========================================================================
+  // CveSecurity -- CVE detection and lifecycle
   // Defaults source: Options/CveSecurityOptions.cs
-  // ==============================================================================
+  // =========================================================================
   "CveSecurity": {
-    // Default: true.
-    // false: the module is skipped; no CVE lookup, severity, or lifecycle label.
+    // Enables or disables the CVE security vulnerability tracking module.
+    // true: PR changes mentioning CVEs are queried and labeled by severity.
+    // false: the module is skipped with no CVE lookup, severity, or lifecycle label.
+    // Default: true
     "Enabled": true,
+
+    // Base URL for the OSV.dev vulnerability lookup API.
     // Format: absolute URL.
-    // Empty: OSV lookup is skipped; the NVD fallback is still attempted.
-    // Default: https://api.osv.dev/v1/vulns/.
+    // Empty/0/null: OSV lookup is skipped while NVD fallback is still attempted.
+    // Default: "https://api.osv.dev/v1/vulns/"
     "OsvApiBaseUrl": "https://api.osv.dev/v1/vulns/",
+
+    // Base URL for the NIST NVD CVE 2.0 API.
     // Format: absolute URL.
-    // Empty: NVD lookup is skipped; only OSV is used.
-    // Default: https://services.nvd.nist.gov/rest/json/cves/2.0.
+    // Empty/0/null: NVD fallback lookup is skipped and only OSV is used.
+    // Default: "https://services.nvd.nist.gov/rest/json/cves/2.0"
     "NvdApiBaseUrl": "https://services.nvd.nist.gov/rest/json/cves/2.0",
+
+    // Optional NIST NVD API key used to increase query rate limits.
     // Format: NVD API key string.
-    // Null or empty: unauthenticated NVD rate limits apply.
-    // Default: null.
+    // Secret: provide via environment variables or a secret manager rather than committing real credentials.
+    // Empty/0/null: null or empty uses unauthenticated NVD rate limits.
+    // Default: null
     "NvdApiKey": null,
-    // Unit: hours. Range: > 0. Default: 12.
-    // 0: resolved CVE records are not cached (higher API usage).
+
+    // In-memory cache duration for confirmed CVE lookup results.
+    // Unit: hours.
+    // Range: >= 0.
+    // Empty/0/null: 0 disables caching of resolved CVE records (higher API usage).
+    // Default: 12
     "CacheExpirationHours": 12,
-    // Unit: hours. Range: > 0. Default: 1.
-    // 0: unknown/unindexed CVEs are not cached.
+
+    // In-memory cache duration for unknown/unindexed CVE records before re-querying.
+    // Unit: hours.
+    // Range: >= 0.
+    // Empty/0/null: 0 prevents caching of unknown/unindexed CVEs.
+    // Default: 1
     "UnknownCacheExpirationHours": 1,
-    // Unit: seconds. Range: > 0. Default: 15.
-    // Applies to each OSV/NVD HTTP request.
+
+    // HTTP request timeout applied to each OSV/NVD request.
+    // Unit: seconds.
+    // Range: > 0.
+    // Default: 15
     "RequestTimeoutSeconds": 15
   },
 
-  // ==============================================================================
-  // Rebuild impact analysis
+  // =========================================================================
+  // RebuildImpact -- Rebuild impact analysis
   // Defaults source: Options/RebuildImpactOptions.cs
-  // ==============================================================================
+  // Bounds checked by: Options/RebuildImpactOptionsValidator.cs
+  // =========================================================================
   "RebuildImpact": {
-    // Default: true.
-    // false: the module is skipped and the background refresh stops unless an ABI
-    // baseline URL is configured.
+    // Enables or disables downstream RPM rebuild impact analysis and merge gating.
+    // true: evaluates affected downstream packages and applies Rebuild:* / Workflow: Blocked gating.
+    // false: the module is skipped and background repodata refresh stops unless an ABI baseline URL is configured.
+    // Default: true
     "Enabled": true,
-    // Format: URL to repomd.xml or to a primary.xml(.gz/.zst) file.
-    // Null: falls back to the repository derived from AbiCompliance:StableRpmBaseUrl;
-    // if neither is set, no dependency graph is loaded and no Rebuild label is applied.
-    // Default: null.
+
+    // Remote URL to repomd.xml or a primary.xml(.gz/.zst) file.
+    // Format: URL to repomd.xml or primary.xml(.gz/.zst).
+    // Empty/0/null: null falls back to the repository derived from AbiCompliance:StableRpmBaseUrl; if neither is set, no dependency graph is loaded and no Rebuild label is applied.
+    // Default: null
     "PrimaryXmlUrl": null,
-    // Format: path to a local primary metadata FILE (.xml or .xml.gz), not a directory.
-    // Null: no local snapshot is read.
-    // Default: null.
+
+    // Path to a local primary metadata FILE (.xml or .xml.gz), not a directory.
+    // Format: file path.
+    // Empty/0/null: null means no local snapshot is read.
+    // Default: null
     "LocalCachePath": null,
-    // Unit: hours. Range: > 0. Default: 6.
-    // Values below 0.1 are clamped to 0.1.
+
+    // Polling interval for refreshing repository repodata (values below 0.1 are clamped to 0.1).
+    // Unit: hours.
+    // Range: > 0.
+    // Default: 6
     "RefreshIntervalHours": 6,
+
+    // Dependency graph traversal mode.
     // Allowed values: "Transitive" (full reverse closure) or "Direct" (immediate dependents).
-    // Default: Transitive.
+    // Default: "Transitive"
     "CalculationMode": "Transitive",
-    // Unit: dependency hops. Range: >= 1 or null.
-    // Null: unlimited depth.
-    // Default: null (unlimited).
+
+    // Maximum recursive traversal depth for transitive closure calculation.
+    // Unit: dependency hops.
+    // Range: >= 1 or null.
+    // Empty/0/null: null enables unlimited traversal depth.
+    // Default: null
     "MaxDepth": null,
-    // Unit: affected packages. Range: >= 0. Default: 1001.
-    // Blocking applies when the affected count is >= this value on TargetBranchToBlock;
-    // 0 blocks every change on that branch.
+
+    // Affected package threshold triggering Workflow: Blocked on TargetBranchToBlock (0 blocks every change).
+    // Unit: affected packages.
+    // Range: >= 0.
+    // Default: 1001
     "BlockThreshold": 1001,
-    // Allowed values: "Rolling" or "LTS". Default: Rolling.
+
+    // Target release branch stream subject to rebuild impact merge blocking.
+    // Allowed values: "Rolling" or "LTS".
+    // Empty/0/null: falls back to "Rolling" when omitted.
+    // Default: "Rolling"
     "TargetBranchToBlock": "Rolling",
-    // Format: array of { "Title", "TitleZh" (optional), "Url" } objects (max 5 unique absolute HTTP/HTTPS URLs).
-    // Interim "See also" reference links appended to manual rebuild verification guidance comments.
-    // Empty: self-contained OBS reverse-dependency guidance is posted without external links.
-    // Default: [].
+
+    // Configured governance reference links rendered once in the consolidated PR review comment header (and deduplicated against rebuild-gate guidance).
+    // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
+    // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
+    // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
+    // Item field Url: Absolute HTTP or HTTPS destination URL; format: absolute http/https URI without whitespace or control characters; required; example: "https://openruyi.org/docs/contributing".
+    // Empty/0/null: no external reference links are rendered in consolidated review comments.
+    // Example: [{ "Title": "Contribution Guide", "TitleZh": "贡献指南", "Url": "https://openruyi.org/docs/contributing" }]
+    // Default: []
     "VerificationGuideLinks": []
   },
 
-  // ==============================================================================
-  // Binary ABI compliance
+  // =========================================================================
+  // AbiCompliance -- Binary ABI compliance
   // Defaults source: Options/AbiComplianceOptions.cs
-  // ==============================================================================
+  // =========================================================================
   "AbiCompliance": {
-    // Default: true.
-    // false: the module is skipped; no workflow_run analysis or Impact label.
+    // Enables or disables binary ABI compliance checking.
+    // true: workflow_run events trigger RPM ABI analysis and apply Impact labels.
+    // false: the module is skipped with no workflow_run analysis or Impact label.
+    // Default: true
     "Enabled": true,
+
+    // Executable name or absolute path for the Libabigail abipkgdiff binary.
     // Format: executable name or absolute path.
-    // Empty or missing: the startup probe fails and the deployment gate decides whether
-    // startup continues.
-    // Default: "abipkgdiff".
+    // Empty/0/null: the startup probe fails and the deployment gate decides whether startup continues.
+    // Default: "abipkgdiff"
     "AbipkgdiffExecutablePath": "abipkgdiff",
-    // Default: true.
+
+    // Enables automatic fallback to the managed C# ELF/RPM symbol diff engine when native abipkgdiff is unavailable.
+    // true: managed fallback may be used when native tools are unavailable and AllowManagedFallback is true.
     // false: the managed engine is never used, even when AllowManagedFallback is true.
+    // Default: true
     "EnableFallback": true,
-    // Default: false.
-    // false: startup aborts when native tools are unavailable; true: the managed
-    // symbol-level engine is permitted.
+
+    // Explicit deployment consent to use managed symbol-level ABI comparison when native abipkgdiff is unavailable.
+    // true: the managed symbol-level engine is permitted.
+    // false: startup aborts when native tools are unavailable.
+    // Default: false
     "AllowManagedFallback": false,
-    // Default: false.
-    // true: startup aborts when native tools are unavailable, ignoring
-    // AllowManagedFallback and the environment/file overrides.
+
+    // Strict native-tool enforcement switch.
+    // true: startup aborts when native tools are unavailable, ignoring AllowManagedFallback and environment/file overrides.
+    // false: AllowManagedFallback and overrides govern fallback permission.
+    // Default: false
     "StrictEngine": false,
+
+    // Workflow name or path substrings authorized to trigger ABI analysis on workflow_run events.
     // Format: workflow name or path substrings.
-    // Empty: built-in defaults build/package/rpm are used.
-    // Default: ["build", "package", "rpm"].
-    "WorkflowNames": [ "build", "package", "rpm" ],
-    // Format: absolute URL to the stable RPM repository root.
-    // Null: no baseline is available, so every check ends as Status: ABI Unverified.
-    // Default: null.
+    // Empty/0/null: built-in defaults build, package, and rpm are used.
+    // Example: ["build", "package", "rpm"]
+    // Default: ["build", "package", "rpm"]
+    "WorkflowNames": [
+      "build",
+      "package",
+      "rpm"
+    ],
+
+    // Absolute base URL of the stable RPM repository root for baseline package lookups.
+    // Format: absolute URL.
+    // Empty/0/null: null disables baseline lookups so every check ends as Status: ABI Unverified.
+    // Default: null
     "StableRpmBaseUrl": null,
+
+    // Working directory used for temporary RPM extraction during ABI comparison.
     // Format: directory path.
-    // Null: the system temporary directory is used.
-    // Default: null.
+    // Empty/0/null: null uses the system temporary directory.
+    // Default: null
     "TempExtractionDirectory": null,
-    // Unit: seconds. Range: > 0. Default: 300.
-    // Applies to a single abipkgdiff invocation.
+
+    // Process timeout applied to a single abipkgdiff invocation.
+    // Unit: seconds.
+    // Range: > 0.
+    // Default: 300
     "TimeoutSeconds": 300,
-    // Unit: bytes. Range: > 0. Default: 1073741824 (1 GiB).
-    // Bounds the uncompressed payload processed by the managed engine; exceeding it
-    // fails the check instead of exhausting memory.
+
+    // Maximum uncompressed payload processed by the managed engine (exceeding it fails the check instead of exhausting memory).
+    // Unit: bytes.
+    // Range: > 0.
+    // Default: 1073741824
     "MaxTotalPayloadBytes": 1073741824
   },
 
-  // ==============================================================================
-  // In-memory file cache
+  // =========================================================================
+  // FileCache -- In-memory file cache
   // Defaults source: Options/FileCacheOptions.cs
-  // ==============================================================================
+  // =========================================================================
   "FileCache": {
-    // Unit: bytes. Range: > 0. Default: 52428800 (50 MiB).
-    // 0: every entry is evicted immediately, effectively disabling the cache.
+    // Maximum total bytes retained in the in-memory Git blob/file content cache before LRU eviction (50 MiB).
+    // Unit: bytes.
+    // Range: >= 0.
+    // Empty/0/null: 0 evicts every entry immediately, effectively disabling the cache.
+    // Default: 52428800
     "MaxSizeBytes": 52428800
   },
 
-  // ==============================================================================
-  // PackageUpdateOptions: automated upstream package update background service
-  // Discovers upstream releases from Lookout and crates.io, admits safe updates,
-  // rewrites SPEC files, backfills CI checksums, and publishes automated PRs.
-  // ==============================================================================
+  // =========================================================================
+  // PackageUpdate -- Automated upstream package update background service
+  // Defaults source: Options/PackageUpdateOptions.cs
+  // Bounds checked by: Options/PackageUpdateOptionsValidator.cs
+  // =========================================================================
   "PackageUpdate": {
-    // Default: false.
-    // false: no update sweeps; true: sweep every CheckIntervalHours.
+    // Master toggle for the automated upstream package update background worker.
+    // true: runs package discovery and PR update sweeps every CheckIntervalHours.
+    // false: no package update sweeps are performed.
+    // Default: false
     "Enabled": false,
-    // Default: true.
-    // true: discover candidates and prepare plans without pushing branches or opening PRs.
+
+    // Safety dry-run switch for package updates.
+    // true: discovers candidates and prepares update plans without pushing branches or opening PRs.
+    // false: creates branches, commits SPEC rewrites, and opens/updates PRs on GitHub.
+    // Default: true
     "DryRun": true,
+
+    // Target repository managed by automated package update sweeps.
     // Format: "owner/repo".
-    // Empty: sweeps are skipped.
-    // Default: "openRuyi-Project/openRuyi".
+    // Empty/0/null: sweeps are skipped.
+    // Default: "openRuyi-Project/openRuyi"
     "TargetRepository": "openRuyi-Project/openRuyi",
-    // Format: fallback GitHub login used only when no live IBotIdentityProvider is resolved (live App slug or BotPat user overrides this at runtime).
-    // Empty: allowed at startup; branch commit ownership, post-merge verification, and bot-triage checks fail closed whenever live identity resolution also fails.
-    // Default: "aqua-rium".
+
+    // Fallback GitHub login used only in BotPat mode when live IBotIdentityProvider lookup fails.
+    // Format: GitHub login username.
+    // Empty/0/null: allowed at startup; ownership and bot-triage checks fail closed if live identity resolution also fails.
+    // Default: "aqua-rium"
     "BotLogin": "aqua-rium",
-    // Format: Personal Access Token string; when set, switches ALL GitHub API calls globally to that PAT user identity.
-    // Allowed scopes when enabled: Contents (Read and write), Pull requests (Read and write), Issues (Read and write), Actions (Read-only), Organization Members (Read-only / classic 'read:org' for team lookup in WorkflowStateModule), plus repository push+ access whenever PackageUpdate runs live (DryRun=false) or ConversationGuard:Enabled=true.
-    // Empty: the GitHub App installation token is used instead (ConversationGuard:ArchiveEnabled=true is disallowed).
-    // Default: empty (the App installation token is used).
+
+    // Optional Personal Access Token switching all GitHub API calls globally to that PAT user identity.
+    // Format: GitHub PAT token string (Contents/Pull requests/Issues RW, Actions R, Org Members R, push+ when live).
+    // Required when: ConversationGuard:ArchiveEnabled=true.
+    // Secret: provide via environment variables or a secret manager rather than committing real credentials.
+    // Empty/0/null: uses the GitHub App installation token instead (ConversationGuard:ArchiveEnabled=true is disallowed).
+    // Default: ""
     "BotPat": "",
+
+    // Branch name prefix applied to automated package update branches.
     // Format: branch name prefix.
-    // Empty: branches are created without a prefix (not recommended).
-    // Default: "autoupdate/".
+    // Empty/0/null: branches are created without a prefix (not recommended).
+    // Default: "autoupdate/"
     "BranchPrefix": "autoupdate/",
-    // Unit: hours. Range: >= 1. Default: 12.
+
+    // Interval between automated package update sweeps.
+    // Unit: hours.
+    // Range: >= 1.
+    // Default: 12
     "CheckIntervalHours": 12,
+
+    // Configuration for the Lookout upstream candidate source.
     "Lookout": {
-      // Default: true.
+      // Enables or disables the Lookout candidate source.
+      // true: queries Lookout for upstream package releases.
       // false: the Lookout candidate source is skipped.
+      // Default: true
       "Enabled": true,
+
+      // Base URL of the Lookout release index service.
       // Format: absolute URL.
-      // Empty: Lookout queries cannot run.
-      // Default: https://lookout.openruyi.cn.
+      // Empty/0/null: Lookout queries cannot run.
+      // Default: "https://lookout.openruyi.cn"
       "BaseUrl": "https://lookout.openruyi.cn",
-      // Unit: hours. Range: > 0. Default: 48.
+
+      // Maximum age before Lookout candidate observations are treated as stale.
+      // Unit: hours.
+      // Range: > 0.
+      // Default: 48
       "StaleThresholdHours": 48,
-      // Format: local file path for persisting Lookout first-observed timestamps across restarts.
-      // Empty: defaults to lookout-first-seen.json under BotState:StateDirectory (/state in Docker Compose, or the local application data directory when unset).
-      // Default: "".
+
+      // Optional local file path for persisting Lookout first-observed timestamps across restarts.
+      // Format: local file path.
+      // Empty/0/null: defaults to lookout-first-seen.json under BotState:StateDirectory (/state or local app data directory).
+      // Default: ""
       "FirstSeenStatePath": ""
     },
+
+    // Configuration for the crates.io sparse-index candidate source.
     "RustCratePoller": {
-      // Default: true.
+      // Enables or disables the crates.io candidate poller.
+      // true: polls crates.io sparse index for Rust crate updates.
       // false: the crates.io candidate source is skipped.
+      // Default: true
       "Enabled": true,
+
+      // Base URL of the crates.io sparse index.
       // Format: absolute URL.
-      // Empty: crates.io queries cannot run.
-      // Default: https://index.crates.io.
+      // Empty/0/null: crates.io queries cannot run.
+      // Default: "https://index.crates.io"
       "IndexBaseUrl": "https://index.crates.io",
-      // Range: >= 1. Default: 60.
+
+      // Maximum crates queried per sweep slice.
+      // Unit: crates.
+      // Range: >= 1.
+      // Default: 60
       "MaxCratesPerSweep": 60,
-      // Unit: milliseconds. Range: >= 0. Default: 300.
+
+      // Delay inserted between crates.io sparse index HTTP requests.
+      // Unit: milliseconds.
+      // Range: >= 0.
+      // Empty/0/null: 0 disables request throttling.
+      // Default: 300
       "RequestDelayMilliseconds": 300
     },
+
+    // Configuration for Open Build Service (OBS) post-merge build verification.
     "Obs": {
+      // Base URL of the Open Build Service (OBS) instance for post-merge verification.
       // Format: absolute URL.
-      // Empty: OBS verification is disabled.
-      // Default: https://build.openruyi.cn.
+      // Empty/0/null: OBS verification is disabled.
+      // Default: "https://build.openruyi.cn"
       "BaseUrl": "https://build.openruyi.cn",
+
+      // OBS project name containing the monitored packages.
       // Format: OBS project name.
-      // Empty: invalid when OBS verification is enabled.
-      // Default: "openruyi".
+      // Empty/0/null: invalid when OBS verification is enabled.
+      // Default: "openruyi"
       "Project": "openruyi",
-      // Format: OBS repository name (not an architecture).
-      // Default: riscv64 (the repository name used by the target OBS project).
+
+      // OBS repository name (not an architecture).
+      // Format: OBS repository name.
+      // Empty/0/null: defaults to riscv64 when left unchanged.
+      // Default: "riscv64"
       "TargetRepository": "riscv64",
-      // Format: architecture filter.
-      // Default: "riscv64".
+
+      // Target OBS build architecture filter.
+      // Format: architecture identifier (e.g. riscv64, x86_64).
+      // Empty/0/null: falls back to standard package architecture filtering.
+      // Default: "riscv64"
       "TargetArch": "riscv64",
-      // Default: false.
-      // true: a Failed, Unresolvable, or Broken post-merge OBS build applies Auto-Update: Blocked.
-      // false: OBS results are reported without applying a label.
+
+      // Controls whether OBS post-merge failures apply Auto-Update: Blocked.
+      // true: a Failed, Unresolvable, or Broken post-merge OBS build applies Auto-Update: Blocked and opens an issue.
+      // false: OBS results are logged/reported without applying Auto-Update: Blocked.
+      // Default: false
       "RequireObsSuccessAfterMerge": false
     },
-    // Default: false.
-    // false: updates crossing a major version boundary (or differing versions whose major component cannot be parsed) are skipped fail-closed.
+
+    // Controls whether automated updates may cross a major version boundary.
+    // true: major version bumps are permitted when passing other admission checks.
+    // false: updates crossing a major version boundary (or with unparsable major components) are skipped fail-closed.
+    // Default: false
     "AllowCrossMajorVersion": false,
-    // Default: true.
+
+    // Controls handling of packages carrying downstream Patch directives.
     // true: packages carrying downstream patch files are skipped.
+    // false: packages with patches may still be considered for automated updates.
+    // Default: true
     "SkipPackagesWithPatches": true,
-    // Range: >= 1. Default: 5.
+
+    // Maximum candidate updates evaluated per sweep cycle.
+    // Unit: candidates.
+    // Range: >= 1.
+    // Default: 5
     "MaxCandidatesPerSweep": 5,
-    // Range: >= 1. Default: 5.
+
+    // Maximum open automated update pull requests allowed concurrently.
+    // Unit: pull requests.
+    // Range: >= 1.
+    // Default: 5
     "MaxConcurrentPullRequests": 5,
-    // Unit: days. Range: 1..363. Default: 7.
-    // Days an inactive pull request with failing CI stays open before auto-closure, and age before unverified merged PR branches are reclaimed.
-    // Coupled OBS lookback window computes Math.Clamp(FailedPrTtlDays + 2, 7, 365); values outside 1..363 fail startup validation.
+
+    // Days an inactive failed PR stays open before auto-closure and lookback age for merged-branch reclamation (values outside 1..363 fail startup validation).
+    // Unit: days.
+    // Range: 1..363.
+    // Default: 7
     "FailedPrTtlDays": 7,
-    // Unit: hours. Range: >= 0. Default: 72.
-    // Minimum age in hours an upstream release (or persisted first observation when the source omits release timestamps) must reach before submission.
-    // 0: disables the stabilization window; candidates are submitted immediately.
-    // Security advisories bypass this stabilization delay.
+
+    // Minimum stabilization age an upstream release must reach before PR submission (security advisories bypass this delay).
+    // Unit: hours.
+    // Range: >= 0.
+    // Empty/0/null: 0 disables the stabilization window so candidates are submitted immediately.
+    // Default: 72
     "CooldownHours": 72,
-    // Range: >= 1. Default: 3.
+
+    // Consecutive failure threshold before giving up on a package and entering cooldown.
+    // Unit: failures.
+    // Range: >= 1.
+    // Default: 3
     "MaxConsecutiveFailures": 3,
-    // Default: true.
+
+    // Whether to file a tracking issue when a package reaches MaxConsecutiveFailures.
     // true: a tracking issue is filed when the failure limit is reached.
+    // false: cooldown is entered silently without filing a tracking issue.
+    // Default: true
     "IssueOnGivingUp": true,
-    // Unit: days. Range: >= 1. Default: 30.
-    // Shared recovery horizon controlling CI give-up cooldown, LastFailureAt decay window, and fallback OBS block cooldown if issue creation fails.
-    // Setting 0 or empty is rejected by options validation.
+
+    // Shared recovery horizon controlling CI give-up cooldown, failure decay, and fallback OBS cooldown (0 or <= 0 fails validation).
+    // Unit: days.
+    // Range: >= 1.
+    // Default: 30
     "GiveUpIssueCooldownDays": 30,
+
+    // Label applied to tracking issues filed after repeated update failures.
     // Format: label name.
-    // Empty: falls back to Status: stale-exempt.
-    // Default: "Status: stale-exempt".
+    // Empty/0/null: falls back to Status: stale-exempt.
+    // Default: "Status: stale-exempt"
     "GiveUpIssueLabel": "Status: stale-exempt",
-    // Unit: requests. Range: >= 0. Default: 500.
-    // When remaining core API quota drops below this value, candidate sweeps pause.
+
+    // Minimum remaining core GitHub API quota required to continue candidate sweeps.
+    // Unit: API requests remaining.
+    // Range: >= 0.
+    // Empty/0/null: 0 disables the API quota floor check.
+    // Default: 500
     "MinRateLimitRemaining": 500,
-    // Unit: milliseconds. Range: >= 0. Default: 2000.
-    // Delay inserted after publishing each update pull request to avoid secondary rate limits.
-    // 0: no delay between publishing candidates.
+
+    // Throttle delay inserted after publishing each update pull request to avoid secondary rate limits.
+    // Unit: milliseconds.
+    // Range: >= 0.
+    // Empty/0/null: 0 disables inter-PR throttling.
+    // Default: 2000
     "RequestThrottleMilliseconds": 2000,
-    // Unit: bytes. Range: >= 0. Default: 104857600 (100 MiB).
-    // Maximum compressed repository tarball size accepted via HTTP Content-Length pre-check and bounded streaming read before aborting and falling back to Git Tree API (individual and cumulative decompressed .spec entries are separately capped at 4 MiB per file and 256 MiB total).
-    // 0: disables the compressed archive size cap and streams any compressed archive size.
+
+    // Max compressed tarball bytes accepted before falling back to Git Tree API (decompressed .spec entries stay capped at 4 MiB / 256 MiB).
+    // Unit: bytes.
+    // Range: >= 0.
+    // Empty/0/null: 0 disables the compressed archive cap and streams any compressed archive size.
+    // Default: 104857600
     "MaxArchiveBytes": 104857600
   },
 
-  // ==============================================================================
-  // CveActiveWatchOptions: active repository-wide CVE vulnerability watch service
-  // Periodically scans authoritative-ecosystem distribution packages (and optionally
-  // best-effort native RPMs) against OSV.dev and NIST NVD, files prioritized security
-  // tracking issues, and closes resolved issues.
-  // ==============================================================================
+  // =========================================================================
+  // CveActiveWatch -- Active repository-wide CVE vulnerability watch service
+  // Defaults source: Options/CveActiveWatchOptions.cs
+  // Bounds checked by: Options/CveActiveWatchOptionsValidator.cs
+  // =========================================================================
   "CveActiveWatch": {
-    // Default: false.
-    // false: no proactive scans; true: scan every CheckIntervalHours.
+    // Master toggle for the active CVE vulnerability watch background worker.
+    // true: scans catalog packages every CheckIntervalHours.
+    // false: no proactive CVE scans are executed.
+    // Default: false
     "Enabled": false,
-    // Default: true.
-    // true: findings are logged without creating or closing issues.
+
+    // Safety dry-run switch preventing issue writes during proactive CVE scans.
+    // true: findings are logged without creating or closing tracking issues.
+    // false: security tracking issues are created, updated, and closed on GitHub.
+    // Default: true
     "DryRun": true,
+
+    // Target repository scanned for CVE exposure across RPM specs.
     // Format: "owner/repo".
-    // Empty: scans and issue filing are skipped.
-    // Default: "openRuyi-Project/openRuyi".
+    // Empty/0/null: scans and issue filing are skipped.
+    // Default: "openRuyi-Project/openRuyi"
     "TargetRepository": "openRuyi-Project/openRuyi",
-    // Unit: hours. Range: >= 1. Default: 24.
+
+    // Interval between proactive CVE watch sweeps.
+    // Unit: hours.
+    // Range: >= 1.
+    // Default: 24
     "CheckIntervalHours": 24,
-    // Range: 1..1000. Default: 1000.
+
+    // Number of package queries batched into each OSV API request.
+    // Unit: packages per batch.
+    // Range: 1..1000.
+    // Default: 1000
     "OsvBatchSize": 1000,
-    // Range: >= 0. Default: 0.
-    // 0: every package in the catalog is evaluated during a sweep.
-    // Non-zero: packages scanned per sweep, advancing sequentially across sweeps using a repository-scoped 2PC watermark persisted in bot-state.json when DryRun is false.
+
+    // Packages evaluated per sweep using a persisted repository-scoped 2PC watermark in bot-state.json when DryRun=false.
+    // Unit: packages per sweep.
+    // Range: >= 0.
+    // Empty/0/null: 0 scans every package in the catalog during each sweep.
+    // Default: 0
     "PackagesPerSweep": 0,
-    // Allowed values: true, false. Default: false.
-    // false: skips native RPM specs lacking an authoritative OSV ecosystem feed (crates.io or PyPI) to avoid cross-distribution false positives.
-    // true: queries non-macro native RPM packages best-effort without an ecosystem and adds a best-effort warning banner to generated issues.
+
+    // Controls best-effort OSV querying of native RPM specs lacking an authoritative upstream ecosystem.
+    // true: queries non-macro native RPM packages best-effort and adds a best-effort warning banner to generated issues.
+    // false: skips native RPM specs lacking crates.io or PyPI ecosystems to avoid cross-distribution false positives.
+    // Default: false
     "IncludeUnverifiedNativePackages": false,
-    // Unit: queries per day. Range: >= 0. Default: 200.
-    // 0: no NVD fallback queries are issued.
+
+    // Daily cap on fallback queries dispatched to NIST NVD when OSV lacks CVSS scores.
+    // Unit: queries per day.
+    // Range: >= 0.
+    // Empty/0/null: 0 disables NVD fallback queries.
+    // Default: 200
     "MaxNvdQueriesPerDay": 200,
-    // Unit: milliseconds. Range: >= 0. Default: 6500.
+
+    // Delay inserted between NVD requests to avoid HTTP 429 rate limits.
+    // Unit: milliseconds.
+    // Range: >= 0.
+    // Empty/0/null: 0 removes inter-request delay (only safe with an NVD API key).
+    // Default: 6500
     "NvdRequestDelayMilliseconds": 6500,
-    // Range: >= 1. Default: 8.
+
     // Maximum concurrent HTTP requests dispatched when resolving OSV vulnerability details.
+    // Unit: concurrent requests.
+    // Range: >= 1.
+    // Default: 8
     "MaxConcurrentOsvRequests": 8,
+
+    // Label applied to proactive CVE tracking issues.
     // Format: label name.
-    // Empty: falls back to Vulnerability: Detected.
-    // Default: "Vulnerability: Detected".
+    // Empty/0/null: falls back to Vulnerability: Detected.
+    // Default: "Vulnerability: Detected"
     "IssueLabel": "Vulnerability: Detected",
-    // Unit: hours. Range: >= 1. Default: 168.
-    // Duration before cached vulnerability query results expire.
+
+    // Duration before cached proactive CVE query results expire.
+    // Unit: hours.
+    // Range: >= 1.
+    // Default: 168
     "CacheExpirationHours": 168
   },
 
-  // ==============================================================================
-  // MilestoneSyncOptions: automated milestone assignment and backfill sweep service
-  // Assigns merged pull requests lacking a milestone to the current monthly milestone (YYYY.MM).
+  // =========================================================================
+  // MilestoneSync -- Automated milestone assignment and backfill sweep service
   // Defaults source: Options/MilestoneSyncOptions.cs
-  // ==============================================================================
+  // Bounds checked by: Options/MilestoneSyncOptionsValidator.cs
+  // =========================================================================
   "MilestoneSync": {
-    // Default: false.
+    // Enables or disables automated monthly milestone synchronization on merged pull requests.
+    // true: merged PRs without a milestone are assigned to the current month's YYYY.MM milestone.
     // false: milestone synchronization module and background backfill sweep are disabled.
-    // true: merged PRs without a milestone are assigned to the current month's milestone.
+    // Default: false
     "Enabled": false,
-    // Default: true.
+
+    // Safety dry-run switch for milestone synchronization.
     // true: simulated operations are logged without writing to GitHub.
     // false: milestone assignments and milestone creation requests are written to the remote repository.
+    // Default: true
     "DryRun": true,
+
+    // Repository whitelist eligible for automated milestone assignment and backfill.
     // Format: array of "owner/repo" strings.
-    // Empty: milestone synchronization is disabled globally across all repositories.
-    // Default: [].
+    // Empty/0/null: milestone synchronization is disabled globally across all repositories.
+    // Example: ["openRuyi-Project/openRuyi"]
+    // Default: []
     "RepositoryAllowList": [],
-    // Default: false.
-    // false: if the target monthly milestone does not exist, the assignment is skipped.
-    // true: the bot is permitted to create missing monthly milestones (YYYY.MM) on the remote repository.
+
+    // Permits automatic creation of missing monthly milestones (YYYY.MM).
+    // true: the bot creates missing monthly milestones (YYYY.MM) on the remote repository.
+    // false: if the target monthly milestone does not exist, assignment is skipped.
+    // Default: false
     "CreationEnabled": false,
-    // Unit: day of month. Range: 1..28. Default: 25.
-    // The target due day of the month configured when creating a new monthly milestone.
+
+    // Target due day of the month configured when creating a new monthly milestone.
+    // Unit: day of month.
+    // Range: 1..28.
+    // Default: 25
     "DueDayOfMonth": 25,
-    // Unit: days. Range: 1..365. Default: 30.
-    // Historical time window for the background service to backfill merged pull requests lacking a milestone.
+
+    // Historical time window for backfilling merged pull requests lacking a milestone.
+    // Unit: days.
+    // Range: 1..365.
+    // Default: 30
     "BackfillDays": 30,
-    // Unit: hours. Range: 1..168. Default: 24.
+
     // Execution interval for the background milestone backfill sweep service.
+    // Unit: hours.
+    // Range: 1..168.
+    // Default: 24
     "SweepIntervalHours": 24,
+
+    // IANA or system timezone identifier used when determining the YYYY.MM release milestone month (handles UTC offsets and DST).
     // Format: IANA or system timezone ID (e.g. "Asia/Shanghai", "UTC", "America/New_York").
-    // Applies UTC offset and DST transitions when determining the YYYY.MM release milestone month.
-    // Empty or invalid: startup validation fails fast.
-    // Default: "Asia/Shanghai".
+    // Empty/0/null: empty or unrecognized timezone IDs fail startup validation fast.
+    // Default: "Asia/Shanghai"
     "TimeZoneId": "Asia/Shanghai"
   },
 
-  // ==============================================================================
-  // ConversationGuardOptions: conversation locking, mention command moderation, and inactive PR sweep
-  // Automates thread locking, mention command moderation (@<bot> lock, unlock, hide, archive), and post-closure harassment prevention.
+  // =========================================================================
+  // ConversationGuard -- Conversation locking, mention command moderation, and inactive PR sweep
   // Defaults source: Options/ConversationGuardOptions.cs
-  // ==============================================================================
+  // Bounds checked by: Options/ConversationGuardOptionsValidator.cs
+  // =========================================================================
   "ConversationGuard": {
-    // Default: false.
+    // Enables or disables conversation guard mention commands and closed PR locking.
+    // true: mention commands are processed and closed PRs exceeding InactiveCloseDays are locked.
     // false: conversation guard module and background lock sweep are disabled.
-    // true: mention commands are processed and closed PRs exceeding inactive thresholds are locked.
+    // Default: false
     "Enabled": false,
-    // Default: true.
+
+    // Safety dry-run switch for conversation moderation actions.
     // true: moderation actions are logged without applying locks, minimization, or archiving on GitHub.
-    // false: moderation actions are executed on the remote repository.
+    // false: moderation actions are executed live on the remote repository.
+    // Default: true
     "DryRun": true,
+
+    // Repository whitelist eligible for conversation guard moderation and inactive lock sweeps.
     // Format: array of "owner/repo" strings.
-    // Empty: conversation moderation is disabled globally across all repositories.
-    // Default: [].
+    // Empty/0/null: conversation moderation is disabled globally across all repositories.
+    // Example: ["openRuyi-Project/openRuyi"]
+    // Default: []
     "RepositoryAllowList": [],
-    // Default: false.
+
+    // Independent safety switch enabling pull request archiving via GraphQL (@<bot> archive; strictly read-only until unarchived out-of-band).
+    // true: pull request archiving via GraphQL is enabled (requires PackageUpdate:BotPat with triage+ user PAT; App-only mode fails fast on startup).
     // false: archive commands are rejected (recommended for GitHub App-only deployments).
-    // true: pull request archiving via GraphQL (@<bot> archive) is enabled; requires a triage+ user PAT via PackageUpdate:BotPat (GitHub App-only mode fails fast on startup). Archived PRs become strictly read-only on GitHub and must be unarchived out-of-band via Web UI or `gh api graphql`.
+    // Default: false
     "ArchiveEnabled": false,
-    // Unit: days. Range: 7..365. Default: 60.
-    // Threshold based on closed_at after which closed PRs are automatically locked to prevent post-closure harassment.
+
+    // Threshold based on closed_at after which inactive closed PRs are automatically locked.
+    // Unit: days.
+    // Range: 7..365.
+    // Default: 60
     "InactiveCloseDays": 60,
-    // Unit: hours. Range: 1..72. Default: 12.
+
     // Execution interval for the background closed PR lock sweep service.
+    // Unit: hours.
+    // Range: 1..72.
+    // Default: 12
     "SweepIntervalHours": 12,
-    // Unit: minutes. Range: 1..60. Default: 15.
-    // Time window for the PR author to reply with `@<bot> lock confirm` (or `@<bot> archive confirm`) before the confirmation request expires.
+
+    // Time window for the PR author to reply with @<bot> lock confirm (or archive confirm) before expiry.
+    // Unit: minutes.
+    // Range: 1..60.
+    // Default: 15
     "AuthorLockConfirmTimeoutMinutes": 15,
-    // Unit: pull requests per repository per sweep. Range: 1..500. Default: 50.
-    // Maximum inactive closed pull requests locked per repository per sweep (500 is the search transport cap; remaining PRs defer to the next sweep; values outside 1..500 fail startup validation).
+
+    // Maximum inactive closed PRs locked per repository per sweep (500 is the search transport cap; remaining PRs defer to the next sweep).
+    // Unit: pull requests per repository per sweep.
+    // Range: 1..500.
+    // Default: 50
     "MaxLocksPerSweep": 50
   },
 
-  // ==============================================================================
-  // BotStateOptions: unified persistent runtime state and localization policy
-  // Stores ignored packages, failure cooldowns, user language preferences, and repository locale overrides.
+  // =========================================================================
+  // BotState -- Unified persistent runtime state and localization policy
   // Defaults source: Options/BotStateOptions.cs
-  // ==============================================================================
+  // Bounds checked by: Options/BotStateOptionsValidator.cs
+  // =========================================================================
   "BotState": {
-    // Format: absolute local directory path for persisting bot-state.json and default lookout-first-seen.json (relative paths are rejected at startup).
-    // Empty: resolves LocalApplicationData -> XDG_DATA_HOME -> $HOME/.local/share/abaci-bot -> temp directory (with warning).
-    // Default: "".
+    // Absolute local directory path for persisting bot-state.json and default lookout-first-seen.json (relative paths fail startup validation).
+    // Format: absolute local directory path.
+    // Empty/0/null: resolves LocalApplicationData -> XDG_DATA_HOME -> $HOME/.local/share/abaci-bot -> temp directory (with warning).
+    // Default: ""
     "StateDirectory": "",
-    // Unit: days. Range: >= 1. Default: 180.
+
     // Retention period for user language preferences before inactive entries are pruned.
+    // Unit: days.
+    // Range: >= 1.
+    // Default: 180
     "LocaleRetentionDays": 180,
+
+    // Global fallback locale used when neither repository policy nor user preference is set.
     // Allowed values: "en", "zh", and "en-*" / "zh-*" locale tags (normalized on validation).
-    // Global fallback locale when neither repository policy nor user preference is set.
-    // Default: "en".
+    // Empty/0/null: empty or unrecognized values fail startup validation.
+    // Default: "en"
     "DefaultLocale": "en",
-    // Format: map of "owner/repo" to "en", "zh", or "en-*" / "zh-*" locale tags.
-    // Empty: no repositories force a global language; users may select their preferred language.
-    // Default: {}.
+
+    // Per-repository forced locales disabling user language overrides for matched repositories.
+    // Key format: "owner/repo".
+    // Value format: "en", "zh", or "en-*" / "zh-*" locale tag.
+    // Empty/0/null: no repositories force a global language; users may select their preferred language.
+    // Example: {"openRuyi-Project/openRuyi": "zh"}
+    // Default: {}
     "RepositoryForcedLocales": {},
-    // Format: map of "owner/repo" to "en", "zh", or "en-*" / "zh-*" locale tags.
-    // Empty: repositories fall back to DefaultLocale when a user has no personal preference.
-    // Default: {}.
+
+    // Per-repository default locales applied when a user has no personal preference.
+    // Key format: "owner/repo".
+    // Value format: "en", "zh", or "en-*" / "zh-*" locale tag.
+    // Empty/0/null: repositories fall back to DefaultLocale when a user has no personal preference.
+    // Example: {"openRuyi-Project/openRuyi": "zh"}
+    // Default: {}
     "RepositoryDefaultLocales": {},
-    // Unit: minutes. Range: 0..1440. Default: 5.
-    // Delay before ephemeral bot usage and rejection replies are processed.
-    // 0: disables automatic cleanup.
+
+    // Delay before ephemeral bot usage and rejection replies are cleaned up.
+    // Unit: minutes.
+    // Range: 0..1440.
+    // Empty/0/null: 0 disables automatic cleanup of ephemeral replies.
+    // Default: 5
     "EphemeralReplyDeleteMinutes": 5,
-    // Allowed values: "Delete", "Minimize".
-    // Delete: deletes the expired ephemeral comment via GitHub REST API.
-    // Minimize: folds the expired ephemeral comment as OUTDATED via GitHub GraphQL API.
-    // Default: "Delete".
+
+    // Cleanup action executed when an ephemeral bot reply exceeds EphemeralReplyDeleteMinutes.
+    // Allowed values: "Delete" (deletes via REST API) or "Minimize" (folds as OUTDATED via GraphQL API).
+    // Default: "Delete"
     "EphemeralReplyAction": "Delete"
   }
 }

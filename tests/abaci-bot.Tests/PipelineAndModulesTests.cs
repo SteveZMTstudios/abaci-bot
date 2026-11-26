@@ -1001,7 +1001,7 @@ public class PipelineAndModulesTests
     }
 
     [Fact]
-    public async Task PullRequestPipeline_PostLockRefreshFails_LogsWarningAndAbortsLabelMutation()
+    public async Task PullRequestPipeline_PostLockRefreshTransientFailure_RecordsHealthAndThrowsForDispatcherRetry()
     {
         var module = Substitute.For<IPullRequestModule>();
         module.Priority.Returns(10);
@@ -1009,22 +1009,94 @@ public class PipelineAndModulesTests
 
         var gitHub = Substitute.For<IGitHubService>();
         var logger = Substitute.For<ILogger<PullRequestPipeline>>();
+        var health = new RuntimeHealthState();
         var mutexEngine = new LabelMutexEngine();
-        var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub, logger);
+        var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub, logger, runtimeHealth: health);
         var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Existing: Label" });
 
         gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
-            .Throws(new HttpRequestException("Simulated API failure"));
+            .Throws(new HttpRequestException("Simulated 503 failure", null, System.Net.HttpStatusCode.ServiceUnavailable));
 
-        await pipeline.ExecuteAsync(context, CancellationToken.None);
+        await Assert.ThrowsAsync<HttpRequestException>(() => pipeline.ExecuteAsync(context, CancellationToken.None));
 
+        await gitHub.Received(2).GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>());
+        var (lastError, lastErrorAt) = health.GetLastError();
+        Assert.NotNull(lastError);
+        Assert.NotNull(lastErrorAt);
+        Assert.Contains("Post-lock transient refresh failure", lastError);
         logger.ReceivedWithAnyArgs().Log(
-            LogLevel.Warning,
+            LogLevel.Error,
             Arg.Any<EventId>(),
-            Arg.Is<object>(o => o.ToString()!.Contains("Post-lock refresh failed")),
+            Arg.Is<object>(o => o.ToString()!.Contains("Post-lock refresh failed transiently")),
             Arg.Any<Exception?>(),
             Arg.Any<Func<object, Exception?, string>>());
 
+        await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
+        await gitHub.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default(string[])!, default);
+        await gitHub.DidNotReceiveWithAnyArgs().RemoveLabelAsync(default!, default!, default, default!, default);
+    }
+
+    [Fact]
+    public async Task PullRequestPipeline_PostLockRefreshNonRetriable403_RecordsHealthAndThrowsNonRetriableWithoutRetry()
+    {
+        var module = Substitute.For<IPullRequestModule>();
+        module.Priority.Returns(10);
+        module.ShouldProcess(Arg.Any<PullRequestContext>()).Returns(true);
+
+        var gitHub = Substitute.For<IGitHubService>();
+        var logger = Substitute.For<ILogger<PullRequestPipeline>>();
+        var health = new RuntimeHealthState();
+        var mutexEngine = new LabelMutexEngine();
+        var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub, logger, runtimeHealth: health);
+        var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Existing: Label" });
+
+        var forbiddenEx = new Octokit.ForbiddenException(CreateOctokitResponse(System.Net.HttpStatusCode.Forbidden));
+        gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Throws(forbiddenEx);
+
+        var ex = await Assert.ThrowsAsync<NonRetriablePipelineException>(() => pipeline.ExecuteAsync(context, CancellationToken.None));
+        Assert.True(TransientErrorPolicy.IsNonRetriable(ex));
+        Assert.Same(forbiddenEx, ex.InnerException);
+
+        await gitHub.Received(1).GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>());
+        var (lastError, lastErrorAt) = health.GetLastError();
+        Assert.NotNull(lastError);
+        Assert.NotNull(lastErrorAt);
+        Assert.Contains(nameof(RefreshOutcome.NonRetriableFailure), lastError);
+        await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
+        await gitHub.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default(string[])!, default);
+        await gitHub.DidNotReceiveWithAnyArgs().RemoveLabelAsync(default!, default!, default, default!, default);
+    }
+
+    [Fact]
+    public async Task PullRequestPipeline_PostLockRefreshInvalidNullLabels_RecordsHealthAndThrowsNonRetriableWithoutRetry()
+    {
+        var module = Substitute.For<IPullRequestModule>();
+        module.Priority.Returns(10);
+        module.ShouldProcess(Arg.Any<PullRequestContext>()).Returns(true);
+
+        var gitHub = Substitute.For<IGitHubService>();
+        var logger = Substitute.For<ILogger<PullRequestPipeline>>();
+        var health = new RuntimeHealthState();
+        var mutexEngine = new LabelMutexEngine();
+        var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub, logger, runtimeHealth: health);
+        var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Existing: Label" });
+
+        var invalidPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(invalidPr, null);
+        gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult<PullRequest?>(invalidPr));
+
+        var ex = await Assert.ThrowsAsync<NonRetriablePipelineException>(() => pipeline.ExecuteAsync(context, CancellationToken.None));
+        Assert.True(TransientErrorPolicy.IsNonRetriable(ex));
+        Assert.IsType<InvalidOperationException>(ex.InnerException);
+
+        await gitHub.Received(1).GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>());
+        var (lastError, lastErrorAt) = health.GetLastError();
+        Assert.NotNull(lastError);
+        Assert.NotNull(lastErrorAt);
+        Assert.Contains(nameof(RefreshOutcome.InvalidState), lastError);
+        await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
         await gitHub.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default(string[])!, default);
         await gitHub.DidNotReceiveWithAnyArgs().RemoveLabelAsync(default!, default!, default, default!, default);
     }
@@ -1038,8 +1110,9 @@ public class PipelineAndModulesTests
 
         var gitHub = Substitute.For<IGitHubService>();
         var logger = Substitute.For<ILogger<PullRequestPipeline>>();
+        var health = new RuntimeHealthState();
         var mutexEngine = new LabelMutexEngine();
-        var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub, logger);
+        var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub, logger, runtimeHealth: health);
         var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Existing: Label" });
 
         gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
@@ -1047,8 +1120,11 @@ public class PipelineAndModulesTests
 
         await pipeline.ExecuteAsync(context, CancellationToken.None);
 
-        // Crucial distinction (P2-1): 404/null PR aborts immediately on attempt 0 without retrying 3 times
+        // Crucial distinction: 404/null PR aborts immediately on attempt 0 without retrying or polluting health state
         await gitHub.Received(1).GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>());
+        var (lastError, lastErrorAt) = health.GetLastError();
+        Assert.Null(lastError);
+        Assert.Null(lastErrorAt);
         await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
         await gitHub.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default(string[])!, default);
         await gitHub.DidNotReceiveWithAnyArgs().RemoveLabelAsync(default!, default!, default, default!, default);
@@ -1253,7 +1329,8 @@ public class PipelineAndModulesTests
         var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Stale: Label" });
         var refreshed = await context.RefreshAsync();
 
-        Assert.True(refreshed);
+        Assert.True(refreshed.IsRefreshed);
+        Assert.Equal(RefreshOutcome.Refreshed, refreshed.Outcome);
         Assert.Contains("Workflow: Ready For Review", context.ExistingLabels);
         Assert.DoesNotContain("Stale: Label", context.ExistingLabels);
         Assert.Equal("Updated Title", context.Title);
@@ -1283,7 +1360,7 @@ public class PipelineAndModulesTests
         var context = PullRequestContext.FromPullRequestEvent(gitHub, "captains", null, prEvent, Octokit.Webhooks.Events.PullRequest.PullRequestAction.ReadyForReview);
         var refreshed = await context.RefreshAsync();
 
-        Assert.True(refreshed);
+        Assert.True(refreshed.IsRefreshed);
         Assert.True(context.IsDraft);
     }
 
@@ -1307,7 +1384,7 @@ public class PipelineAndModulesTests
         Assert.False(context.IsDraft);
 
         var refreshed = await context.RefreshAsync();
-        Assert.True(refreshed);
+        Assert.True(refreshed.IsRefreshed);
         Assert.True(context.IsDraft);
     }
 
@@ -1331,7 +1408,7 @@ public class PipelineAndModulesTests
         Assert.Equal("/lgtm comment command", context.Body);
 
         var refreshed = await context.RefreshAsync();
-        Assert.True(refreshed);
+        Assert.True(refreshed.IsRefreshed);
         Assert.Equal("/lgtm comment command", context.Body);
     }
 
@@ -1345,7 +1422,8 @@ public class PipelineAndModulesTests
         var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Original: Label" });
         var refreshed = await context.RefreshAsync();
 
-        Assert.False(refreshed);
+        Assert.False(refreshed.IsRefreshed);
+        Assert.Equal(RefreshOutcome.Gone, refreshed.Outcome);
         Assert.Contains("Original: Label", context.ExistingLabels);
     }
 
@@ -1359,7 +1437,8 @@ public class PipelineAndModulesTests
         var context = CreateMockContext(gitHub, prNumber: 42, existingLabels: new[] { "Original: Label" });
         var refreshed = await context.RefreshAsync();
 
-        Assert.False(refreshed);
+        Assert.False(refreshed.IsRefreshed);
+        Assert.Equal(RefreshOutcome.TransientFailure, refreshed.Outcome);
         Assert.Contains("Original: Label", context.ExistingLabels);
     }
 
@@ -2103,11 +2182,11 @@ public class PipelineAndModulesTests
             prEvent,
             Octokit.Webhooks.Events.PullRequest.PullRequestAction.ConvertedToDraft);
 
-        // Remote GitHub already has Workflow: Ready For Review, but refresh fails transients
+        // Remote GitHub already has Workflow: Ready For Review, but refresh fails transiently
         gitHub.GetPullRequestAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>(), Arg.Any<CancellationToken>())
             .Throws(new HttpRequestException("Simulated transient network failure"));
 
-        await pipeline.ExecuteAsync(context);
+        await Assert.ThrowsAsync<HttpRequestException>(() => pipeline.ExecuteAsync(context));
 
         // Verify pipeline aborted and did not perform stale writes or removals
         await gitHub.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default(string[])!, default);
@@ -2139,7 +2218,7 @@ public class PipelineAndModulesTests
             Octokit.Webhooks.Events.PullRequest.PullRequestAction.ConvertedToDraft);
 
         var refreshed = await context.RefreshAsync();
-        Assert.True(refreshed);
+        Assert.True(refreshed.IsRefreshed);
         Assert.False(context.IsDraft);
     }
 
@@ -2166,7 +2245,7 @@ public class PipelineAndModulesTests
             Octokit.Webhooks.Events.PullRequest.PullRequestAction.Closed);
 
         var refreshed = await context.RefreshAsync();
-        Assert.True(refreshed);
+        Assert.True(refreshed.IsRefreshed);
         Assert.False(context.IsClosed);
         Assert.False(context.IsTerminal);
     }
@@ -2573,7 +2652,7 @@ public class PipelineAndModulesTests
         var context = CreateMockContext(gitHub, prNumber: 1);
         await pipeline.ExecuteAsync(context);
 
-        // Non-retriable 404 error should only be attempted once, not retried 3 times
+        // Gone (404 NotFoundException) should only be attempted once without throwing
         await gitHub.Received(1).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
         await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
     }
@@ -2594,7 +2673,8 @@ public class PipelineAndModulesTests
         var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub);
 
         var context = CreateMockContext(gitHub, prNumber: 1);
-        await pipeline.ExecuteAsync(context);
+        var ex = await Assert.ThrowsAsync<NonRetriablePipelineException>(() => pipeline.ExecuteAsync(context));
+        Assert.Same(badRequestEx, ex.InnerException);
 
         // Non-retriable 400 error should only be attempted once
         await gitHub.Received(1).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
@@ -2617,7 +2697,8 @@ public class PipelineAndModulesTests
         var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub);
 
         var context = CreateMockContext(gitHub, prNumber: 1);
-        await pipeline.ExecuteAsync(context);
+        var ex = await Assert.ThrowsAsync<NonRetriablePipelineException>(() => pipeline.ExecuteAsync(context));
+        Assert.Same(validationEx, ex.InnerException);
 
         // Non-retriable 422 error should only be attempted once
         await gitHub.Received(1).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
@@ -2625,7 +2706,7 @@ public class PipelineAndModulesTests
     }
 
     [Fact]
-    public async Task PullRequestPipeline_OctokitRateLimitExceededException_RetriesThreeTimes()
+    public async Task PullRequestPipeline_OctokitRateLimitExceededException_RetriesInlineThenThrowsForDispatcher()
     {
         var module = Substitute.For<IPullRequestModule>();
         module.Priority.Returns(10);
@@ -2640,15 +2721,15 @@ public class PipelineAndModulesTests
         var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub);
 
         var context = CreateMockContext(gitHub, prNumber: 1);
-        await pipeline.ExecuteAsync(context);
+        await Assert.ThrowsAsync<Octokit.RateLimitExceededException>(() => pipeline.ExecuteAsync(context));
 
-        // Rate limit 403 error is transient and should be retried across 3 attempts
-        await gitHub.Received(3).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
+        // Rate limit 403 error is transient: performs 2 inline attempts then surfaces for WebhookDispatcher retry
+        await gitHub.Received(2).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
         await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
     }
 
     [Fact]
-    public async Task PullRequestPipeline_OctokitAbuseException_RetriesThreeTimes()
+    public async Task PullRequestPipeline_OctokitAbuseException_RetriesInlineThenThrowsForDispatcher()
     {
         var module = Substitute.For<IPullRequestModule>();
         module.Priority.Returns(10);
@@ -2663,15 +2744,15 @@ public class PipelineAndModulesTests
         var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub);
 
         var context = CreateMockContext(gitHub, prNumber: 1);
-        await pipeline.ExecuteAsync(context);
+        await Assert.ThrowsAsync<Octokit.AbuseException>(() => pipeline.ExecuteAsync(context));
 
-        // Abuse rate limit 403 error is transient and should be retried across 3 attempts
-        await gitHub.Received(3).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
+        // Abuse rate limit 403 error is transient: performs 2 inline attempts then surfaces for WebhookDispatcher retry
+        await gitHub.Received(2).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
         await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
     }
 
     [Fact]
-    public async Task PullRequestPipeline_OctokitApiException500_RetriesThreeTimes()
+    public async Task PullRequestPipeline_OctokitApiException500_RetriesInlineThenThrowsForDispatcher()
     {
         var module = Substitute.For<IPullRequestModule>();
         module.Priority.Returns(10);
@@ -2686,10 +2767,10 @@ public class PipelineAndModulesTests
         var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub);
 
         var context = CreateMockContext(gitHub, prNumber: 1);
-        await pipeline.ExecuteAsync(context);
+        await Assert.ThrowsAsync<Octokit.ApiException>(() => pipeline.ExecuteAsync(context));
 
-        // Server 500 error is transient and should be retried across 3 attempts
-        await gitHub.Received(3).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
+        // Server 500 error is transient: performs 2 inline attempts then surfaces for WebhookDispatcher retry
+        await gitHub.Received(2).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
         await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
     }
 
@@ -2709,7 +2790,8 @@ public class PipelineAndModulesTests
         var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub);
 
         var context = CreateMockContext(gitHub, prNumber: 1);
-        await pipeline.ExecuteAsync(context);
+        var ex = await Assert.ThrowsAsync<NonRetriablePipelineException>(() => pipeline.ExecuteAsync(context));
+        Assert.Same(badRequestEx, ex.InnerException);
 
         // Non-retriable 400 error should only be attempted once
         await gitHub.Received(1).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
@@ -2732,7 +2814,8 @@ public class PipelineAndModulesTests
         var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub);
 
         var context = CreateMockContext(gitHub, prNumber: 1);
-        await pipeline.ExecuteAsync(context);
+        var ex = await Assert.ThrowsAsync<NonRetriablePipelineException>(() => pipeline.ExecuteAsync(context));
+        Assert.Same(authEx, ex.InnerException);
 
         // Non-retriable 401 error should only be attempted once
         await gitHub.Received(1).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
@@ -2755,7 +2838,8 @@ public class PipelineAndModulesTests
         var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub);
 
         var context = CreateMockContext(gitHub, prNumber: 1);
-        await pipeline.ExecuteAsync(context);
+        var ex = await Assert.ThrowsAsync<NonRetriablePipelineException>(() => pipeline.ExecuteAsync(context));
+        Assert.Same(forbiddenEx, ex.InnerException);
 
         // Non-retriable 403 error should only be attempted once
         await gitHub.Received(1).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
@@ -2789,7 +2873,7 @@ public class PipelineAndModulesTests
     }
 
     [Fact]
-    public async Task PullRequestPipeline_TransientNetworkErrorWithoutStatusCode_RetriesThreeTimes()
+    public async Task PullRequestPipeline_TransientNetworkErrorWithoutStatusCode_RetriesInlineThenThrowsForDispatcher()
     {
         var module = Substitute.For<IPullRequestModule>();
         module.Priority.Returns(10);
@@ -2804,10 +2888,10 @@ public class PipelineAndModulesTests
         var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub);
 
         var context = CreateMockContext(gitHub, prNumber: 1);
-        await pipeline.ExecuteAsync(context);
+        await Assert.ThrowsAsync<HttpRequestException>(() => pipeline.ExecuteAsync(context));
 
-        // Network error without 4xx status code should be retried across all 3 attempts
-        await gitHub.Received(3).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
+        // Network error without 4xx status code is transient: 2 inline attempts then throws for WebhookDispatcher
+        await gitHub.Received(2).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
         await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
     }
 
@@ -2856,7 +2940,8 @@ public class PipelineAndModulesTests
 
         var success = await context.RefreshAsync();
 
-        Assert.False(success);
+        Assert.False(success.IsRefreshed);
+        Assert.Equal(RefreshOutcome.InvalidState, success.Outcome);
         Assert.NotNull(context.LastRefreshException);
         Assert.IsType<InvalidOperationException>(context.LastRefreshException);
         // Preserves previous existing labels rather than corrupting state
@@ -3419,6 +3504,386 @@ public class PipelineAndModulesTests
         await gitHub.DidNotReceiveWithAnyArgs().AddLabelsAsync(default!, default!, default, default!, default);
         await gitHub.DidNotReceiveWithAnyArgs().RemoveLabelAsync(default!, default!, default, default!, default);
     }
+
+    [Fact]
+    public async Task BuildSystemAnalysisModule_SpecReturnsNotFound_PreservesBuildSystemLabelsAndStillAppliesCi()
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var deletedForkSpec = (PullRequestFile)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequestFile));
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.FileName))?.SetValue(deletedForkSpec, "SPECS/orphan/orphan.spec");
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.Status))?.SetValue(deletedForkSpec, "modified");
+
+        var ciFile = (PullRequestFile)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequestFile));
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.FileName))?.SetValue(ciFile, ".github/workflows/ci.yml");
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.Status))?.SetValue(ciFile, "modified");
+
+        gitHub.GetPullRequestFilesAsync("owner", "repo", Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(new List<PullRequestFile> { deletedForkSpec, ciFile });
+
+        var notFoundResp = Substitute.For<IResponse>();
+        notFoundResp.StatusCode.Returns(System.Net.HttpStatusCode.NotFound);
+        gitHub.GetFileContentAsync("owner", "repo", "SPECS/orphan/orphan.spec", Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns<Task<string>>(_ => throw new NotFoundException(notFoundResp));
+
+        var module = new BuildSystemAnalysisModule();
+        var context = CreateMockContext(
+            gitHub,
+            existingLabels: new[] { GitHubLabels.BuildSystemCmake });
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Contains(GitHubLabels.Ci, context.LabelsToAdd);
+        Assert.DoesNotContain(GitHubLabels.BuildSystemCmake, context.LabelsToRemove);
+        Assert.DoesNotContain(context.LabelsToAdd, l => l.StartsWith("BuildSystem:", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(System.Net.HttpStatusCode.Forbidden)]
+    [InlineData(System.Net.HttpStatusCode.Gone)]
+    public async Task BuildSystemAnalysisModule_SpecReturnsForbiddenOrGone_PreservesBuildSystemLabelsAndStillAppliesCi(System.Net.HttpStatusCode statusCode)
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var forkSpec = (PullRequestFile)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequestFile));
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.FileName))?.SetValue(forkSpec, "SPECS/fork/fork.spec");
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.Status))?.SetValue(forkSpec, "modified");
+
+        var ciFile = (PullRequestFile)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequestFile));
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.FileName))?.SetValue(ciFile, ".github/workflows/ci.yml");
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.Status))?.SetValue(ciFile, "modified");
+
+        gitHub.GetPullRequestFilesAsync("owner", "repo", Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(new List<PullRequestFile> { forkSpec, ciFile });
+
+        var resp = Substitute.For<IResponse>();
+        resp.StatusCode.Returns(statusCode);
+        Exception apiEx = statusCode == System.Net.HttpStatusCode.Forbidden
+            ? new ForbiddenException(resp)
+            : new ApiException("Gone", statusCode);
+
+        gitHub.GetFileContentAsync("owner", "repo", "SPECS/fork/fork.spec", Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns<Task<string>>(_ => Task.FromException<string>(apiEx));
+
+        var module = new BuildSystemAnalysisModule();
+        var context = CreateMockContext(
+            gitHub,
+            existingLabels: new[] { GitHubLabels.BuildSystemCmake });
+
+        await module.ProcessAsync(context, CancellationToken.None);
+
+        Assert.Contains(GitHubLabels.Ci, context.LabelsToAdd);
+        Assert.DoesNotContain(GitHubLabels.BuildSystemCmake, context.LabelsToRemove);
+        Assert.DoesNotContain(context.LabelsToAdd, l => l.StartsWith("BuildSystem:", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task BuildSystemAnalysisModule_SpecReturns503_PropagatesTransientException()
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var forkSpec = (PullRequestFile)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequestFile));
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.FileName))?.SetValue(forkSpec, "SPECS/transient/transient.spec");
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.Status))?.SetValue(forkSpec, "modified");
+
+        gitHub.GetPullRequestFilesAsync("owner", "repo", Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(new List<PullRequestFile> { forkSpec });
+        gitHub.GetFileContentAsync("owner", "repo", "SPECS/transient/transient.spec", Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns<Task<string>>(_ => throw new ApiException("Service Unavailable", System.Net.HttpStatusCode.ServiceUnavailable));
+
+        var module = new BuildSystemAnalysisModule();
+        var context = CreateMockContext(gitHub);
+
+        await Assert.ThrowsAsync<ApiException>(() => module.ProcessAsync(context, CancellationToken.None));
+    }
+
+    #region R53 Regression Tests
+
+    public static TheoryData<string, Exception, bool> TransientErrorClassificationCases
+    {
+        get
+        {
+            var data = new TheoryData<string, Exception, bool>();
+            static ApiException MakeApi(System.Net.HttpStatusCode status) =>
+                new ApiException(CreateOctokitResponse(status));
+
+            data.Add("ApiException 408 RequestTimeout", MakeApi(System.Net.HttpStatusCode.RequestTimeout), false);
+            data.Add("ApiException 425 TooEarly", MakeApi((System.Net.HttpStatusCode)425), false);
+            data.Add("ApiException 429 TooManyRequests", MakeApi(System.Net.HttpStatusCode.TooManyRequests), false);
+            data.Add("HttpRequestException 408 RequestTimeout", new HttpRequestException("timeout", null, System.Net.HttpStatusCode.RequestTimeout), false);
+            data.Add("HttpRequestException 425 TooEarly", new HttpRequestException("too early", null, (System.Net.HttpStatusCode)425), false);
+            data.Add("HttpRequestException 429 TooManyRequests", new HttpRequestException("rate limited", null, System.Net.HttpStatusCode.TooManyRequests), false);
+            data.Add("RateLimitExceededException", (RateLimitExceededException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(RateLimitExceededException)), false);
+            data.Add("SecondaryRateLimitExceededException", (SecondaryRateLimitExceededException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SecondaryRateLimitExceededException)), false);
+            data.Add("AbuseException", (AbuseException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(AbuseException)), false);
+            data.Add("ApiException 500 InternalServerError", MakeApi(System.Net.HttpStatusCode.InternalServerError), false);
+            data.Add("ApiException 503 ServiceUnavailable", MakeApi(System.Net.HttpStatusCode.ServiceUnavailable), false);
+            data.Add("HttpRequestException 502 BadGateway", new HttpRequestException("bad gw", null, System.Net.HttpStatusCode.BadGateway), false);
+            data.Add("HttpRequestException without status", new HttpRequestException("socket reset"), false);
+
+            data.Add("ApiException 400 BadRequest", MakeApi(System.Net.HttpStatusCode.BadRequest), true);
+            data.Add("ApiException 401 Unauthorized", MakeApi(System.Net.HttpStatusCode.Unauthorized), true);
+            data.Add("ApiException 403 Forbidden", MakeApi(System.Net.HttpStatusCode.Forbidden), true);
+            data.Add("ApiException 404 NotFound", MakeApi(System.Net.HttpStatusCode.NotFound), true);
+            data.Add("ApiException 422 UnprocessableEntity", MakeApi(System.Net.HttpStatusCode.UnprocessableEntity), true);
+            data.Add("HttpRequestException 400 BadRequest", new HttpRequestException("bad", null, System.Net.HttpStatusCode.BadRequest), true);
+            data.Add("HttpRequestException 403 Forbidden", new HttpRequestException("forbidden", null, System.Net.HttpStatusCode.Forbidden), true);
+            data.Add("HttpRequestException 404 NotFound", new HttpRequestException("not found", null, System.Net.HttpStatusCode.NotFound), true);
+            data.Add("HttpRequestException 422 UnprocessableEntity", new HttpRequestException("invalid", null, System.Net.HttpStatusCode.UnprocessableEntity), true);
+            data.Add("ForbiddenException", new ForbiddenException(CreateOctokitResponse(System.Net.HttpStatusCode.Forbidden)), true);
+            data.Add("AuthorizationException", (AuthorizationException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(AuthorizationException)), true);
+            data.Add("NotFoundException", new NotFoundException(CreateOctokitResponse(System.Net.HttpStatusCode.NotFound)), true);
+            data.Add("ArgumentException", new ArgumentException("bad arg"), true);
+            data.Add("NotSupportedException", new NotSupportedException("unsupported"), true);
+            data.Add("JsonException", new System.Text.Json.JsonException("bad json"), true);
+            return data;
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(TransientErrorClassificationCases))]
+    public void TransientErrorPolicy_IsNonRetriable_ClassifiesRateLimitsAndHttpStatusCodesCorrectly(
+        string caseName,
+        Exception ex,
+        bool expectedNonRetriable)
+    {
+        Assert.False(string.IsNullOrEmpty(caseName));
+        Assert.Equal(expectedNonRetriable, TransientErrorPolicy.IsNonRetriable(ex));
+    }
+
+    [Fact]
+    public async Task PullRequestPipeline_OctokitSecondaryRateLimitExceededException_RetriesInlineThenThrowsForDispatcher()
+    {
+        var module = Substitute.For<IPullRequestModule>();
+        module.Priority.Returns(10);
+        module.ShouldProcess(Arg.Any<PullRequestContext>()).Returns(true);
+
+        var gitHub = Substitute.For<IGitHubService>();
+        var health = new RuntimeHealthState();
+        var secondaryEx = (SecondaryRateLimitExceededException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(
+            typeof(SecondaryRateLimitExceededException));
+        gitHub.GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>())
+            .Throws(secondaryEx);
+
+        var mutexEngine = new LabelMutexEngine();
+        var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub, runtimeHealth: health);
+
+        var context = CreateMockContext(gitHub, prNumber: 1);
+        await Assert.ThrowsAsync<SecondaryRateLimitExceededException>(() => pipeline.ExecuteAsync(context));
+
+        await gitHub.Received(2).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
+        Assert.Contains("Post-lock transient refresh failure", health.GetLastError().LastError);
+        await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
+    }
+
+    [Fact]
+    public async Task PullRequestPipeline_OctokitApiException429_RetriesInlineThenThrowsForDispatcher()
+    {
+        var module = Substitute.For<IPullRequestModule>();
+        module.Priority.Returns(10);
+        module.ShouldProcess(Arg.Any<PullRequestContext>()).Returns(true);
+
+        var gitHub = Substitute.For<IGitHubService>();
+        var health = new RuntimeHealthState();
+        var api429Ex = new ApiException(CreateOctokitResponse(System.Net.HttpStatusCode.TooManyRequests));
+        gitHub.GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>())
+            .Throws(api429Ex);
+
+        var mutexEngine = new LabelMutexEngine();
+        var pipeline = new PullRequestPipeline(new[] { module }, mutexEngine, gitHub, runtimeHealth: health);
+
+        var context = CreateMockContext(gitHub, prNumber: 1);
+        await Assert.ThrowsAsync<ApiException>(() => pipeline.ExecuteAsync(context));
+
+        await gitHub.Received(2).GetPullRequestAsync("owner", "repo", 1, Arg.Any<CancellationToken>());
+        Assert.Contains("Post-lock transient refresh failure", health.GetLastError().LastError);
+        await module.DidNotReceiveWithAnyArgs().ProcessAsync(default!, default);
+    }
+
+    [Theory]
+    [InlineData("core")]
+    [InlineData("secondary")]
+    [InlineData("abuse")]
+    [InlineData("http429")]
+    public async Task BuildSystemAnalysisModule_SpecRateLimitOrAbuse_PropagatesInsteadOfIsolating(string kind)
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var specFile = (PullRequestFile)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequestFile));
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.FileName))?.SetValue(specFile, "SPECS/curl/curl.spec");
+        typeof(PullRequestFile).GetProperty(nameof(PullRequestFile.Status))?.SetValue(specFile, "modified");
+
+        gitHub.GetPullRequestFilesAsync("owner", "repo", Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(new List<PullRequestFile> { specFile });
+
+        Exception ex = kind switch
+        {
+            "core" => (RateLimitExceededException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(RateLimitExceededException)),
+            "secondary" => (SecondaryRateLimitExceededException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SecondaryRateLimitExceededException)),
+            "abuse" => (AbuseException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(AbuseException)),
+            _ => new ApiException(CreateOctokitResponse(System.Net.HttpStatusCode.TooManyRequests))
+        };
+
+        gitHub.GetFileContentAsync("owner", "repo", "SPECS/curl/curl.spec", Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns<Task<string>>(_ => Task.FromException<string>(ex));
+
+        var module = new BuildSystemAnalysisModule();
+        var context = CreateMockContext(gitHub, existingLabels: new[] { GitHubLabels.BuildSystemCmake });
+
+        var thrown = await Assert.ThrowsAnyAsync<ApiException>(() => module.ProcessAsync(context, CancellationToken.None));
+        Assert.Same(ex, thrown);
+        Assert.DoesNotContain(GitHubLabels.Ci, context.LabelsToAdd);
+    }
+
+    [Fact]
+    public async Task PullRequestContext_RefreshResult_DefaultIsUnknownFailClosed_AndTracksSingleTruthError()
+    {
+        RefreshResult uninitialized = default;
+        Assert.Equal(RefreshOutcome.Unknown, uninitialized.Outcome);
+        Assert.False(uninitialized.IsRefreshed);
+        Assert.Null(uninitialized.Error);
+
+        var gitHub = Substitute.For<IGitHubService>();
+        var transientEx = new HttpRequestException("Upstream 503", null, System.Net.HttpStatusCode.ServiceUnavailable);
+        var call = 0;
+        gitHub.GetPullRequestAsync("owner", "repo", 42, Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                call++;
+                return call == 1
+                    ? Task.FromException<PullRequest?>(transientEx)
+                    : Task.FromResult<PullRequest?>(null);
+            });
+
+        var context = CreateMockContext(gitHub, prNumber: 42);
+        var first = await context.RefreshAsync();
+        Assert.Equal(RefreshOutcome.TransientFailure, first.Outcome);
+        Assert.Same(transientEx, context.LastRefreshResult?.Error);
+        Assert.Same(transientEx, context.LastRefreshException);
+
+        var second = await context.RefreshAsync();
+        Assert.Equal(RefreshOutcome.Gone, second.Outcome);
+        Assert.Null(second.Error);
+        Assert.Equal(RefreshOutcome.Gone, context.LastRefreshResult?.Outcome);
+        Assert.Null(context.LastRefreshException);
+    }
+
+    [Fact]
+    public void TransientErrorPolicy_Raw403WithRateLimitHeaders_ClassifiesAsTransient_AndPlain403AsNonRetriable()
+    {
+        var retryAfterHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Retry-After"] = "90"
+        };
+        var retryAfterResp = Substitute.For<IResponse>();
+        retryAfterResp.StatusCode.Returns(System.Net.HttpStatusCode.Forbidden);
+        retryAfterResp.Headers.Returns(retryAfterHeaders);
+        var rawRetryAfter403 = new ForbiddenException(retryAfterResp);
+
+        Assert.True(TransientErrorPolicy.TryGetRateLimitInfo(rawRetryAfter403, out var retryDelay, out var retryType));
+        Assert.Equal("Secondary (Retry-After)", retryType);
+        Assert.Equal(TimeSpan.FromSeconds(90), retryDelay);
+        Assert.False(TransientErrorPolicy.IsNonRetriable(rawRetryAfter403));
+
+        var resetEpoch = DateTimeOffset.UtcNow.AddMinutes(5).ToUnixTimeSeconds();
+        var exhaustedHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["X-RateLimit-Remaining"] = "0",
+            ["X-RateLimit-Reset"] = resetEpoch.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        };
+        var exhaustedResp = Substitute.For<IResponse>();
+        exhaustedResp.StatusCode.Returns(System.Net.HttpStatusCode.Forbidden);
+        exhaustedResp.Headers.Returns(exhaustedHeaders);
+        var rawCore403 = new ApiException(exhaustedResp);
+
+        Assert.True(TransientErrorPolicy.TryGetRateLimitInfo(rawCore403, out var coreDelay, out var coreType));
+        Assert.Equal("Core (Header)", coreType);
+        Assert.NotNull(coreDelay);
+        Assert.True(coreDelay!.Value > TimeSpan.FromMinutes(3) && coreDelay.Value <= TimeSpan.FromMinutes(5));
+        Assert.False(TransientErrorPolicy.IsNonRetriable(rawCore403));
+
+        // Plain 403 without rate-limit headers stays non-retriable
+        var plainResp = Substitute.For<IResponse>();
+        plainResp.StatusCode.Returns(System.Net.HttpStatusCode.Forbidden);
+        plainResp.Headers.Returns(new Dictionary<string, string>());
+        var plain403 = new ForbiddenException(plainResp);
+        Assert.False(TransientErrorPolicy.TryGetRateLimitInfo(plain403, out _, out _));
+        Assert.True(TransientErrorPolicy.IsNonRetriable(plain403));
+    }
+
+    [Fact]
+    public void TransientErrorPolicy_TryGetRateLimitInfo_UnwrapsNestedInnerExceptions()
+    {
+        var resetEpoch = DateTimeOffset.UtcNow.AddMinutes(45).ToUnixTimeSeconds();
+        var apiInfo = new ApiInfo(
+            new Dictionary<string, Uri>(),
+            Array.Empty<string>(),
+            Array.Empty<string>(),
+            "etag",
+            new RateLimit(5000, 0, resetEpoch),
+            TimeSpan.Zero);
+        var coreResp = Substitute.For<IResponse>();
+        coreResp.StatusCode.Returns(System.Net.HttpStatusCode.Forbidden);
+        coreResp.ApiInfo.Returns(apiInfo);
+        var wrappedCore = new InvalidOperationException(
+            "wrapped comment failure",
+            new RateLimitExceededException(coreResp));
+
+        Assert.True(TransientErrorPolicy.TryGetRateLimitInfo(wrappedCore, out var coreDelay, out var coreType));
+        Assert.Equal("Core", coreType);
+        Assert.NotNull(coreDelay);
+        Assert.True(coreDelay!.Value > TimeSpan.FromMinutes(40) && coreDelay.Value <= TimeSpan.FromMinutes(45));
+        Assert.False(TransientErrorPolicy.IsNonRetriable(wrappedCore));
+
+        var retryAfterResp = Substitute.For<IResponse>();
+        retryAfterResp.StatusCode.Returns(System.Net.HttpStatusCode.Forbidden);
+        retryAfterResp.Headers.Returns(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Retry-After"] = "90"
+        });
+        var doubleWrappedRetryAfter = new InvalidOperationException(
+            "outer",
+            new Exception("middle", new ForbiddenException(retryAfterResp)));
+
+        Assert.True(TransientErrorPolicy.TryGetRateLimitInfo(doubleWrappedRetryAfter, out var retryDelay, out var retryType));
+        Assert.Equal("Secondary (Retry-After)", retryType);
+        Assert.Equal(TimeSpan.FromSeconds(90), retryDelay);
+        Assert.False(TransientErrorPolicy.IsNonRetriable(doubleWrappedRetryAfter));
+
+        // Depth beyond cap (depth > 8) stops unwrapping cleanly
+        Exception deepWrapped = (SecondaryRateLimitExceededException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(
+            typeof(SecondaryRateLimitExceededException));
+        for (int i = 0; i < 9; i++)
+        {
+            deepWrapped = new InvalidOperationException($"layer-{i}", deepWrapped);
+        }
+
+        Assert.False(TransientErrorPolicy.TryGetRateLimitInfo(deepWrapped, out _, out _));
+    }
+
+    [Fact]
+    public void TransientErrorPolicy_IsNonRetriable_UnwrapsAggregateExceptionCorrectly()
+    {
+        var notFound = new NotFoundException(CreateOctokitResponse(System.Net.HttpStatusCode.NotFound));
+        var forbidden = new ForbiddenException(CreateOctokitResponse(System.Net.HttpStatusCode.Forbidden));
+        var badArg = new ArgumentException("bad arg");
+        var transient503 = new HttpRequestException("upstream 503", null, System.Net.HttpStatusCode.ServiceUnavailable);
+        var secondaryRateLimit = (SecondaryRateLimitExceededException)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(
+            typeof(SecondaryRateLimitExceededException));
+
+        var allNonRetriable = new AggregateException(notFound, badArg);
+        Assert.True(TransientErrorPolicy.IsNonRetriable(allNonRetriable));
+
+        var nestedAllNonRetriable = new AggregateException(new AggregateException(notFound), forbidden);
+        Assert.True(TransientErrorPolicy.IsNonRetriable(nestedAllNonRetriable));
+
+        var mixedTransient = new AggregateException(notFound, transient503);
+        Assert.False(TransientErrorPolicy.IsNonRetriable(mixedTransient));
+
+        var mixedRateLimit = new AggregateException(notFound, secondaryRateLimit);
+        Assert.False(TransientErrorPolicy.IsNonRetriable(mixedRateLimit));
+
+        var emptyAggregate = new AggregateException();
+        Assert.False(TransientErrorPolicy.IsNonRetriable(emptyAggregate));
+    }
+
+    #endregion
 
     #endregion
 

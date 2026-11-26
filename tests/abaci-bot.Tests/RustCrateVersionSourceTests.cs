@@ -321,6 +321,7 @@ public class RustCrateVersionSourceTests
 
         var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
         {
+            DryRun = false,
             RustCratePoller = new RustCratePollerOptions
             {
                 Enabled = true,
@@ -407,6 +408,7 @@ public class RustCrateVersionSourceTests
 
         var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
         {
+            DryRun = false,
             RustCratePoller = new RustCratePollerOptions
             {
                 Enabled = true,
@@ -483,6 +485,7 @@ public class RustCrateVersionSourceTests
 
         var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
         {
+            DryRun = false,
             RustCratePoller = new RustCratePollerOptions
             {
                 Enabled = true,
@@ -540,6 +543,7 @@ public class RustCrateVersionSourceTests
 
         var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
         {
+            DryRun = false,
             RustCratePoller = new RustCratePollerOptions
             {
                 Enabled = true,
@@ -715,6 +719,123 @@ public class RustCrateVersionSourceTests
         var next = await source.GetCandidatesAsync();
         Assert.Single(next);
         Assert.Equal("rust-b", next[0].PackageName);
+    }
+
+    [Fact]
+    public async Task CompleteSweep_PersistsPoisonRewindAcrossRestarts_AndSkipsAfterMaxAttempts()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"rust-poison-{Guid.NewGuid():N}");
+        try
+        {
+            var crates = new[] { "rust-a-poison", "rust-b-next" };
+            var specCatalog = Substitute.For<ISpecCatalog>();
+            specCatalog.GetAllPackageNamesAsync(Arg.Any<CancellationToken>()).Returns(crates);
+            specCatalog.GetSpecAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(call =>
+                {
+                    var pkg = call.Arg<string>();
+                    return new SpecContext(pkg, pkg, $"%global crate_name {pkg}\nVersion: 1.0.0\n", $"SPECS/{pkg}/{pkg}.spec");
+                });
+
+            var handler = new FakeHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("""{"name":"crate","vers":"1.0.1","yanked":false}""")
+            });
+
+            var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+            {
+                DryRun = false,
+                TargetRepository = "openRuyi-Project/openRuyi",
+                RustCratePoller = new RustCratePollerOptions
+                {
+                    Enabled = true,
+                    IndexBaseUrl = "https://index.crates.io",
+                    MaxCratesPerSweep = 1,
+                    RequestDelayMilliseconds = 0
+                }
+            });
+
+            var botStateOptions = Microsoft.Extensions.Options.Options.Create(new BotStateOptions
+            {
+                StateDirectory = tempDir
+            });
+
+            // Simulate 3 separate process restarts sharing persisted JsonBotStateStore
+            for (int restart = 1; restart <= 3; restart++)
+            {
+                using var store = new JsonBotStateStore(botStateOptions, Microsoft.Extensions.Logging.Abstractions.NullLogger<JsonBotStateStore>.Instance);
+                var source = new RustCrateVersionSource(new HttpClient(handler), options, specCatalog: specCatalog, stateStore: store);
+                var cursor = (ICandidateSweepCursor)source;
+
+                var cands = await source.GetCandidatesAsync();
+                Assert.Single(cands);
+                Assert.Equal("rust-a-poison", cands[0].PackageName);
+
+                var sched = await CandidateScheduler.ScheduleAndExecuteAsync(
+                    cands,
+                    maxPublishes: 5,
+                    startOriginOffset: 0,
+                    canAttempt: (_, _) => true,
+                    tryPublishAsync: (_, _) => throw new HttpRequestException($"Failure #{restart}"));
+
+                cursor.CompleteSweep(sched.ProcessedPackageNames, sched.FailedPackageNames);
+            }
+
+            // 4th instance after restart must advance past rust-a-poison to rust-b-next
+            using var finalStore = new JsonBotStateStore(botStateOptions, Microsoft.Extensions.Logging.Abstractions.NullLogger<JsonBotStateStore>.Instance);
+            var finalSource = new RustCrateVersionSource(new HttpClient(handler), options, specCatalog: specCatalog, stateStore: finalStore);
+            var next = await finalSource.GetCandidatesAsync();
+
+            Assert.Single(next);
+            Assert.Equal("rust-b-next", next[0].PackageName);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task CompleteSweep_DryRunTrue_DoesNotPersistPoisonOrWatermarkState()
+    {
+        var store = Substitute.For<IBotStateStore>();
+        var specCatalog = Substitute.For<ISpecCatalog>();
+        specCatalog.GetAllPackageNamesAsync(Arg.Any<CancellationToken>()).Returns(new[] { "rust-a" });
+        specCatalog.GetSpecAsync("rust-a", Arg.Any<CancellationToken>())
+            .Returns(new SpecContext("rust-a", "rust-a", "%global crate_name rust-a\nVersion: 1.0.0\n", "SPECS/rust-a/rust-a.spec"));
+
+        var handler = new FakeHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent("""{"name":"rust-a","vers":"1.0.1","yanked":false}""")
+        });
+
+        var options = Microsoft.Extensions.Options.Options.Create(new PackageUpdateOptions
+        {
+            DryRun = true,
+            TargetRepository = "openRuyi-Project/openRuyi",
+            RustCratePoller = new RustCratePollerOptions
+            {
+                Enabled = true,
+                IndexBaseUrl = "https://index.crates.io",
+                MaxCratesPerSweep = 1,
+                RequestDelayMilliseconds = 0
+            }
+        });
+
+        var source = new RustCrateVersionSource(new HttpClient(handler), options, specCatalog: specCatalog, stateStore: store);
+        var cands = await source.GetCandidatesAsync();
+        Assert.Single(cands);
+
+        ((ICandidateSweepCursor)source).CompleteSweep(
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "rust-a" });
+
+        store.DidNotReceiveWithAnyArgs().SetCursorWatermark(default!, default);
+        store.DidNotReceiveWithAnyArgs().SetPackageFailure(default!, default!, default!, default, default);
+        store.DidNotReceiveWithAnyArgs().SetUserLocale(default!, default!);
     }
 }
 

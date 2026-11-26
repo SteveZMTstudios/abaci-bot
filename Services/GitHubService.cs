@@ -7,7 +7,7 @@ using System.Text.Json;
 
 namespace abaci_bot.Services;
 
-public class GitHubService : IGitHubService, IRepositoryPermissionService, IPackageUpdatePermissionProbeGateway, IBotIdentityProvider, IEphemeralCommentGateway, IRepositoryArchiveGateway, IPagedIssueSearchGateway, IOpenPullRequestInventoryGateway, IDisposable
+public class GitHubService : IGitHubService, IRepositoryPermissionService, IPackageUpdatePermissionProbeGateway, IBotIdentityProvider, IEphemeralCommentGateway, IRepositoryArchiveGateway, IPagedIssueSearchGateway, IOpenPullRequestInventoryGateway, IOptimisticFileContentGateway, IDisposable
 {
     private static readonly AsyncLocal<CancellationToken> _ambientCancellationToken = new();
 
@@ -530,7 +530,7 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IPack
     {
         using var _ = SetAmbientToken(ct);
         await EnsureAuthenticatedAsync(ct);
-        return await _client.Issue.Comment.GetAllForIssue(owner, repo, number);
+        return await _client.Issue.Comment.GetAllForIssue(owner, repo, number, new ApiOptions { PageSize = 100 });
     }
 
     public async Task<GitHubRateLimitSnapshot> GetRateLimitSnapshotAsync(CancellationToken ct = default)
@@ -727,6 +727,58 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IPack
         return createResult.Commit.Sha;
     }
 
+    public async Task<RepositoryFileContent?> GetFileContentWithShaAsync(
+        string owner, string repo, string path, string reference, CancellationToken ct = default)
+    {
+        using var _ = SetAmbientToken(ct);
+        ct.ThrowIfCancellationRequested();
+        await EnsureAuthenticatedAsync(ct);
+        ct.ThrowIfCancellationRequested();
+
+        IReadOnlyList<RepositoryContent>? existing;
+        try
+        {
+            existing = await _client.Repository.Content.GetAllContentsByRef(owner, repo, path, reference);
+        }
+        catch (NotFoundException)
+        {
+            return null;
+        }
+
+        if (existing == null || existing.Count == 0 || string.IsNullOrWhiteSpace(existing[0].Sha))
+        {
+            return null;
+        }
+
+        var content = existing[0].Content;
+        if (string.IsNullOrEmpty(content))
+        {
+            var raw = await _client.Repository.Content.GetRawContentByRef(owner, repo, path, reference);
+            content = raw != null ? Encoding.UTF8.GetString(raw) : string.Empty;
+        }
+
+        return new RepositoryFileContent(content, existing[0].Sha);
+    }
+
+    public async Task<string> UpdateFileContentIfUnchangedAsync(
+        string owner, string repo, string path, string message, string content, string branch, string expectedBlobSha, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(expectedBlobSha))
+        {
+            throw new ArgumentException("Expected blob SHA must be provided for optimistic file updates.", nameof(expectedBlobSha));
+        }
+
+        using var _ = SetAmbientToken(ct);
+        ct.ThrowIfCancellationRequested();
+        await EnsureAuthenticatedAsync(ct);
+        ct.ThrowIfCancellationRequested();
+
+        // Enforce compare-and-swap directly with caller's expectedBlobSha; never re-fetch latest blob SHA here.
+        var updateResult = await _client.Repository.Content.UpdateFile(
+            owner, repo, path, new UpdateFileRequest(message, content, expectedBlobSha, branch));
+        return updateResult.Commit.Sha;
+    }
+
     public async Task<PullRequest?> FindOpenPullRequestByHeadAsync(
         string owner, string repo, string headBranch, CancellationToken ct = default)
     {
@@ -804,6 +856,77 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IPack
         }
 
         return matched;
+    }
+
+    public async Task<IReadOnlyList<PullRequest>> FindOpenPullRequestsByHeadShaAsync(
+        string owner, string repo, string? headOwner, string? headBranch, string headSha, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(headSha))
+        {
+            return Array.Empty<PullRequest>();
+        }
+
+        using var _ = SetAmbientToken(ct);
+        ct.ThrowIfCancellationRequested();
+        await EnsureAuthenticatedAsync(ct);
+        ct.ThrowIfCancellationRequested();
+
+        if (!string.IsNullOrWhiteSpace(headOwner) && !string.IsNullOrWhiteSpace(headBranch))
+        {
+            var cleanBranch = headBranch.TrimStart('/');
+            if (cleanBranch.StartsWith("refs/heads/", StringComparison.OrdinalIgnoreCase))
+            {
+                cleanBranch = cleanBranch.Substring("refs/heads/".Length);
+            }
+            else if (cleanBranch.StartsWith("heads/", StringComparison.OrdinalIgnoreCase))
+            {
+                cleanBranch = cleanBranch.Substring("heads/".Length);
+            }
+
+            var headPrs = await _client.PullRequest.GetAllForRepository(
+                owner,
+                repo,
+                new PullRequestRequest
+                {
+                    State = ItemStateFilter.Open,
+                    Head = $"{headOwner}:{cleanBranch}"
+                });
+
+            var directMatches = headPrs?
+                .Where(pr => string.Equals(pr.Head?.Sha, headSha, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (directMatches is { Count: > 0 })
+            {
+                return directMatches;
+            }
+        }
+
+        var searchQuery = $"repo:{owner}/{repo} is:pr is:open {headSha}";
+        var searchResult = await _client.Search.SearchIssues(new SearchIssuesRequest(searchQuery)
+        {
+            Page = 1,
+            PerPage = 10
+        });
+
+        var fallbackMatches = new List<PullRequest>();
+        if (searchResult?.Items == null || searchResult.Items.Count == 0)
+        {
+            return fallbackMatches;
+        }
+
+        foreach (var item in searchResult.Items)
+        {
+            ct.ThrowIfCancellationRequested();
+            var fullPr = await GetPullRequestAsync(owner, repo, item.Number, ct);
+            if (fullPr != null &&
+                string.Equals(fullPr.State.StringValue, "open", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(fullPr.Head?.Sha, headSha, StringComparison.OrdinalIgnoreCase))
+            {
+                fallbackMatches.Add(fullPr);
+            }
+        }
+
+        return fallbackMatches;
     }
 
     public async Task<PullRequest> CreatePullRequestAsync(
@@ -1588,7 +1711,7 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IPack
             "Set ConversationGuard:ArchiveEnabled=false (recommended) or configure a triage+ user PAT via PackageUpdate:BotPat.");
     }
 
-    public async Task VerifyPackageUpdateWritePermissionAsync(
+    public async Task<string> VerifyPackageUpdateWritePermissionAsync(
         string owner, string repo, CancellationToken ct = default)
     {
         using var _ = SetAmbientToken(ct);
@@ -1599,7 +1722,24 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IPack
             await EnsureAuthenticatedAsync(ct);
             ct.ThrowIfCancellationRequested();
 
-            var repoInfo = await _client.Repository.Get(owner, repo);
+            Repository? repoInfo = null;
+            IReadOnlyDictionary<string, string>? responseHeaders = null;
+            try
+            {
+                var apiResponse = await _client.Connection.Get<Repository>(
+                    ApiUrls.Repository(owner, repo),
+                    new Dictionary<string, string>(),
+                    "application/vnd.github+json",
+                    ct);
+                repoInfo = apiResponse?.Body;
+                responseHeaders = apiResponse?.HttpResponse?.Headers;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException && ex is not ApiException)
+            {
+                // Fall back to IRepositoriesClient.Get when unit tests mock only Repository.Get
+            }
+
+            repoInfo ??= await _client.Repository.Get(owner, repo);
             var perms = repoInfo?.Permissions;
             if (perms == null || !(perms.Push || perms.Maintain || perms.Admin))
             {
@@ -1607,27 +1747,71 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IPack
                     $"Configured PackageUpdate:BotPat lacks write access (push+) on '{owner}/{repo}' required for PackageUpdate:Enabled=true && DryRun=false.");
             }
 
-            try
+            var oauthScopes = TryGetHeaderIgnoreCase(responseHeaders, "X-OAuth-Scopes");
+            if (!string.IsNullOrWhiteSpace(oauthScopes))
             {
-                await _client.Actions.Workflows.Runs.List(
+                var scopes = oauthScopes
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var hasClassicRepoScope = scopes.Contains("repo") || (!repoInfo!.Private && scopes.Contains("public_repo"));
+                if (!hasClassicRepoScope)
+                {
+                    var expectedScope = repoInfo!.Private ? "repo" : "repo (or public_repo)";
+                    throw new InvalidOperationException(
+                        $"Configured classic PackageUpdate:BotPat is missing required OAuth scope '{expectedScope}' on '{owner}/{repo}' (actual X-OAuth-Scopes='{oauthScopes}').");
+                }
+
+                await VerifyBotPatResourceReadableAsync(
+                    "Actions: Read-only",
+                    () => _client.Actions.Workflows.Runs.List(
+                        owner, repo, new WorkflowRunsRequest(), new ApiOptions { PageSize = 1, PageCount = 1 }),
                     owner,
-                    repo,
-                    new WorkflowRunsRequest(),
-                    new ApiOptions { PageSize = 1, PageCount = 1 });
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException(
-                    $"Configured PackageUpdate:BotPat failed to read GitHub Actions workflow runs on '{owner}/{repo}' ({ex.Message}). " +
-                    "Grant 'Actions: Read-only' (or classic 'repo' / 'public_repo') on PackageUpdate:BotPat.",
-                    ex);
+                    repo);
+                return "verified";
             }
 
-            return;
+            // Fine-grained PATs do not emit X-OAuth-Scopes and expose no non-mutating write-scope introspection API;
+            // probe zero-side-effect read access across all four required resources and surface honest "partial" status.
+            await VerifyBotPatResourceReadableAsync(
+                "Actions: Read-only",
+                () => _client.Actions.Workflows.Runs.List(
+                    owner, repo, new WorkflowRunsRequest(), new ApiOptions { PageSize = 1, PageCount = 1 }),
+                owner,
+                repo);
+            await VerifyBotPatResourceReadableAsync(
+                "Pull requests: Read and write",
+                () => _client.PullRequest.GetAllForRepository(
+                    owner, repo, new PullRequestRequest { State = ItemStateFilter.All }, new ApiOptions { PageSize = 1, PageCount = 1 }),
+                owner,
+                repo);
+            await VerifyBotPatResourceReadableAsync(
+                "Issues: Read and write",
+                () => _client.Issue.Labels.GetAllForRepository(
+                    owner, repo, new ApiOptions { PageSize = 1, PageCount = 1 }),
+                owner,
+                repo);
+            await VerifyBotPatResourceReadableAsync(
+                "Contents: Read and write",
+                async () =>
+                {
+                    try
+                    {
+                        await _client.Repository.Content.GetAllContents(owner, repo);
+                    }
+                    catch (NotFoundException)
+                    {
+                        // Empty repository returns 404 rather than 403 Forbidden
+                    }
+                },
+                owner,
+                repo);
+
+            _logger?.LogWarning(
+                "PackageUpdate:BotPat on '{Owner}/{Repo}' passed push+ and four zero-side-effect read probes (Actions, Pull requests, Issues, Contents), " +
+                "but GitHub REST API provides no non-mutating write-scope introspection for fine-grained PATs; reporting 'partial' capability status.",
+                owner,
+                repo);
+            return "partial";
         }
 
         Installation? installation;
@@ -1688,6 +1872,49 @@ public class GitHubService : IGitHubService, IRepositoryPermissionService, IPack
                 $"GitHub App installation on '{owner}/{repo}' is missing required PackageUpdate permissions: {string.Join("; ", missing)}. " +
                 "Grant 'Repository -> Contents: Read and write', 'Pull requests: Read and write', 'Issues: Read and write', and 'Actions: Read-only' " +
                 "on the GitHub App and accept updated permissions on the installation before running PackageUpdate with DryRun=false.");
+        }
+
+        return "verified";
+    }
+
+    private static string? TryGetHeaderIgnoreCase(IReadOnlyDictionary<string, string>? headers, string headerName)
+    {
+        if (headers == null)
+        {
+            return null;
+        }
+
+        foreach (var kv in headers)
+        {
+            if (string.Equals(kv.Key, headerName, StringComparison.OrdinalIgnoreCase))
+            {
+                return kv.Value;
+            }
+        }
+
+        return null;
+    }
+
+    private static async Task VerifyBotPatResourceReadableAsync(
+        string requiredPermission,
+        Func<Task> probe,
+        string owner,
+        string repo)
+    {
+        try
+        {
+            await probe();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                $"Configured PackageUpdate:BotPat failed read probe for '{requiredPermission}' on '{owner}/{repo}' ({ex.Message}). " +
+                $"Grant '{requiredPermission}' on PackageUpdate:BotPat.",
+                ex);
         }
     }
 

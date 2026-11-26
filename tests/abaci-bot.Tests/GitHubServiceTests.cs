@@ -2612,6 +2612,255 @@ public class GitHubServiceTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => svc4.VerifyCollaboratorPermissionProbeAsync("org", "public-repo"));
     }
 
+    [Fact]
+    public async Task GetFileContentWithShaAsync_AndUpdateFileContentIfUnchangedAsync_PassesExpectedShaAndPropagates409Conflict()
+    {
+        var (pem, rsa) = GenerateRsaKeyPair();
+        using (rsa)
+        {
+            var (service, client) = CreateTestService(pem);
+            var reposClient = Substitute.For<IRepositoriesClient>();
+            var contentClient = Substitute.For<IRepositoryContentsClient>();
+            reposClient.Content.Returns(contentClient);
+            client.Repository.Returns(reposClient);
+
+            // 1. Populated Content + Sha returns directly without GetRawContentByRef
+            var rcDirect = (RepositoryContent)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(RepositoryContent));
+            typeof(RepositoryContent).GetProperty(nameof(RepositoryContent.Sha))?.SetValue(rcDirect, "blob-sha-1");
+            typeof(RepositoryContent).GetProperty(nameof(RepositoryContent.EncodedContent))?.SetValue(
+                rcDirect, Convert.ToBase64String(Encoding.UTF8.GetBytes("Name: curl\nVersion: 8.21.0\n")));
+            contentClient.GetAllContentsByRef("owner", "repo", "SPECS/curl/curl.spec", "main")
+                .Returns(Task.FromResult<IReadOnlyList<RepositoryContent>>(new[] { rcDirect }));
+
+            var snapshot1 = await service.GetFileContentWithShaAsync("owner", "repo", "SPECS/curl/curl.spec", "main");
+            Assert.NotNull(snapshot1);
+            Assert.Equal("blob-sha-1", snapshot1!.BlobSha);
+            Assert.Contains("Version: 8.21.0", snapshot1.Content);
+            await contentClient.DidNotReceiveWithAnyArgs().GetRawContentByRef(default!, default!, default!, default!);
+
+            // 2. Empty Content falls back to GetRawContentByRef while retaining authoritative Sha
+            var rcFallback = (RepositoryContent)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(RepositoryContent));
+            typeof(RepositoryContent).GetProperty(nameof(RepositoryContent.Sha))?.SetValue(rcFallback, "blob-sha-raw");
+            contentClient.GetAllContentsByRef("owner", "repo", "SPECS/big/big.spec", "main")
+                .Returns(Task.FromResult<IReadOnlyList<RepositoryContent>>(new[] { rcFallback }));
+            contentClient.GetRawContentByRef("owner", "repo", "SPECS/big/big.spec", "main")
+                .Returns(Task.FromResult(Encoding.UTF8.GetBytes("Name: big\n")));
+
+            var snapshot2 = await service.GetFileContentWithShaAsync("owner", "repo", "SPECS/big/big.spec", "main");
+            Assert.NotNull(snapshot2);
+            Assert.Equal("blob-sha-raw", snapshot2!.BlobSha);
+            Assert.Equal("Name: big\n", snapshot2.Content);
+
+            // 3. UpdateFileContentIfUnchangedAsync passes expectedBlobSha directly without re-fetching GetAllContentsByRef
+            contentClient.ClearReceivedCalls();
+            var updatedSet = (RepositoryContentChangeSet)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(RepositoryContentChangeSet));
+            var updatedCommit = (Octokit.Commit)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Octokit.Commit));
+            typeof(Octokit.Commit).GetProperty(nameof(Octokit.Commit.Sha))?.SetValue(updatedCommit, "commit-cas-ok");
+            typeof(RepositoryContentChangeSet).GetProperty(nameof(RepositoryContentChangeSet.Commit))?.SetValue(updatedSet, updatedCommit);
+            contentClient.UpdateFile("owner", "repo", "SPECS/curl/curl.spec", Arg.Any<UpdateFileRequest>())
+                .Returns(Task.FromResult(updatedSet));
+
+            var commitSha = await service.UpdateFileContentIfUnchangedAsync(
+                "owner", "repo", "SPECS/curl/curl.spec", "bump curl", "new-body", "autoupdate/curl", "blob-sha-1");
+            Assert.Equal("commit-cas-ok", commitSha);
+            await contentClient.DidNotReceiveWithAnyArgs().GetAllContentsByRef(default!, default!, default!, default!);
+            await contentClient.Received(1).UpdateFile(
+                "owner",
+                "repo",
+                "SPECS/curl/curl.spec",
+                Arg.Is<UpdateFileRequest>(r => r.Sha == "blob-sha-1" && r.Branch == "autoupdate/curl"));
+
+            // 4. Empty expectedBlobSha rejected; 409 Conflict propagates unmodified
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                service.UpdateFileContentIfUnchangedAsync("owner", "repo", "SPECS/curl/curl.spec", "msg", "body", "branch", ""));
+
+            contentClient.UpdateFile("owner", "repo", "SPECS/curl/curl.spec", Arg.Any<UpdateFileRequest>())
+                .Returns<Task<RepositoryContentChangeSet>>(_ => throw new ApiException("Conflict", HttpStatusCode.Conflict));
+            var conflictEx = await Assert.ThrowsAsync<ApiException>(() =>
+                service.UpdateFileContentIfUnchangedAsync("owner", "repo", "SPECS/curl/curl.spec", "msg", "body", "branch", "stale-sha"));
+            Assert.Equal(HttpStatusCode.Conflict, conflictEx.StatusCode);
+        }
+    }
+
+    [Fact]
+    public async Task FindOpenPullRequestsByHeadShaAsync_UsesDirectHeadFilterAndFallsBackToSearchWithShaMatch()
+    {
+        var (pem, rsa) = GenerateRsaKeyPair();
+        using (rsa)
+        {
+            var (service, client) = CreateTestService(pem);
+            var prClient = Substitute.For<IPullRequestsClient>();
+            var searchClient = Substitute.For<ISearchClient>();
+            client.PullRequest.Returns(prClient);
+            client.Search.Returns(searchClient);
+
+            static PullRequest MakePr(int number, string headSha, ItemState state = ItemState.Open)
+            {
+                var pr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+                typeof(PullRequest).GetProperty(nameof(PullRequest.Number))?.SetValue(pr, number);
+                typeof(PullRequest).GetProperty(nameof(PullRequest.State))?.SetValue(pr, new StringEnum<ItemState>(state));
+                var head = (GitReference)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(GitReference));
+                typeof(GitReference).GetProperty(nameof(GitReference.Sha))?.SetValue(head, headSha);
+                typeof(PullRequest).GetProperty(nameof(PullRequest.Head))?.SetValue(pr, head);
+                return pr;
+            }
+
+            // 1. Direct fork head lookup strips refs/heads/ and matches Head.Sha without hitting Search
+            prClient.GetAllForRepository(
+                    "owner",
+                    "repo",
+                    Arg.Is<PullRequestRequest>(r => r.State == ItemStateFilter.Open && r.Head == "fork-user:feat"))
+                .Returns(Task.FromResult<IReadOnlyList<PullRequest>>(new[]
+                {
+                    MakePr(10, "other-sha"),
+                    MakePr(11, "target-sha")
+                }));
+
+            var direct = await service.FindOpenPullRequestsByHeadShaAsync("owner", "repo", "fork-user", "refs/heads/feat", "target-sha");
+            Assert.Single(direct);
+            Assert.Equal(11, direct[0].Number);
+            await searchClient.DidNotReceiveWithAnyArgs().SearchIssues(default!);
+
+            // 2. Empty direct result falls back to Search API and filters strictly by Open + Head.Sha
+            prClient.GetAllForRepository("owner", "repo", Arg.Any<PullRequestRequest>())
+                .Returns(Task.FromResult<IReadOnlyList<PullRequest>>(Array.Empty<PullRequest>()));
+
+            var issueMatch = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+            typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issueMatch, 22);
+            var issueClosed = (Issue)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Issue));
+            typeof(Issue).GetProperty(nameof(Issue.Number))?.SetValue(issueClosed, 23);
+            var searchRes = (SearchIssuesResult)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(SearchIssuesResult));
+            typeof(SearchIssuesResult).GetProperty(nameof(SearchIssuesResult.Items))?.SetValue(searchRes, new List<Issue> { issueMatch, issueClosed });
+            searchClient.SearchIssues(Arg.Is<SearchIssuesRequest>(r => r.Term.Contains("fallback-sha"))).Returns(Task.FromResult(searchRes));
+
+            prClient.Get("owner", "repo", 22).Returns(Task.FromResult(MakePr(22, "fallback-sha", ItemState.Open)));
+            prClient.Get("owner", "repo", 23).Returns(Task.FromResult(MakePr(23, "fallback-sha", ItemState.Closed)));
+
+            var fallback = await service.FindOpenPullRequestsByHeadShaAsync("owner", "repo", "fork-user", "feat", "fallback-sha");
+            Assert.Single(fallback);
+            Assert.Equal(22, fallback[0].Number);
+        }
+    }
+
+    [Fact]
+    public async Task VerifyPackageUpdateWritePermissionAsync_ClassicPatVsFineGrainedPat_ReportsVerifiedOrPartialAndFailsFast()
+    {
+        var (pem, rsa) = GenerateRsaKeyPair();
+        using (rsa)
+        {
+            // 1. GitHub App installation returns "verified"
+            var (appService, appClient) = CreateTestService(pem);
+            var appsClient = Substitute.For<IGitHubAppsClient>();
+            appClient.GitHubApps.Returns(appsClient);
+            var perms = (InstallationPermissions)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(InstallationPermissions));
+            var writePerm = (StringEnum<InstallationReadWritePermissionLevel>?)new StringEnum<InstallationReadWritePermissionLevel>(InstallationReadWritePermissionLevel.Write);
+            var readPerm = (StringEnum<InstallationReadWritePermissionLevel>?)new StringEnum<InstallationReadWritePermissionLevel>(InstallationReadWritePermissionLevel.Read);
+            typeof(InstallationPermissions).GetProperty(nameof(InstallationPermissions.Contents))?.SetValue(perms, writePerm);
+            typeof(InstallationPermissions).GetProperty(nameof(InstallationPermissions.PullRequests))?.SetValue(perms, writePerm);
+            typeof(InstallationPermissions).GetProperty(nameof(InstallationPermissions.Issues))?.SetValue(perms, writePerm);
+            typeof(InstallationPermissions).GetProperty(nameof(InstallationPermissions.Actions))?.SetValue(perms, readPerm);
+            var inst = (Installation)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Installation));
+            typeof(Installation).GetProperty(nameof(Installation.Permissions))?.SetValue(inst, perms);
+            appsClient.GetRepositoryInstallationForCurrent("owner", "repo").Returns(Task.FromResult(inst));
+
+            Assert.Equal("verified", await appService.VerifyPackageUpdateWritePermissionAsync("owner", "repo"));
+
+            // 2. Classic PAT with X-OAuth-Scopes: repo -> "verified"; missing repo -> fails fast
+            var patClient = Substitute.For<IGitHubClient>();
+            var conn = Substitute.For<IConnection>();
+            patClient.Connection.Returns(conn);
+            var reposClient = Substitute.For<IRepositoriesClient>();
+            var contentClient = Substitute.For<IRepositoryContentsClient>();
+            reposClient.Content.Returns(contentClient);
+            var prClient = Substitute.For<IPullRequestsClient>();
+            var issueClient = Substitute.For<IIssuesClient>();
+            var labelsClient = Substitute.For<IIssuesLabelsClient>();
+            issueClient.Labels.Returns(labelsClient);
+            var actionsClient = Substitute.For<IActionsClient>();
+            var wfClient = Substitute.For<IActionsWorkflowsClient>();
+            var runsClient = Substitute.For<IActionsWorkflowRunsClient>();
+            wfClient.Runs.Returns(runsClient);
+            actionsClient.Workflows.Returns(wfClient);
+            patClient.Repository.Returns(reposClient);
+            patClient.PullRequest.Returns(prClient);
+            patClient.Issue.Returns(issueClient);
+            patClient.Actions.Returns(actionsClient);
+
+            var pushRepo = (Repository)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Repository));
+            typeof(Repository).GetProperty(nameof(Repository.Permissions))?.SetValue(
+                pushRepo, new RepositoryPermissions(admin: false, maintain: false, push: true, triage: true, pull: true));
+            typeof(Repository).GetProperty(nameof(Repository.Private))?.SetValue(pushRepo, true);
+
+            static IApiResponse<Repository> MakeRepoResponse(Repository repoObj, IReadOnlyDictionary<string, string> headers)
+            {
+                var httpResp = Substitute.For<IResponse>();
+                httpResp.Headers.Returns(headers);
+                var apiResp = Substitute.For<IApiResponse<Repository>>();
+                apiResp.Body.Returns(repoObj);
+                apiResp.HttpResponse.Returns(httpResp);
+                return apiResp;
+            }
+
+            var classicOkResp = MakeRepoResponse(pushRepo, new Dictionary<string, string> { ["X-OAuth-Scopes"] = "repo, read:org" });
+            conn.Get<Repository>(ApiUrls.Repository("owner", "repo"), Arg.Any<IDictionary<string, string>>(), "application/vnd.github+json", Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult(classicOkResp));
+
+            var classicSvc = new GitHubService(123456, pem, 789012, "ghp_classic", patClient);
+            Assert.Equal("verified", await classicSvc.VerifyPackageUpdateWritePermissionAsync("owner", "repo"));
+
+            var classicMissingScopeResp = MakeRepoResponse(pushRepo, new Dictionary<string, string> { ["X-OAuth-Scopes"] = "read:org" });
+            conn.Get<Repository>(ApiUrls.Repository("owner", "repo"), Arg.Any<IDictionary<string, string>>(), "application/vnd.github+json", Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult(classicMissingScopeResp));
+            var exMissingScope = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                classicSvc.VerifyPackageUpdateWritePermissionAsync("owner", "repo"));
+            Assert.Contains("X-OAuth-Scopes", exMissingScope.Message);
+
+            // 3. Fine-grained PAT (no X-OAuth-Scopes) passing 4 probes (404 empty repo tolerated on Contents) -> "partial"; 403 on PullRequests fails fast
+            var finePatResp = MakeRepoResponse(pushRepo, new Dictionary<string, string>());
+            conn.Get<Repository>(ApiUrls.Repository("owner", "repo"), Arg.Any<IDictionary<string, string>>(), "application/vnd.github+json", Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult(finePatResp));
+            var notFoundResp = Substitute.For<IResponse>();
+            notFoundResp.StatusCode.Returns(HttpStatusCode.NotFound);
+            contentClient.GetAllContents("owner", "repo").Returns<Task<IReadOnlyList<RepositoryContent>>>(_ => throw new NotFoundException(notFoundResp));
+
+            var fineSvc = new GitHubService(123456, pem, 789012, "github_pat_fine", patClient);
+            Assert.Equal("partial", await fineSvc.VerifyPackageUpdateWritePermissionAsync("owner", "repo"));
+
+            var forbiddenResp = Substitute.For<IResponse>();
+            forbiddenResp.StatusCode.Returns(HttpStatusCode.Forbidden);
+            prClient.GetAllForRepository("owner", "repo", Arg.Any<PullRequestRequest>(), Arg.Any<ApiOptions>())
+                .Returns<Task<IReadOnlyList<PullRequest>>>(_ => throw new ForbiddenException(forbiddenResp));
+            var exPrForbidden = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                fineSvc.VerifyPackageUpdateWritePermissionAsync("owner", "repo"));
+            Assert.Contains("Pull requests: Read and write", exPrForbidden.Message);
+        }
+    }
+
+    [Fact]
+    public async Task GetIssueCommentsAsync_PassesPageSize100ApiOptionsForEfficientFullPagination()
+    {
+        var (pem, rsa) = GenerateRsaKeyPair();
+        using (rsa)
+        {
+            var (service, client) = CreateTestService(pem);
+            var issueClient = Substitute.For<IIssuesClient>();
+            var commentsClient = Substitute.For<IIssueCommentsClient>();
+            issueClient.Comment.Returns(commentsClient);
+            client.Issue.Returns(issueClient);
+            commentsClient.GetAllForIssue("owner", "repo", 55L, Arg.Any<ApiOptions>())
+                .Returns(Task.FromResult<IReadOnlyList<IssueComment>>(Array.Empty<IssueComment>()));
+
+            var comments = await service.GetIssueCommentsAsync("owner", "repo", 55);
+
+            Assert.Empty(comments);
+            await commentsClient.Received(1).GetAllForIssue(
+                "owner",
+                "repo",
+                55L,
+                Arg.Is<ApiOptions>(o => o.PageSize == 100 && o.PageCount == null));
+        }
+    }
+
     private sealed class ControllableHttpMessageHandler : HttpMessageHandler
     {
         private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _handler;

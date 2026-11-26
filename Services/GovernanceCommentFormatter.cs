@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using abaci_bot.Options;
+using Microsoft.Extensions.Options;
 
 namespace abaci_bot.Services;
 
@@ -11,46 +12,102 @@ namespace abaci_bot.Services;
 /// </summary>
 public class GovernanceCommentFormatter : IGovernanceCommentFormatter
 {
+    public const string RebuildGateCommentMarker = "<!-- abaci-bot:rebuild-gate -->";
+
+    private readonly IReadOnlyList<VerificationReferenceLink>? _configuredReferenceLinks;
+
+    public GovernanceCommentFormatter(IOptions<RebuildImpactOptions>? rebuildImpactOptions = null)
+    {
+        _configuredReferenceLinks = rebuildImpactOptions?.Value.VerificationGuideLinks;
+    }
+
     public string PreferredLocale { get; set; } = "en";
 
     private bool IsChinese(string? locale) =>
         string.Equals(locale ?? PreferredLocale, "zh", StringComparison.OrdinalIgnoreCase) ||
         (locale ?? PreferredLocale).StartsWith("zh-", StringComparison.OrdinalIgnoreCase);
 
-    public string FormatConsolidatedHeader(string? locale = null)
+    public string FormatConsolidatedHeader(string? locale = null) =>
+        FormatConsolidatedHeader(locale, botDisplayName: null);
+
+    public string FormatConsolidatedHeader(string? locale, string? botDisplayName)
     {
-        return IsChinese(locale)
-            ? "## abaci-bot 门禁与治理检查报告"
-            : "## abaci-bot Governance Review";
+        var isZh = IsChinese(locale);
+        var displayName = NormalizeBotDisplayName(botDisplayName);
+        var sb = new StringBuilder();
+
+        if (isZh)
+        {
+            sb.AppendLine("感谢您的贡献！我们发现以下几个需要您关注的事项：");
+            sb.AppendLine();
+            sb.Append(CultureInfo.InvariantCulture, $"## {displayName} 审查说明");
+        }
+        else
+        {
+            sb.AppendLine("Thank you for your contribution! We have identified a few points that require your attention:");
+            sb.AppendLine();
+            sb.Append(CultureInfo.InvariantCulture, $"## {displayName} Review Notes");
+        }
+
+        var resolvedLinks = ResolveReferenceLinks(_configuredReferenceLinks, isZh);
+        if (resolvedLinks.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine(isZh ? "更多参考文档：" : "For more details, see:");
+            foreach (var (title, url) in resolvedLinks)
+            {
+                sb.AppendLine(CultureInfo.InvariantCulture, $"- [{title}]({url})");
+            }
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    private static string NormalizeBotDisplayName(string? botDisplayName)
+    {
+        if (string.IsNullOrWhiteSpace(botDisplayName))
+        {
+            return "abaci-bot";
+        }
+
+        var trimmed = botDisplayName.Trim();
+        const string botSuffix = "[bot]";
+        if (trimmed.EndsWith(botSuffix, StringComparison.OrdinalIgnoreCase))
+        {
+            trimmed = trimmed[..^botSuffix.Length].TrimEnd();
+        }
+
+        return string.IsNullOrWhiteSpace(trimmed) ? "abaci-bot" : trimmed;
     }
 
     public string FormatSpdxLicenseIssue(IReadOnlyList<(string File, string Expression, string Details)> issues, string? locale = null)
     {
         var isZh = IsChinese(locale);
         var sb = new StringBuilder();
-        sb.AppendLine("> [!WARNING]");
+        sb.AppendLine("> [!TIP]");
 
         if (isZh)
         {
-            sb.AppendLine("> **SPDX 许可证合规检查未通过**");
-            sb.AppendLine("> 所有软件包 Spec 必须采用符合标准 SPDX 规范的许可证标识符：");
+            sb.AppendLine("> **请将 SPDX 许可证标签补充为标准标识符**");
+            sb.AppendLine("> 为帮助软件包元数据顺利通过合规检查，请将以下 Spec 文件中的 `License:` 更新为标准 SPDX 标识符：");
             foreach (var (file, expr, details) in issues)
             {
-                sb.AppendLine(CultureInfo.InvariantCulture, $"> - `{file}`: 许可证表达式 `{expr}` 不合规（{details}）。");
+                sb.AppendLine(CultureInfo.InvariantCulture, $"> - `{file}`: 当前声明 `{expr}`（{details}）。");
             }
             sb.AppendLine(">");
-            sb.Append("> 请参考 [SPDX License List](https://spdx.org/licenses/) 修正后再推入更新。");
+            sb.Append("> 您可以在 [SPDX License List](https://spdx.org/licenses/) 查询标准标识符并在方便时推送更新。");
         }
         else
         {
-            sb.AppendLine("> **SPDX License Compliance Check Failed**");
-            sb.AppendLine("> All RPM package specifications must declare valid standard SPDX license identifiers:");
+            sb.AppendLine("> **SPDX License Tag Update Suggested**");
+            sb.AppendLine("> To help keep package metadata compliant, please update the `License:` field(s) below to use standard SPDX identifiers:");
             foreach (var (file, expr, details) in issues)
             {
-                sb.AppendLine(CultureInfo.InvariantCulture, $"> - `{file}`: Expression `{expr}` is not compliant ({details}).");
+                sb.AppendLine(CultureInfo.InvariantCulture, $"> - `{file}`: declared `{expr}` ({details}).");
             }
             sb.AppendLine(">");
-            sb.Append("> Please refer to the [SPDX License List](https://spdx.org/licenses/) to update the license identifiers.");
+            sb.Append("> You can look up standard identifiers in the [SPDX License List](https://spdx.org/licenses/) and push an update whenever you're ready.");
         }
 
         return sb.ToString();
@@ -65,7 +122,7 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
         if (isZh)
         {
             sb.AppendLine("> **安全漏洞评估清单**");
-            sb.AppendLine("> 检测到本 PR 包含 CVE 漏洞修复或变更关联：");
+            sb.AppendLine("> 我们检测到本 PR 涉及以下 CVE 漏洞记录，供您与维护者审查参考：");
             foreach (var (cveId, cvss, severity, source) in cves)
             {
                 if (cvss.HasValue)
@@ -89,7 +146,7 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
         else
         {
             sb.AppendLine("> **Security Vulnerability Assessment**");
-            sb.AppendLine("> Detected the following CVE vulnerability references associated with this pull request:");
+            sb.AppendLine("> We spotted the following CVE references associated with this pull request:");
             foreach (var (cveId, cvss, severity, source) in cves)
             {
                 if (cvss.HasValue)
@@ -124,25 +181,30 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
     {
         var isZh = IsChinese(locale);
         var pkgList = string.Join("`, `", packages);
-        var resolvedLinks = ResolveReferenceLinks(referenceLinks, isZh);
+        var headerUrls = ResolveReferenceLinks(_configuredReferenceLinks, isZh)
+            .Select(l => l.Url)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var resolvedLinks = ResolveReferenceLinks(referenceLinks, isZh)
+            .Where(l => !headerUrls.Contains(l.Url))
+            .ToList();
         var sb = new StringBuilder();
         sb.AppendLine("> [!IMPORTANT]");
 
         if (isZh)
         {
-            sb.AppendLine("> **Rebuild 规模准入拦截**");
-            sb.AppendLine(CultureInfo.InvariantCulture, $"> 本 PR 涉及基础包变更（`{pkgList}`），在下游反向依赖 DAG 中触发 **{affectedCount}** 个软件包重构（阈值: {threshold}）。");
+            sb.AppendLine("> **Rebuild 影响范围暂缓合并**");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"> 本次变更涉及基础软件包（`{pkgList}`），在下游反向依赖图中会影响 **{affectedCount}** 个软件包重构（暂缓阈值：{threshold}）。");
             sb.AppendLine(">");
-            sb.AppendLine(CultureInfo.InvariantCulture, $"> 为防止大规模级联构建影响 {targetBranch} 主干分支稳定性，已自动添加 `Workflow: Blocked` 拦截合并。");
-            sb.AppendLine("> **建议处置**：请在独立的构建环境（例如配置 `linkedbuild=\"localdep\"` 的 OBS 个人子项目）中对受影响的下游反向依赖完成隔离构建验证后再推进合并。");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"> 为保障 `{targetBranch}` 分支稳定性，我们先将该 PR 的合并暂时置于等待状态（已标记 `Workflow: Blocked`），待维护者确认下游兼容后推进。");
+            sb.AppendLine("> **后续步骤**：维护者会协调完成受影响下游软件包的隔离构建验证，确认通过后解除暂缓状态，外部贡献者无需进行额外环境配置。");
         }
         else
         {
-            sb.AppendLine("> **Rebuild Impact Gate: Merge Blocked**");
-            sb.AppendLine(CultureInfo.InvariantCulture, $"> Changes to base packages (`{pkgList}`) trigger a cascading rebuild of **{affectedCount}** downstream packages in the reverse dependency graph (threshold: {threshold}).");
+            sb.AppendLine("> **Rebuild Impact Hold**");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"> Because changes to base packages (`{pkgList}`) trigger a cascading rebuild of **{affectedCount}** downstream packages in the reverse dependency graph (hold threshold: {threshold}),");
             sb.AppendLine(">");
-            sb.AppendLine(CultureInfo.InvariantCulture, $"> To safeguard the stability of the `{targetBranch}` branch, this pull request has been automatically marked with `Workflow: Blocked` to prevent merging.");
-            sb.AppendLine("> **Recommended Action**: Verify the affected downstream reverse dependencies in an isolated build environment (for example, an OBS personal subproject with `linkedbuild=\"localdep\"`) before merging.");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"> we place merges to `{targetBranch}` on hold (`Workflow: Blocked`) while maintainers verify downstream compatibility.");
+            sb.AppendLine("> **Next Steps**: Maintainers will coordinate isolated downstream rebuild verification and lift the hold once checks pass—no extra setup is required from external contributors.");
         }
 
         if (resolvedLinks.Count > 0)
@@ -155,6 +217,7 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
             }
         }
 
+        sb.AppendLine(RebuildGateCommentMarker);
         return sb.ToString().TrimEnd();
     }
 
@@ -220,8 +283,8 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
 
         if (isZh)
         {
-            sb.AppendLine("> **ABI 破坏性兼容性变更预警**");
-            sb.AppendLine("> 门禁比对检测到二进制共享库存在破坏性 ABI 改变（缺少导出的公共符号或 SONAME 发生变更）：");
+            sb.AppendLine("> **检测到破坏性 ABI 变更**");
+            sb.AppendLine("> 二进制比对发现共享库存在破坏性 ABI 修改（例如导出的公共符号缺失或 SONAME 变更）：");
             sb.AppendLine(">");
             sb.AppendLine("> ```");
             foreach (var line in snippet.Split('\n'))
@@ -230,12 +293,12 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
             }
             sb.AppendLine("> ```");
             sb.AppendLine(">");
-            sb.Append("> 下游依赖此动态库的应用可能发生运行时符号解析崩溃，请评估是否属于有意变更。");
+            sb.Append("> 依赖该动态库的下游软件包可能在运行时发生符号解析失败。请与维护者确认该破坏性变更是否符合预期，以便协调后续下游重构。");
         }
         else
         {
             sb.AppendLine("> **ABI Breaking Change Detected**");
-            sb.AppendLine("> Binary comparison detected incompatible ABI modifications in shared libraries (e.g. missing exported symbols or SONAME changes):");
+            sb.AppendLine("> Binary comparison detected incompatible ABI modifications in shared libraries (for example, missing exported symbols or SONAME changes):");
             sb.AppendLine(">");
             sb.AppendLine("> ```");
             foreach (var line in snippet.Split('\n'))
@@ -244,7 +307,7 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
             }
             sb.AppendLine("> ```");
             sb.AppendLine(">");
-            sb.Append("> Downstream applications depending on this library may encounter runtime symbol resolution crashes. Please verify whether this breaking change is intended.");
+            sb.Append("> Downstream packages depending on this library may encounter symbol resolution failures at runtime. Please confirm with maintainers whether this breaking ABI change is intended so downstream rebuilds can be coordinated.");
         }
 
         return sb.ToString();
@@ -262,12 +325,12 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
         }
 
         var sb = new StringBuilder();
-        sb.AppendLine("> [!WARNING]");
+        sb.AppendLine("> [!NOTE]");
 
         if (isZh)
         {
-            sb.AppendLine("> **ABI 合规比对未能完成**");
-            sb.AppendLine("> 本 PR 的二进制 ABI 比对检查未能完整执行：");
+            sb.AppendLine("> **ABI 自动比对未能完成**");
+            sb.AppendLine("> 本 PR 的二进制 ABI 自动比对未能完整执行（这并不意味着您的变更存在问题）：");
             if (sanitizedReason.Contains('\n'))
             {
                 sb.AppendLine("> - 原因：");
@@ -284,12 +347,12 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
                 sb.AppendLine(CultureInfo.InvariantCulture, $"> - 原因：{sanitizedReason}");
             }
             sb.AppendLine(">");
-            sb.Append("> PR 已标记 `Status: ABI Unverified`，请维护者检查构建产物或依赖 baseline。");
+            sb.Append("> 本 PR 已标记 `Status: ABI Unverified`，维护者可按需检查构建产物或基线软件包。");
         }
         else
         {
-            sb.AppendLine("> **ABI Compliance Check Incomplete**");
-            sb.AppendLine("> Binary ABI comparison could not be completed for this pull request:");
+            sb.AppendLine("> **ABI Comparison Not Completed**");
+            sb.AppendLine("> We couldn't complete the automated binary ABI comparison for this pull request (this is not necessarily an issue with your changes):");
             if (sanitizedReason.Contains('\n'))
             {
                 sb.AppendLine("> - Reason:");
@@ -306,7 +369,7 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
                 sb.AppendLine(CultureInfo.InvariantCulture, $"> - Reason: {sanitizedReason}");
             }
             sb.AppendLine(">");
-            sb.Append("> The pull request has been tagged with `Status: ABI Unverified`. Please verify RPM artifacts or baseline packages.");
+            sb.Append("> This pull request has been marked `Status: ABI Unverified`. Maintainers can inspect the build artifacts or baseline packages if needed.");
         }
 
         return sb.ToString();

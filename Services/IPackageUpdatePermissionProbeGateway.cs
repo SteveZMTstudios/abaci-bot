@@ -6,7 +6,7 @@ namespace abaci_bot.Services;
 /// </summary>
 public interface IPackageUpdatePermissionProbeGateway
 {
-    Task VerifyPackageUpdateWritePermissionAsync(string owner, string repo, CancellationToken ct = default);
+    Task<string> VerifyPackageUpdateWritePermissionAsync(string owner, string repo, CancellationToken ct = default);
 
     Task VerifyBotPatTeamReadPermissionAsync(string owner, string repo, string teamName, CancellationToken ct = default);
 }

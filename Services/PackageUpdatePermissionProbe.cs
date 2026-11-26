@@ -59,6 +59,8 @@ public class PackageUpdatePermissionProbe : IHostedService
             return;
         }
 
+        var writeProbeStatus = "verified";
+
         try
         {
             if (_packageUpdate.Enabled && !_packageUpdate.DryRun)
@@ -69,7 +71,7 @@ public class PackageUpdatePermissionProbe : IHostedService
                         $"PackageUpdate:TargetRepository '{_packageUpdate.TargetRepository}' must be formatted as 'owner/repo'.");
                 }
 
-                await _probeGateway.VerifyPackageUpdateWritePermissionAsync(targetOwner, targetRepo, cancellationToken);
+                writeProbeStatus = await _probeGateway.VerifyPackageUpdateWritePermissionAsync(targetOwner, targetRepo, cancellationToken);
             }
 
             if (shouldProbeTeam)
@@ -104,7 +106,9 @@ public class PackageUpdatePermissionProbe : IHostedService
             throw new InvalidOperationException(fatalMessage, ex);
         }
 
-        SetStatus((_packageUpdate.Enabled && _packageUpdate.DryRun) ? "dry-run" : "verified");
+        SetStatus((_packageUpdate.Enabled && _packageUpdate.DryRun)
+            ? "dry-run"
+            : (string.IsNullOrWhiteSpace(writeProbeStatus) ? "verified" : writeProbeStatus));
         _logger.LogInformation(
             "PackageUpdate permission probe completed with status '{Status}' (Enabled={Enabled}, DryRun={DryRun}, HasBotPat={HasBotPat}).",
             Status,

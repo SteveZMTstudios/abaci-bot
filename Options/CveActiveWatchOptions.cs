@@ -5,48 +5,78 @@ namespace abaci_bot.Options;
 /// </summary>
 public class CveActiveWatchOptions
 {
+    [ConfigField(
+        Description = "Master toggle for the active CVE vulnerability watch background worker.",
+        TrueBehavior = "scans catalog packages every CheckIntervalHours.",
+        FalseBehavior = "no proactive CVE scans are executed.")]
     public bool Enabled { get; set; }
 
+    [ConfigField(
+        Description = "Safety dry-run switch preventing issue writes during proactive CVE scans.",
+        TrueBehavior = "findings are logged without creating or closing tracking issues.",
+        FalseBehavior = "security tracking issues are created, updated, and closed on GitHub.")]
     public bool DryRun { get; set; } = true;
 
+    [ConfigField(
+        Description = "Target repository scanned for CVE exposure across RPM specs.",
+        Format = "\"owner/repo\"",
+        EmptyBehavior = "scans and issue filing are skipped.")]
     public string TargetRepository { get; set; } = "openRuyi-Project/openRuyi";
 
+    [ConfigField(
+        Description = "Interval between proactive CVE watch sweeps.",
+        Unit = "hours",
+        Range = ">= 1")]
     public int CheckIntervalHours { get; set; } = 24;
 
-    /// <summary>
-    /// Number of package entries per OSV batch query (OSV API supports up to 1000).
-    /// </summary>
+    [ConfigField(
+        Description = "Number of package queries batched into each OSV API request.",
+        Unit = "packages per batch",
+        Range = "1..1000")]
     public int OsvBatchSize { get; set; } = 1000;
 
-    /// <summary>
-    /// Total packages to query per sweep (0 = scan full catalog, which takes ~7 batch calls for 6290 packages).
-    /// </summary>
+    [ConfigField(
+        Description = "Packages evaluated per sweep using a persisted repository-scoped 2PC watermark in bot-state.json when DryRun=false.",
+        Unit = "packages per sweep",
+        Range = ">= 0",
+        EmptyBehavior = "0 scans every package in the catalog during each sweep.")]
     public int PackagesPerSweep { get; set; }
 
-    /// <summary>
-    /// When false (default), only packages with an authoritative OSV ecosystem (<c>crates.io</c>, <c>PyPI</c>)
-    /// are queried against OSV.dev; native RPM specs are skipped as unverified to avoid cross-distribution false positives.
-    /// When true, native RPM packages with valid non-macro versions are queried best-effort without an ecosystem
-    /// and flagged with a best-effort warning in generated issues. Default: false.
-    /// </summary>
+    [ConfigField(
+        Description = "Controls best-effort OSV querying of native RPM specs lacking an authoritative upstream ecosystem.",
+        TrueBehavior = "queries non-macro native RPM packages best-effort and adds a best-effort warning banner to generated issues.",
+        FalseBehavior = "skips native RPM specs lacking crates.io or PyPI ecosystems to avoid cross-distribution false positives.")]
     public bool IncludeUnverifiedNativePackages { get; set; }
 
-    /// <summary>
-    /// Daily cap on queries dispatched to NVD when OSV lacks CVSS metrics.
-    /// </summary>
+    [ConfigField(
+        Description = "Daily cap on fallback queries dispatched to NIST NVD when OSV lacks CVSS scores.",
+        Unit = "queries per day",
+        Range = ">= 0",
+        EmptyBehavior = "0 disables NVD fallback queries.")]
     public int MaxNvdQueriesPerDay { get; set; } = 200;
 
-    /// <summary>
-    /// Inter-request delay for unauthenticated NVD queries to avoid HTTP 429.
-    /// </summary>
+    [ConfigField(
+        Description = "Delay inserted between NVD requests to avoid HTTP 429 rate limits.",
+        Unit = "milliseconds",
+        Range = ">= 0",
+        EmptyBehavior = "0 removes inter-request delay (only safe with an NVD API key).")]
     public int NvdRequestDelayMilliseconds { get; set; } = 6500;
 
-    /// <summary>
-    /// Maximum concurrent HTTP requests dispatched when resolving OSV vulnerability details.
-    /// </summary>
+    [ConfigField(
+        Description = "Maximum concurrent HTTP requests dispatched when resolving OSV vulnerability details.",
+        Unit = "concurrent requests",
+        Range = ">= 1")]
     public int MaxConcurrentOsvRequests { get; set; } = 8;
 
+    [ConfigField(
+        Description = "Label applied to proactive CVE tracking issues.",
+        Format = "label name",
+        EmptyBehavior = "falls back to Vulnerability: Detected.")]
     public string IssueLabel { get; set; } = "Vulnerability: Detected";
 
+    [ConfigField(
+        Description = "Duration before cached proactive CVE query results expire.",
+        Unit = "hours",
+        Range = ">= 1")]
     public int CacheExpirationHours { get; set; } = 168; // 7 days
 }

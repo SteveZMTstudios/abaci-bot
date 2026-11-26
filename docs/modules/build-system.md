@@ -54,6 +54,7 @@ This module operates without external configuration keys. It parses files retrie
 
 - **Missing BuildSystem Header**: If a spec file builds via custom shell scripts or does not declare a `BuildSystem:` directive, `BuildSystem: misc` is applied.
 - **Spec Deletion**: If a spec file is removed in the PR, it is ignored during build system parsing.
+- **Inaccessible Fork `.spec` Reads (`403`/`404`/`410`)**: Isolated per file so remaining pipeline modules still run, `CI` labeling is preserved, and existing `BuildSystem:*` labels are not stripped; rate-limit (`RateLimitExceededException`, `SecondaryRateLimitExceededException`, `AbuseException`, HTTP `429`) and `5xx` errors are not isolated and propagate to `WebhookDispatcher` for retry.
 
 ---
 

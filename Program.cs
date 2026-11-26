@@ -75,6 +75,7 @@ builder.Services.AddSingleton<IEphemeralCommentGateway>(sp => sp.GetRequiredServ
 builder.Services.AddSingleton<IRepositoryArchiveGateway>(sp => sp.GetRequiredService<GitHubService>());
 builder.Services.AddSingleton<IPagedIssueSearchGateway>(sp => sp.GetRequiredService<GitHubService>());
 builder.Services.AddSingleton<IOpenPullRequestInventoryGateway>(sp => sp.GetRequiredService<GitHubService>());
+builder.Services.AddSingleton<IOptimisticFileContentGateway>(sp => sp.GetRequiredService<GitHubService>());
 
 builder.Services.AddHttpClient();
 
@@ -194,8 +195,15 @@ builder.Services.AddHostedService<CveActiveWatchService>();
 builder.Services.AddHostedService<MilestoneBackfillSweepService>();
 builder.Services.AddHostedService<LockSweepService>();
 
-// Register the pipeline orchestrator
+// Register the pipeline orchestrator and bounded async webhook dispatcher
 builder.Services.AddSingleton<PullRequestPipeline>();
+builder.Services.AddSingleton<WebhookDispatcher>();
+builder.Services.AddSingleton<IWebhookDispatcher>(sp => sp.GetRequiredService<WebhookDispatcher>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<WebhookDispatcher>());
+builder.Services.Configure<GitHubWebhookOptions>(options =>
+{
+    options.ExceptionHandler = WebhookDispatcher.HandleWebhookExceptionAsync;
+});
 
 builder.Services.AddSingleton<WebhookEventProcessor, GitHubWebhookProcessor>();
 

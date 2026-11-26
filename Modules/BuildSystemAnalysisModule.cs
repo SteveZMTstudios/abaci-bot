@@ -1,8 +1,11 @@
 using System.Collections.Concurrent;
+using System.Net;
 using System.Text.RegularExpressions;
 using abaci_bot.Contexts;
 using abaci_bot.Pipelines;
 using abaci_bot.Services;
+using Microsoft.Extensions.Logging;
+using Octokit;
 using Octokit.Webhooks.Events.PullRequest;
 
 namespace abaci_bot.Modules;
@@ -14,6 +17,13 @@ namespace abaci_bot.Modules;
 /// </summary>
 public partial class BuildSystemAnalysisModule : IPullRequestModule
 {
+    private readonly ILogger<BuildSystemAnalysisModule>? _logger;
+
+    public BuildSystemAnalysisModule(ILogger<BuildSystemAnalysisModule>? logger = null)
+    {
+        _logger = logger;
+    }
+
     public string ModuleName => "BuildSystemAnalysisModule";
 
     public int Priority => 30;
@@ -73,6 +83,7 @@ public partial class BuildSystemAnalysisModule : IPullRequestModule
                         f.FileName.EndsWith(".spec", StringComparison.OrdinalIgnoreCase))
             .ToList();
 
+        int missingSpecCount = 0;
         if (specFiles.Count > 0)
         {
             var parallelOptions = new ParallelOptions
@@ -83,7 +94,25 @@ public partial class BuildSystemAnalysisModule : IPullRequestModule
 
             await Parallel.ForEachAsync(specFiles, parallelOptions, async (file, ct) =>
             {
-                var content = await context.GetFileContentAsync(file.FileName, context.HeadSha, file.Sha, ct);
+                string content;
+                try
+                {
+                    content = await context.GetFileContentAsync(file.FileName, context.HeadSha, file.Sha, ct);
+                }
+                catch (Exception ex) when (
+                    !TransientErrorPolicy.IsRateLimitOrAbuse(ex) &&
+                    (ex is NotFoundException or ForbiddenException ||
+                     ex is ApiException { StatusCode: HttpStatusCode.Gone }))
+                {
+                    // Isolate unavailable fork .spec reads (403/404/410) so remaining pipeline modules (Status: New, Target:*, Type:*)
+                    // are not aborted and existing BuildSystem:* labels are not erroneously stripped.
+                    Interlocked.Increment(ref missingSpecCount);
+                    _logger?.LogWarning(
+                        ex,
+                        "Spec file '{FileName}' returned inaccessible status for {Owner}/{Repo}#{PrNumber} (head={HeadSha}); skipping BuildSystem classification rewrite.",
+                        file.FileName, context.Owner, context.Repo, context.PrNumber, context.HeadSha);
+                    return;
+                }
 
                 // Identify declared build systems in RPM spec files (flexible whitespace handling)
                 var match = BuildSystemRegex().Match(content);
@@ -130,6 +159,15 @@ public partial class BuildSystemAnalysisModule : IPullRequestModule
         }
 
         var uniqueLabels = new HashSet<string>(desiredLabels, StringComparer.OrdinalIgnoreCase);
+
+        if (Volatile.Read(ref missingSpecCount) > 0)
+        {
+            if (uniqueLabels.Contains(GitHubLabels.Ci))
+            {
+                context.LabelsToAdd.Add(GitHubLabels.Ci);
+            }
+            return;
+        }
 
         // Reconcile complete managed label set: add current desired labels, remove stale ones
         context.ReconcileLabels(ManagedLabels, label => uniqueLabels.Contains(label));

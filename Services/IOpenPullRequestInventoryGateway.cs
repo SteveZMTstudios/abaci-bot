@@ -19,4 +19,12 @@ public interface IOpenPullRequestInventoryGateway
         string repo,
         IEnumerable<(string Name, string Color, string Description)> labels,
         CancellationToken ct = default);
+
+    Task<IReadOnlyList<PullRequest>> FindOpenPullRequestsByHeadShaAsync(
+        string owner,
+        string repo,
+        string? headOwner,
+        string? headBranch,
+        string headSha,
+        CancellationToken ct = default);
 }

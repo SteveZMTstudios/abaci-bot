@@ -53,9 +53,8 @@ be replaced with the four facts above.
 
 ASP.NET Core's configuration builder natively reads JSON files with comments and trailing commas enabled (`JsonCommentHandling.Skip` and `AllowTrailingCommas = true`).
 
-`appsettings.demo.jsonc` intentionally mirrors every default declared in `Options/*.cs`.
-`DemoConfigurationOptionsTests` fails when a property or default is missing from the demo
-file, so the reference cannot drift silently. The deployed `appsettings.json` only needs
+`appsettings.demo.jsonc` is generated deterministically from `[ConfigField]` metadata on `Options/*.cs` and `Services/ConfigSchemaCatalog.cs` rather than hand-edited.
+`DemoConfigurationOptionsTests` (`AllOptionsProperties_HaveCompleteConfigFieldMetadata` and `GeneratedDemo_MatchesRepositoryFile`) fails if any property, default, or metadata diverges from the generated reference file. The deployed `appsettings.json` only needs
 the values that differ from those defaults.
 
 ---
@@ -67,7 +66,7 @@ Before launching `abaci-bot`, the following settings **must** be populated:
 | Key | Type | Description | Production Source |
 |---|---|---|---|
 | `GitHubApp:AppId` | `int` | Unique GitHub App ID. | Environment variable `GitHubApp__AppId` |
-| `GitHubApp:InstallationId` | `int` | GitHub App Installation ID on target organization/repo. | Environment variable `GitHubApp__InstallationId` |
+| `GitHubApp:InstallationId` | `long` | GitHub App Installation ID on target organization/repo. | Environment variable `GitHubApp__InstallationId` |
 | `GitHubApp:PrivateKey` | `string` | RSA Private Key in PEM format. | Secret mount / environment variable `GitHubApp__PrivateKey` |
 | `GitHubApp:WebhookSecret` | `string` | Webhook verification secret. | Environment variable `GitHubApp__WebhookSecret` |
 | `GitHubApp:TeamName` | `string` | Team slug inside an existing GitHub organization you administer, used for review transitions (required; no code default; example: `captains`). | `appsettings.json` or environment variable |
