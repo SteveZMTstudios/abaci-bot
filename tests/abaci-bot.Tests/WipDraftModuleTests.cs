@@ -50,7 +50,8 @@ public class WipDraftModuleTests
         bool isClosed = false,
         IReadOnlyList<IssueComment>? existingComments = null,
         IGitHubService? customGitHub = null,
-        string locale = "en")
+        string locale = "en",
+        string? previousTitle = null)
     {
         var resolvedAction = prAction ?? PullRequestAction.Edited;
         var gitHub = customGitHub ?? Substitute.For<IGitHubService>();
@@ -78,7 +79,8 @@ public class WipDraftModuleTests
             authorLogin: "contributor",
             action: resolvedAction.ToString() ?? "edited",
             existingLabels: Array.Empty<string>(),
-            prAction: resolvedAction);
+            prAction: resolvedAction,
+            previousTitle: previousTitle);
         context.PreferredLocale = locale;
         return context;
     }
@@ -154,7 +156,9 @@ public class WipDraftModuleTests
         Assert.False(notice.Delete);
         Assert.Null(notice.ExistingCommentId);
         Assert.Equal(DraftMarker, notice.Marker);
-        Assert.StartsWith("> [!TIP]", notice.Body, StringComparison.Ordinal);
+        Assert.StartsWith("Thank you for your contribution!", notice.Body, StringComparison.Ordinal);
+        Assert.Contains("## abaci-bot Review Notes", notice.Body, StringComparison.Ordinal);
+        Assert.Contains("> [!TIP]", notice.Body, StringComparison.Ordinal);
         Assert.Contains("**Convert to draft**", notice.Body, StringComparison.Ordinal);
         Assert.Contains(PrUrl, notice.Body, StringComparison.Ordinal);
         Assert.DoesNotContain("<button", notice.Body, StringComparison.OrdinalIgnoreCase);
@@ -575,10 +579,12 @@ public class WipDraftModuleTests
         foreach (var locale in new[] { "en", "zh-CN" })
         {
             var draftTip = formatter.FormatWipTip(WipTipKind.Draft, PrUrl, locale, specialLinks);
+            Assert.Contains(locale == "en" ? "For more details, see:" : "更多参考文档：", draftTip, StringComparison.Ordinal);
             Assert.True(WipDraftModule.TryParseTipKind(draftTip, out var parsedDraft));
             Assert.Equal(WipTipKind.Draft, parsedDraft);
 
             var readyTip = formatter.FormatWipTip(WipTipKind.Ready, PrUrl, locale, specialLinks);
+            Assert.Contains(locale == "en" ? "For more details, see:" : "更多参考文档：", readyTip, StringComparison.Ordinal);
             Assert.True(WipDraftModule.TryParseTipKind(readyTip, out var parsedReady));
             Assert.Equal(WipTipKind.Ready, parsedReady);
         }
@@ -636,5 +642,119 @@ public class WipDraftModuleTests
         Assert.Single(createdTips);
         await gitHub.DidNotReceive().UpdateCommentAsync(
             Arg.Any<string>(), Arg.Any<string>(), Arg.Any<long>(), Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Reconcile_ConvertToDraftThenRemoveWipTitle_PostsReadyTip_ThenReadyForReviewDeletesTip()
+    {
+        var botState = Microsoft.Extensions.Options.Options.Create(new BotStateOptions
+        {
+            GeneralDocumentationLinks = new List<DocumentationLink>
+            {
+                new() { Title = "Contributor Guide", TitleZh = "贡献指南", Url = "https://docs.openruyi.org/contributing" }
+            }
+        });
+        var formatter = new GovernanceCommentFormatter(botState);
+        var wipOptions = Microsoft.Extensions.Options.Options.Create(new WipDraftOptions
+        {
+            Enabled = true,
+            DryRun = false,
+            DocumentationLinks = new List<DocumentationLink>
+            {
+                new() { Title = "Draft PR Guide", TitleZh = "草稿规范", Url = "https://docs.openruyi.org/draft" }
+            }
+        });
+        var identity = Substitute.For<IBotIdentityProvider>();
+        identity.GetBotLoginAsync(Arg.Any<CancellationToken>()).Returns("abaci-bot-test[bot]");
+        var module = new WipDraftModule(wipOptions, formatter, identity);
+
+        // 1. Open WIP ready PR -> posts framed Draft TIP using live bot display name & merged footer links
+        var ctx1 = CreateContext("WIP: feat", isDraft: false, PullRequestAction.Opened);
+        await module.ProcessAsync(ctx1, CancellationToken.None);
+
+        var draftNotice = Assert.Single(ctx1.PendingNotices);
+        Assert.False(draftNotice.Delete);
+        Assert.Equal(DraftMarker, draftNotice.Marker);
+        Assert.NotNull(draftNotice.Body);
+        Assert.StartsWith("Thank you for your contribution!", draftNotice.Body, StringComparison.Ordinal);
+        Assert.Contains("## abaci-bot-test Review Notes", draftNotice.Body, StringComparison.Ordinal);
+        Assert.Contains("> [!TIP]", draftNotice.Body, StringComparison.Ordinal);
+        Assert.Contains("For more details, see:\n- [Draft PR Guide](https://docs.openruyi.org/draft)\n- [Contributor Guide](https://docs.openruyi.org/contributing)", draftNotice.Body.Replace("\r\n", "\n", StringComparison.Ordinal), StringComparison.Ordinal);
+        Assert.True(WipDraftModule.TryParseTipKind(draftNotice.Body, out var parsedDraft));
+        Assert.Equal(WipTipKind.Draft, parsedDraft);
+
+        // 2. Contributor clicks "Convert to draft" while title still has WIP -> deletes Draft TIP
+        var ctx2 = CreateContext(
+            "WIP: feat",
+            isDraft: true,
+            PullRequestAction.ConvertedToDraft,
+            existingComments: new[] { CreateBotComment(801, draftNotice.Body, login: "abaci-bot-test[bot]") });
+        await module.ProcessAsync(ctx2, CancellationToken.None);
+
+        var deleteDraftNotice = Assert.Single(ctx2.PendingNotices);
+        Assert.True(deleteDraftNotice.Delete);
+        Assert.Equal(801L, deleteDraftNotice.ExistingCommentId);
+
+        // 3. Contributor removes "WIP: " from title while still in draft -> creates Ready TIP
+        var ctx3 = CreateContext(
+            "feat",
+            isDraft: true,
+            PullRequestAction.Edited,
+            existingComments: Array.Empty<IssueComment>(),
+            previousTitle: "WIP: feat");
+        await module.ProcessAsync(ctx3, CancellationToken.None);
+
+        var readyNotice = Assert.Single(ctx3.PendingNotices);
+        Assert.False(readyNotice.Delete);
+        Assert.Null(readyNotice.ExistingCommentId);
+        Assert.Equal(ReadyMarker, readyNotice.Marker);
+        Assert.NotNull(readyNotice.Body);
+        Assert.Contains("**Ready for review**", readyNotice.Body, StringComparison.Ordinal);
+        Assert.True(WipDraftModule.TryParseTipKind(readyNotice.Body, out var parsedReady));
+        Assert.Equal(WipTipKind.Ready, parsedReady);
+
+        // 4. Control: manual draft renamed without prior WIP title -> stays untouched
+        var manualDraftEditCtx = CreateContext(
+            "feat v2",
+            isDraft: true,
+            PullRequestAction.Edited,
+            existingComments: Array.Empty<IssueComment>(),
+            previousTitle: "Initial design");
+        await module.ProcessAsync(manualDraftEditCtx, CancellationToken.None);
+        Assert.Empty(manualDraftEditCtx.PendingNotices);
+
+        // 5. Contributor clicks "Ready for review" -> deletes Ready TIP
+        var ctx5 = CreateContext(
+            "feat",
+            isDraft: false,
+            PullRequestAction.ReadyForReview,
+            existingComments: new[] { CreateBotComment(802, readyNotice.Body, login: "abaci-bot-test[bot]") });
+        await module.ProcessAsync(ctx5, CancellationToken.None);
+
+        var deleteReadyNotice = Assert.Single(ctx5.PendingNotices);
+        Assert.True(deleteReadyNotice.Delete);
+        Assert.Equal(802L, deleteReadyNotice.ExistingCommentId);
+    }
+
+    [Fact]
+    public void TryParseTipKind_RejectsFramedConsolidatedCommentWithOtherSectionAndWipMarker()
+    {
+        var consolidatedWithOtherSection = string.Join(
+            "\n",
+            "Thank you for your contribution! We have identified a few points that require your attention:",
+            string.Empty,
+            "## abaci-bot Review Notes",
+            string.Empty,
+            "### CVE Vulnerability Breakdown",
+            "- CVE-2026-0001 detected in sample spec",
+            string.Empty,
+            "> [!TIP]",
+            "> This pull request title contains `WIP`. If it is not ready for review, use **Convert to draft** under the pull request description.",
+            ">",
+            $"> [Open the pull request]({PrUrl})",
+            string.Empty,
+            DraftMarker);
+
+        Assert.False(WipDraftModule.TryParseTipKind(consolidatedWithOtherSection, out _));
     }
 }

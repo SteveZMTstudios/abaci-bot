@@ -76,33 +76,15 @@ public class WipDraftModule : IPullRequestModule
             return;
         }
 
-        IReadOnlyList<ExistingTipComment>? existingTips;
-        try
+        var inspection = await FindExistingTipCommentsAsync(context, cancellationToken);
+
+        // Fail closed when bot identity cannot be resolved so another bot's comment is never mutated.
+        if (inspection == null)
         {
-            existingTips = await FindExistingTipCommentsAsync(context, cancellationToken);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _runtimeHealth?.RecordError(
-                nameof(WipDraftModule),
-                ex,
-                $"Failed to inspect WIP TIP comments on {context.Owner}/{context.Repo}#{context.PrNumber}");
-            _logger?.LogWarning(
-                ex,
-                "Could not inspect existing WIP TIP comments on PR {Owner}/{Repo}#{PrNumber}; skipping reconciliation for this delivery.",
-                context.Owner, context.Repo, context.PrNumber);
             return;
         }
 
-        // Fail closed when bot identity cannot be resolved so another bot's comment is never mutated.
-        if (existingTips == null)
-        {
-            return;
-        }
+        var (existingTips, botDisplayName) = inspection.Value;
 
         var desiredKind = ResolveDesiredTipKind(context, existingTips);
         if (desiredKind == null)
@@ -116,7 +98,8 @@ public class WipDraftModule : IPullRequestModule
             desiredKind.Value,
             prUrl,
             context.PreferredLocale,
-            _options.DocumentationLinks);
+            _options.DocumentationLinks,
+            botDisplayName);
         if (string.IsNullOrWhiteSpace(targetBody))
         {
             return;
@@ -197,39 +180,86 @@ public class WipDraftModule : IPullRequestModule
             return false;
         }
 
-        if (!normalized.StartsWith("> [!TIP]\n", StringComparison.Ordinal))
-        {
-            return false;
-        }
-
         var bodyBeforeMarker = normalized[..^(marker.Length + 1)];
-        if (bodyBeforeMarker.IndexOf("> [!", 8, StringComparison.Ordinal) >= 0)
+        var lines = bodyBeforeMarker.Split('\n');
+        var tipStartIndex = Array.FindIndex(lines, static line => string.Equals(line, "> [!TIP]", StringComparison.Ordinal));
+        if (tipStartIndex < 0 || tipStartIndex + 1 >= lines.Length)
         {
             return false;
         }
 
-        var lines = bodyBeforeMarker.Split('\n');
-        if (lines.Length < 2)
+        // Reject multi-callout review comments or injected callouts anywhere else in the body.
+        for (var i = 0; i < lines.Length; i++)
         {
-            return false;
+            if (i != tipStartIndex && lines[i].TrimStart().StartsWith("> [!", StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        if (tipStartIndex > 0)
+        {
+            // Unified frame must start with the standard consolidated review opener + heading and nothing else before > [!TIP].
+            if (tipStartIndex < 3 ||
+                (!string.Equals(lines[0], GovernanceCommentFormatter.ConsolidatedOpenerEn, StringComparison.Ordinal) &&
+                 !string.Equals(lines[0], GovernanceCommentFormatter.ConsolidatedOpenerZh, StringComparison.Ordinal)) ||
+                lines[1].Length != 0 ||
+                !lines[2].StartsWith("## ", StringComparison.Ordinal) ||
+                (!lines[2].EndsWith(" Review Notes", StringComparison.Ordinal) &&
+                 !lines[2].EndsWith(" 审查说明", StringComparison.Ordinal)))
+            {
+                return false;
+            }
+
+            for (var i = 3; i < tipStartIndex; i++)
+            {
+                if (lines[i].Length != 0)
+                {
+                    return false;
+                }
+            }
         }
 
         var expectedLeadMatch = kind == WipTipKind.Draft
-            ? string.Equals(lines[1], GovernanceCommentFormatter.WipDraftTipLeadEn, StringComparison.Ordinal) ||
-              string.Equals(lines[1], GovernanceCommentFormatter.WipDraftTipLeadZh, StringComparison.Ordinal)
-            : string.Equals(lines[1], GovernanceCommentFormatter.WipReadyTipLeadEn, StringComparison.Ordinal) ||
-              string.Equals(lines[1], GovernanceCommentFormatter.WipReadyTipLeadZh, StringComparison.Ordinal);
+            ? string.Equals(lines[tipStartIndex + 1], GovernanceCommentFormatter.WipDraftTipLeadEn, StringComparison.Ordinal) ||
+              string.Equals(lines[tipStartIndex + 1], GovernanceCommentFormatter.WipDraftTipLeadZh, StringComparison.Ordinal)
+            : string.Equals(lines[tipStartIndex + 1], GovernanceCommentFormatter.WipReadyTipLeadEn, StringComparison.Ordinal) ||
+              string.Equals(lines[tipStartIndex + 1], GovernanceCommentFormatter.WipReadyTipLeadZh, StringComparison.Ordinal);
         if (!expectedLeadMatch)
         {
             return false;
         }
 
-        foreach (var line in lines)
+        var index = tipStartIndex + 1;
+        while (index < lines.Length && lines[index].TrimStart().StartsWith('>'))
         {
-            if (line.Length > 0 && !line.TrimStart().StartsWith('>'))
+            index++;
+        }
+
+        // After the > [!TIP] blockquote, permit only blank lines and the unified "See also" footer list.
+        var sawFooterHeader = false;
+        for (; index < lines.Length; index++)
+        {
+            var line = lines[index];
+            if (line.Length == 0)
             {
-                return false;
+                continue;
             }
+
+            if (!sawFooterHeader &&
+                (string.Equals(line, "For more details, see:", StringComparison.Ordinal) ||
+                 string.Equals(line, "更多参考文档：", StringComparison.Ordinal)))
+            {
+                sawFooterHeader = true;
+                continue;
+            }
+
+            if (sawFooterHeader && line.StartsWith("- ", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            return false;
         }
 
         return true;
@@ -257,8 +287,10 @@ public class WipDraftModule : IPullRequestModule
             return null;
         }
 
-        // Respect manual drafts when the bot never previously issued a WIP TIP comment.
-        return existingTips.Count > 0 ? WipTipKind.Ready : null;
+        // Respect manual drafts unless this edit event just removed a WIP token from the PR title.
+        var justRemovedWip = context.PullRequestAction == PullRequestAction.Edited &&
+                             WipTitleHelper.IsWip(context.PreviousTitle);
+        return existingTips.Count > 0 || justRemovedWip ? WipTipKind.Ready : null;
     }
 
     private void QueueDeletions(PullRequestContext context, IEnumerable<ExistingTipComment> tipsToDelete)
@@ -281,7 +313,7 @@ public class WipDraftModule : IPullRequestModule
         }
     }
 
-    private async Task<IReadOnlyList<ExistingTipComment>?> FindExistingTipCommentsAsync(
+    private async Task<(IReadOnlyList<ExistingTipComment> Tips, string? BotDisplayName)?> FindExistingTipCommentsAsync(
         PullRequestContext context,
         CancellationToken cancellationToken)
     {
@@ -305,7 +337,28 @@ public class WipDraftModule : IPullRequestModule
             return null;
         }
 
-        var comments = await context.IssueComments.Value;
+        IReadOnlyList<IssueComment> comments;
+        try
+        {
+            comments = await context.IssueComments.Value;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _runtimeHealth?.RecordError(
+                nameof(WipDraftModule),
+                ex,
+                $"Failed to inspect WIP TIP comments on {context.Owner}/{context.Repo}#{context.PrNumber}");
+            _logger?.LogWarning(
+                ex,
+                "Could not inspect existing WIP TIP comments on PR {Owner}/{Repo}#{PrNumber}; skipping reconciliation for this delivery.",
+                context.Owner, context.Repo, context.PrNumber);
+            return null;
+        }
+
         var matches = new List<ExistingTipComment>();
         foreach (var comment in comments)
         {
@@ -320,6 +373,6 @@ public class WipDraftModule : IPullRequestModule
         }
 
         matches.Sort(static (left, right) => left.Id.CompareTo(right.Id));
-        return matches;
+        return (matches, ownBotLogins.FirstOrDefault());
     }
 }

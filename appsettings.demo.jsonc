@@ -814,7 +814,7 @@
     // Default: 104857600
     "MaxArchiveBytes": 104857600,
 
-    // Module-specific documentation links appended to automated package update PR comments (stepped-aside notices and failed-PR TTL closures).
+    // Module-specific documentation links appended to automated package update PR comments (stepped-aside warnings and failed-PR TTL closures) and OBS blocked tracking issue bodies (before the hidden package marker).
     // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
     // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
     // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
@@ -906,7 +906,7 @@
     // Default: 168
     "CacheExpirationHours": 168,
 
-    // Module-specific documentation links appended to proactive CVE notice and auto-resolution comments.
+    // Module-specific documentation links appended to proactive CVE notices, auto-resolution comments, and tracking issue bodies (before the hidden package marker).
     // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
     // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
     // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".

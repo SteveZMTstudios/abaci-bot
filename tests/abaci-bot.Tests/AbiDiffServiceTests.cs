@@ -899,4 +899,465 @@ public class AbiDiffServiceTests
             if (File.Exists(tempV6)) File.Delete(tempV6);
         }
     }
+
+    [Fact]
+    public void BuildStartInfo_WithWorkingDirectoryAndSigpipeReset_ConfiguresEnvWrapperAndTempDir()
+    {
+        var startInfo = ProcessAbiDiffRunner.BuildStartInfo(
+            "/usr/bin/abipkgdiff",
+            "/tmp/old.rpm",
+            "/tmp/new.rpm",
+            privateDso: true,
+            dsoOnly: true,
+            oldDebuginfoPath: "/tmp/old-debuginfo.rpm",
+            newDebuginfoPath: "/tmp/new-debuginfo.rpm",
+            workingDirectory: "/tmp/abaci-abi-123",
+            resetSigpipeWithEnv: true);
+
+        Assert.Equal("/usr/bin/env", startInfo.FileName);
+        Assert.Equal("/tmp/abaci-abi-123", startInfo.WorkingDirectory);
+        Assert.Equal("/tmp/abaci-abi-123", startInfo.Environment["TMPDIR"]);
+        Assert.Equal(
+            new[]
+            {
+                "--default-signal=PIPE",
+                "/usr/bin/abipkgdiff",
+                "--private-dso",
+                "--dso-only",
+                "--d1",
+                "/tmp/old-debuginfo.rpm",
+                "--d2",
+                "/tmp/new-debuginfo.rpm",
+                "/tmp/old.rpm",
+                "/tmp/new.rpm"
+            },
+            startInfo.ArgumentList);
+    }
+
+    [Fact]
+    public void IsTransientWriteError_MatchesArchiveWriteErrors_AndRejectsOtherFailures()
+    {
+        var failed = new AbiDiffResult(false, false, false, "Error writing archive: Write error", "failed");
+        Assert.True(ProcessAbiDiffRunner.IsTransientWriteError(failed, "Error writing archive: Write error"));
+        Assert.True(ProcessAbiDiffRunner.IsTransientWriteError(failed, "write error on pipe"));
+        Assert.False(ProcessAbiDiffRunner.IsTransientWriteError(failed, "some other failure"));
+        Assert.False(ProcessAbiDiffRunner.IsTransientWriteError(failed, string.Empty));
+
+        var succeeded = new AbiDiffResult(true, false, false, "clean");
+        Assert.False(ProcessAbiDiffRunner.IsTransientWriteError(succeeded, "Error writing archive: Write error"));
+
+        var toolMissing = new AbiDiffResult(false, false, false, "missing", "missing", ToolMissing: true);
+        Assert.False(ProcessAbiDiffRunner.IsTransientWriteError(toolMissing, "Error writing archive: Write error"));
+    }
+
+    [Fact]
+    public async Task RunDiffAsync_TransientWriteError_RetriesOnceWithFreshWorkDirAndSucceeds()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"abaci_r75_retry_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        var oldRpm = Path.Combine(tempRoot, "libfoo-1.0-1.x86_64.rpm");
+        var newRpm = Path.Combine(tempRoot, "libfoo-1.0-2.x86_64.rpm");
+        File.WriteAllText(oldRpm, "old-rpm-bytes");
+        File.WriteAllText(newRpm, "new-rpm-bytes");
+
+        var recordedWorkDirs = new List<string>();
+        var attempts = 0;
+        var runner = new ProcessAbiDiffRunner(
+            Microsoft.Extensions.Options.Options.Create(new AbiComplianceOptions
+            {
+                AbipkgdiffExecutablePath = "/usr/bin/abipkgdiff",
+                TempExtractionDirectory = tempRoot
+            }),
+            logger: null,
+            processExecutor: (startInfo, _) =>
+            {
+                attempts++;
+                recordedWorkDirs.Add(startInfo.WorkingDirectory);
+                Assert.True(Directory.Exists(startInfo.WorkingDirectory));
+                Assert.Equal(startInfo.WorkingDirectory, startInfo.Environment["TMPDIR"]);
+                Assert.Equal("/usr/bin/env", startInfo.FileName);
+                Assert.Equal("--default-signal=PIPE", startInfo.ArgumentList[0]);
+                Assert.Equal("/usr/bin/abipkgdiff", startInfo.ArgumentList[1]);
+
+                return Task.FromResult(attempts == 1
+                    ? (0, string.Empty, "Error writing archive: Write error")
+                    : (4, "Functions changes summary: 0 Removed, 0 Changed, 1 Added function", string.Empty));
+            },
+            supportsEnvDefaultSigpipe: () => true);
+
+        try
+        {
+            var result = await runner.RunDiffAsync(oldRpm, newRpm);
+
+            Assert.True(result.Succeeded);
+            Assert.True(result.HasAbiChange);
+            Assert.False(result.IsBreakingChange);
+            Assert.Equal(2, attempts);
+            Assert.Equal(2, recordedWorkDirs.Count);
+            Assert.NotEqual(recordedWorkDirs[0], recordedWorkDirs[1]);
+            Assert.Empty(Directory.EnumerateDirectories(tempRoot, $"{ProcessAbiDiffRunner.RetainedWorkDirPrefix}*"));
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task RunDiffAsync_PersistentWriteError_RetriesOncePreservesSnapshotAndPrunesBeyondFive()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"abaci_r75_persist_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        var oldRpm = Path.Combine(tempRoot, "libassuan-3.0.2-6.2.x86_64.rpm");
+        var newRpm = Path.Combine(tempRoot, "libassuan-3.0.2-999.x86_64.rpm");
+        var oldDebug = Path.Combine(tempRoot, "libassuan-debuginfo-3.0.2-6.2.x86_64.rpm");
+        var newDebug = Path.Combine(tempRoot, "libassuan-debuginfo-3.0.2-999.x86_64.rpm");
+        File.WriteAllText(oldRpm, "old-rpm");
+        File.WriteAllText(newRpm, "new-rpm");
+        File.WriteAllText(oldDebug, "old-debug");
+        File.WriteAllText(newDebug, "new-debug");
+
+        var logger = Substitute.For<ILogger<ProcessAbiDiffRunner>>();
+        var totalProcessCalls = 0;
+        var runner = new ProcessAbiDiffRunner(
+            Microsoft.Extensions.Options.Options.Create(new AbiComplianceOptions
+            {
+                AbipkgdiffExecutablePath = "/usr/bin/abipkgdiff",
+                TempExtractionDirectory = tempRoot
+            }),
+            logger: logger,
+            processExecutor: (_, _) =>
+            {
+                totalProcessCalls++;
+                return Task.FromResult((0, string.Empty, "Error writing archive: Write error"));
+            },
+            supportsEnvDefaultSigpipe: () => false);
+
+        try
+        {
+            AbiDiffResult? lastResult = null;
+            for (var i = 0; i < 6; i++)
+            {
+                lastResult = await runner.RunDiffAsync(oldRpm, newRpm, oldDebug, newDebug);
+            }
+
+            Assert.NotNull(lastResult);
+            Assert.False(lastResult.Succeeded);
+            Assert.False(lastResult.HasAbiChange);
+            Assert.Contains("Write error", lastResult.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+            // Each of the 6 calls executes initial + 1 bounded retry = 12 attempts total.
+            Assert.Equal(12, totalProcessCalls);
+
+            var retainedDirs = Directory.EnumerateDirectories(tempRoot, $"{ProcessAbiDiffRunner.RetainedWorkDirPrefix}*").ToList();
+            Assert.Equal(ProcessAbiDiffRunner.MaxRetainedFailureSnapshots, retainedDirs.Count);
+
+            var sampleDir = retainedDirs[0];
+            var diagPath = Path.Combine(sampleDir, ProcessAbiDiffRunner.DiagnosticFileName);
+            Assert.True(File.Exists(diagPath));
+            var diagContent = File.ReadAllText(diagPath);
+            Assert.Contains("/usr/bin/abipkgdiff", diagContent, StringComparison.Ordinal);
+            Assert.Contains("TMPDIR:", diagContent, StringComparison.Ordinal);
+            Assert.Contains("HOME:", diagContent, StringComparison.Ordinal);
+            Assert.Contains("ExitCode: 0", diagContent, StringComparison.Ordinal);
+            Assert.Contains("Error writing archive: Write error", diagContent, StringComparison.Ordinal);
+            Assert.True(File.Exists(Path.Combine(sampleDir, "old-" + Path.GetFileName(oldRpm))));
+            Assert.True(File.Exists(Path.Combine(sampleDir, "new-" + Path.GetFileName(newRpm))));
+            Assert.True(File.Exists(Path.Combine(sampleDir, "old-debug-" + Path.GetFileName(oldDebug))));
+            Assert.True(File.Exists(Path.Combine(sampleDir, "new-debug-" + Path.GetFileName(newDebug))));
+
+            logger.Received().Log(
+                LogLevel.Warning,
+                Arg.Any<EventId>(),
+                Arg.Is<object>(o => o.ToString()!.Contains("diagnostic snapshot", StringComparison.OrdinalIgnoreCase)),
+                Arg.Any<Exception?>(),
+                Arg.Any<Func<object, Exception?, string>>());
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task RunDiffAsync_WhenInputFileRemovedBeforeSnapshot_StillReturnsOriginalAbiDiffResult()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"abaci_r76_missing_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        var oldRpm = Path.Combine(tempRoot, "libfoo-1.0-1.x86_64.rpm");
+        var newRpm = Path.Combine(tempRoot, "libfoo-1.0-2.x86_64.rpm");
+        File.WriteAllText(oldRpm, "old-rpm");
+        File.WriteAllText(newRpm, "new-rpm");
+
+        var runner = new ProcessAbiDiffRunner(
+            Microsoft.Extensions.Options.Options.Create(new AbiComplianceOptions
+            {
+                AbipkgdiffExecutablePath = "/usr/bin/abipkgdiff",
+                TempExtractionDirectory = tempRoot
+            }),
+            logger: null,
+            processExecutor: (_, _) =>
+            {
+                if (File.Exists(oldRpm))
+                {
+                    File.Delete(oldRpm);
+                }
+
+                return Task.FromResult((1, string.Empty, "abipkgdiff fatal comparison error"));
+            },
+            supportsEnvDefaultSigpipe: () => false);
+
+        try
+        {
+            var result = await runner.RunDiffAsync(oldRpm, newRpm);
+
+            Assert.False(result.Succeeded);
+            Assert.Contains("abipkgdiff reported tool failure (exit code: 1)", result.ErrorMessage, StringComparison.Ordinal);
+
+            var retainedDir = Assert.Single(Directory.EnumerateDirectories(tempRoot, $"{ProcessAbiDiffRunner.RetainedWorkDirPrefix}*"));
+            var diagText = File.ReadAllText(Path.Combine(retainedDir, ProcessAbiDiffRunner.DiagnosticFileName));
+            Assert.Contains("(missing)", diagText, StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void PruneRetainedFailureDirectories_EnforcesMaxTotalBytesWhileKeepingNewestSnapshot()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"abaci_r76_sizecap_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+
+        try
+        {
+            var baseUtc = new DateTime(2026, 11, 27, 12, 0, 0, DateTimeKind.Utc);
+            var dirs = new List<string>();
+            for (var i = 0; i < 3; i++)
+            {
+                var dir = Path.Combine(tempRoot, $"{ProcessAbiDiffRunner.RetainedWorkDirPrefix}snap{i}");
+                Directory.CreateDirectory(dir);
+                File.WriteAllBytes(Path.Combine(dir, ProcessAbiDiffRunner.DiagnosticFileName), new byte[20]);
+                File.WriteAllBytes(Path.Combine(dir, "payload.rpm"), new byte[100]);
+                Directory.SetLastWriteTimeUtc(dir, baseUtc.AddMinutes(i));
+                dirs.Add(dir);
+            }
+
+            // Each directory is 120 bytes; cap at 250 bytes keeps newest 2 (snap2 + snap1) and prunes oldest (snap0).
+            ProcessAbiDiffRunner.PruneRetainedFailureDirectories(tempRoot, maxRetained: 5, maxTotalBytes: 250);
+
+            Assert.False(Directory.Exists(dirs[0]));
+            Assert.True(Directory.Exists(dirs[1]));
+            Assert.True(Directory.Exists(dirs[2]));
+
+            // Tight cap below single snapshot size still preserves the newest snapshot (snap2) for post-mortem triage.
+            ProcessAbiDiffRunner.PruneRetainedFailureDirectories(tempRoot, maxRetained: 5, maxTotalBytes: 10);
+
+            Assert.False(Directory.Exists(dirs[1]));
+            Assert.True(Directory.Exists(dirs[2]));
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task RunDiffAsync_WhenDiagnosticFileWriteFails_CleansUpOrphanWorkDirAndReturnsOriginalResult()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"abaci_r77_orphan_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        var oldRpm = Path.Combine(tempRoot, "libfoo-1.0-1.x86_64.rpm");
+        var newRpm = Path.Combine(tempRoot, "libfoo-1.0-2.x86_64.rpm");
+        File.WriteAllText(oldRpm, "old-rpm");
+        File.WriteAllText(newRpm, "new-rpm");
+
+        var logger = Substitute.For<ILogger<ProcessAbiDiffRunner>>();
+        string? capturedWorkDir = null;
+        var runner = new ProcessAbiDiffRunner(
+            Microsoft.Extensions.Options.Options.Create(new AbiComplianceOptions
+            {
+                AbipkgdiffExecutablePath = "/usr/bin/abipkgdiff",
+                TempExtractionDirectory = tempRoot
+            }),
+            logger: logger,
+            processExecutor: (startInfo, _) =>
+            {
+                capturedWorkDir = startInfo.WorkingDirectory;
+                // Pre-create a subdirectory with the exact diagnostic.err name to force File.WriteAllText failure cross-platform.
+                Directory.CreateDirectory(Path.Combine(capturedWorkDir, ProcessAbiDiffRunner.DiagnosticFileName));
+                return Task.FromResult((1, string.Empty, "abipkgdiff fatal comparison error"));
+            },
+            supportsEnvDefaultSigpipe: () => false);
+
+        try
+        {
+            var result = await runner.RunDiffAsync(oldRpm, newRpm);
+
+            Assert.False(result.Succeeded);
+            Assert.Contains("abipkgdiff reported tool failure (exit code: 1)", result.ErrorMessage, StringComparison.Ordinal);
+            Assert.NotNull(capturedWorkDir);
+            Assert.False(Directory.Exists(capturedWorkDir));
+
+            logger.Received().Log(
+                LogLevel.Warning,
+                Arg.Any<EventId>(),
+                Arg.Is<object>(o => o.ToString()!.Contains("Failed to persist full ABI diagnostic snapshot", StringComparison.Ordinal)),
+                Arg.Any<Exception?>(),
+                Arg.Any<Func<object, Exception?, string>>());
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task RunDiffAsync_WhenWorkDirCleanupThrows_LogsWorkDirWarningAndPreservesAbiDiffResult()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"abaci_r78_cleanup_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        var oldRpm = Path.Combine(tempRoot, "libfoo-1.0-1.x86_64.rpm");
+        var newRpm = Path.Combine(tempRoot, "libfoo-1.0-2.x86_64.rpm");
+        File.WriteAllText(oldRpm, "old-rpm");
+        File.WriteAllText(newRpm, "new-rpm");
+
+        var logger = Substitute.For<ILogger<ProcessAbiDiffRunner>>();
+        string? capturedWorkDir = null;
+        var runner = new ProcessAbiDiffRunner(
+            Microsoft.Extensions.Options.Options.Create(new AbiComplianceOptions
+            {
+                AbipkgdiffExecutablePath = "/usr/bin/abipkgdiff",
+                TempExtractionDirectory = tempRoot
+            }),
+            logger: logger,
+            processExecutor: (startInfo, _) =>
+            {
+                capturedWorkDir = startInfo.WorkingDirectory;
+                return Task.FromResult((0, string.Empty, string.Empty));
+            },
+            supportsEnvDefaultSigpipe: () => false,
+            deleteDirectory: _ => throw new IOException("simulated read-only filesystem"));
+
+        try
+        {
+            var result = await runner.RunDiffAsync(oldRpm, newRpm);
+
+            Assert.True(result.Succeeded);
+            Assert.False(result.HasAbiChange);
+            Assert.NotNull(capturedWorkDir);
+
+            logger.Received().Log(
+                LogLevel.Warning,
+                Arg.Any<EventId>(),
+                Arg.Is<object>(o =>
+                    o.ToString()!.Contains("Failed to delete temporary ABI working directory", StringComparison.Ordinal) &&
+                    o.ToString()!.Contains(capturedWorkDir, StringComparison.Ordinal)),
+                Arg.Any<Exception?>(),
+                Arg.Any<Func<object, Exception?, string>>());
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void ProcessAbiDiffRunner_InterpretExitCode_127And126_ReturnToolMissingTrue()
+    {
+        var envNotFound = ProcessAbiDiffRunner.InterpretExitCode(
+            127,
+            string.Empty,
+            "env: 'nonexistent-abipkgdiff': No such file or directory");
+        Assert.False(envNotFound.Succeeded);
+        Assert.True(envNotFound.ToolMissing);
+        Assert.Contains("not found", envNotFound.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+
+        var bare127 = ProcessAbiDiffRunner.InterpretExitCode(127, string.Empty, string.Empty);
+        Assert.False(bare127.Succeeded);
+        Assert.True(bare127.ToolMissing);
+        Assert.Contains("not found", bare127.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+
+        var permissionDenied = ProcessAbiDiffRunner.InterpretExitCode(
+            126,
+            string.Empty,
+            "env: '/usr/bin/abipkgdiff': Permission denied");
+        Assert.False(permissionDenied.Succeeded);
+        Assert.True(permissionDenied.ToolMissing);
+        Assert.Contains("cannot be invoked", permissionDenied.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+
+        var bare126 = ProcessAbiDiffRunner.InterpretExitCode(126, string.Empty, string.Empty);
+        Assert.False(bare126.Succeeded);
+        Assert.True(bare126.ToolMissing);
+        Assert.Contains("cannot be invoked", bare126.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task RunDiffAsync_EnvWrapperExit127_ReturnsToolMissingTrueAndCleansUpWorkDir()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"abaci_r79_env127_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        var oldRpm = Path.Combine(tempRoot, "libfoo-1.0-1.x86_64.rpm");
+        var newRpm = Path.Combine(tempRoot, "libfoo-1.0-2.x86_64.rpm");
+        File.WriteAllText(oldRpm, "old-rpm");
+        File.WriteAllText(newRpm, "new-rpm");
+
+        var logger = Substitute.For<ILogger<ProcessAbiDiffRunner>>();
+        var runner = new ProcessAbiDiffRunner(
+            Microsoft.Extensions.Options.Options.Create(new AbiComplianceOptions
+            {
+                AbipkgdiffExecutablePath = "nonexistent-abipkgdiff-tool",
+                TempExtractionDirectory = tempRoot
+            }),
+            logger: logger,
+            processExecutor: (startInfo, _) =>
+            {
+                Assert.Equal("/usr/bin/env", startInfo.FileName);
+                Assert.Equal("--default-signal=PIPE", startInfo.ArgumentList[0]);
+                return Task.FromResult((127, string.Empty, "env: 'nonexistent-abipkgdiff-tool': No such file or directory"));
+            },
+            supportsEnvDefaultSigpipe: () => true);
+
+        try
+        {
+            var result = await runner.RunDiffAsync(oldRpm, newRpm);
+
+            Assert.False(result.Succeeded);
+            Assert.True(result.ToolMissing);
+            Assert.Contains("not found", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+            Assert.Empty(Directory.EnumerateDirectories(tempRoot, $"{ProcessAbiDiffRunner.RetainedWorkDirPrefix}*"));
+
+            logger.Received().Log(
+                LogLevel.Error,
+                Arg.Any<EventId>(),
+                Arg.Is<object>(o => o.ToString()!.Contains("could not be executed", StringComparison.Ordinal)),
+                Arg.Any<Exception?>(),
+                Arg.Any<Func<object, Exception?, string>>());
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+        }
+    }
 }

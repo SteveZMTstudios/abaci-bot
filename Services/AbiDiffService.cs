@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Globalization;
+using System.Text;
 using abaci_bot.Options;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -11,8 +13,22 @@ namespace abaci_bot.Services;
 /// </summary>
 public class ProcessAbiDiffRunner : IAbiDiffRunner
 {
+    internal const string RetainedWorkDirPrefix = "abaci-abi-";
+    internal const string DiagnosticFileName = "diagnostic.err";
+    internal const int MaxRetainedFailureSnapshots = 5;
+    internal const long MaxRetainedFailureBytes = 512L * 1024 * 1024;
+
+    internal delegate Task<(int ExitCode, string Stdout, string Stderr)> ProcessExecutorDelegate(
+        ProcessStartInfo startInfo,
+        CancellationToken cancellationToken);
+
+    private static readonly Lazy<bool> CachedEnvDefaultSigpipeSupport = new(ProbeEnvDefaultSigpipeCore);
+
     private readonly AbiComplianceOptions _options;
     private readonly ILogger<ProcessAbiDiffRunner>? _logger;
+    private readonly ProcessExecutorDelegate _processExecutor;
+    private readonly Func<bool> _supportsEnvDefaultSigpipe;
+    private readonly Action<string> _deleteDirectory;
     private volatile bool _rpmSupportUnavailable;
     private string? _cachedRpmErrorMessage;
 
@@ -27,9 +43,22 @@ public class ProcessAbiDiffRunner : IAbiDiffRunner
     public ProcessAbiDiffRunner(
         IOptions<AbiComplianceOptions> options,
         ILogger<ProcessAbiDiffRunner>? logger = null)
+        : this(options, logger, null, null, null)
+    {
+    }
+
+    internal ProcessAbiDiffRunner(
+        IOptions<AbiComplianceOptions> options,
+        ILogger<ProcessAbiDiffRunner>? logger,
+        ProcessExecutorDelegate? processExecutor,
+        Func<bool>? supportsEnvDefaultSigpipe = null,
+        Action<string>? deleteDirectory = null)
     {
         _options = options.Value;
         _logger = logger;
+        _processExecutor = processExecutor ?? ExecuteProcessAsync;
+        _supportsEnvDefaultSigpipe = supportsEnvDefaultSigpipe ?? (() => CachedEnvDefaultSigpipeSupport.Value);
+        _deleteDirectory = deleteDirectory ?? (static path => Directory.Delete(path, recursive: true));
     }
 
     private bool _privateDsoSupported = true;
@@ -45,16 +74,28 @@ public class ProcessAbiDiffRunner : IAbiDiffRunner
         bool privateDso = true,
         bool dsoOnly = true,
         string? oldDebuginfoPath = null,
-        string? newDebuginfoPath = null)
+        string? newDebuginfoPath = null,
+        string? workingDirectory = null,
+        bool resetSigpipeWithEnv = false)
     {
         var startInfo = new ProcessStartInfo
         {
-            FileName = executablePath,
+            FileName = resetSigpipeWithEnv ? "/usr/bin/env" : executablePath,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        if (!string.IsNullOrWhiteSpace(workingDirectory))
+        {
+            startInfo.WorkingDirectory = workingDirectory;
+            startInfo.Environment["TMPDIR"] = workingDirectory;
+        }
+        if (resetSigpipeWithEnv)
+        {
+            startInfo.ArgumentList.Add("--default-signal=PIPE");
+            startInfo.ArgumentList.Add(executablePath);
+        }
         if (privateDso)
         {
             startInfo.ArgumentList.Add("--private-dso");
@@ -120,90 +161,135 @@ public class ProcessAbiDiffRunner : IAbiDiffRunner
 
         var effectiveOldDebug = !string.IsNullOrWhiteSpace(oldDebuginfoPath) && File.Exists(oldDebuginfoPath) ? oldDebuginfoPath : null;
         var effectiveNewDebug = !string.IsNullOrWhiteSpace(newDebuginfoPath) && File.Exists(newDebuginfoPath) ? newDebuginfoPath : null;
+        var baseTemp = ResolveBaseTempDirectory();
+        var resetSigpipe = _supportsEnvDefaultSigpipe();
+        const int maxAttempts = 2;
 
         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.TimeoutSeconds > 0 ? _options.TimeoutSeconds : 300));
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
         var effectiveCt = linkedCts.Token;
 
-        Process? process = null;
+        string? currentWorkDir = null;
         try
         {
-            var usePrivateDso = _privateDsoSupported;
-            var startInfo = BuildStartInfo(_options.AbipkgdiffExecutablePath, oldRpmPath, newRpmPath, usePrivateDso, dsoOnly: true, effectiveOldDebug, effectiveNewDebug);
-
-            process = new Process { StartInfo = startInfo };
-            process.Start();
-
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(effectiveCt);
-            var stderrTask = process.StandardError.ReadToEndAsync(effectiveCt);
-
-            await process.WaitForExitAsync(effectiveCt);
-            var stdout = await stdoutTask;
-            var stderr = await stderrTask;
-
-            if (usePrivateDso && (process.ExitCode & 2) != 0 &&
-                (stderr.Contains("private-dso", StringComparison.OrdinalIgnoreCase) || stderr.Contains("unrecognized option", StringComparison.OrdinalIgnoreCase)))
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                _privateDsoSupported = false;
-                _logger?.LogWarning("abipkgdiff executable does not support --private-dso; retrying without this option");
-                process.Dispose();
+                currentWorkDir = Path.Combine(baseTemp, RetainedWorkDirPrefix + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(currentWorkDir);
 
-                startInfo = BuildStartInfo(_options.AbipkgdiffExecutablePath, oldRpmPath, newRpmPath, privateDso: false, dsoOnly: true, effectiveOldDebug, effectiveNewDebug);
-                process = new Process { StartInfo = startInfo };
-                process.Start();
+                var usePrivateDso = _privateDsoSupported;
+                var startInfo = BuildStartInfo(
+                    _options.AbipkgdiffExecutablePath,
+                    oldRpmPath,
+                    newRpmPath,
+                    usePrivateDso,
+                    dsoOnly: true,
+                    effectiveOldDebug,
+                    effectiveNewDebug,
+                    currentWorkDir,
+                    resetSigpipe);
 
-                stdoutTask = process.StandardOutput.ReadToEndAsync(effectiveCt);
-                stderrTask = process.StandardError.ReadToEndAsync(effectiveCt);
+                var (exitCode, stdout, stderr) = await _processExecutor(startInfo, effectiveCt);
 
-                await process.WaitForExitAsync(effectiveCt);
-                stdout = await stdoutTask;
-                stderr = await stderrTask;
-            }
-
-            var exitCode = process.ExitCode;
-            var result = InterpretExitCode(exitCode, stdout, stderr);
-            if (result.ToolMissing && result.ErrorMessage?.Contains("rpm", StringComparison.OrdinalIgnoreCase) == true)
-            {
-                _rpmSupportUnavailable = true;
-                _cachedRpmErrorMessage = result.ErrorMessage;
-                _logger?.LogError("abipkgdiff on host system lacks RPM support. Short-circuiting future diffs: {Error}", result.ErrorMessage);
-            }
-
-            var hasPairedDebuginfo = effectiveOldDebug != null && effectiveNewDebug != null;
-            var isAsymmetricalDebuginfo = (effectiveOldDebug != null) ^ (effectiveNewDebug != null);
-
-            if (result.Succeeded && (!hasPairedDebuginfo || isAsymmetricalDebuginfo))
-            {
-                var details = result.Details;
-                if (isAsymmetricalDebuginfo)
+                if (usePrivateDso && exitCode is not (126 or 127) && (exitCode & 2) != 0 &&
+                    (stderr.Contains("private-dso", StringComparison.OrdinalIgnoreCase) || stderr.Contains("unrecognized option", StringComparison.OrdinalIgnoreCase)))
                 {
-                    var note = "[Native Analysis: Debuginfo was provided for only one package side; type-level validation was omitted]";
-                    details = string.IsNullOrWhiteSpace(details) ? note : $"{details}\n{note}";
+                    _privateDsoSupported = false;
+                    _logger?.LogWarning("abipkgdiff executable does not support --private-dso; retrying without this option");
+
+                    startInfo = BuildStartInfo(
+                        _options.AbipkgdiffExecutablePath,
+                        oldRpmPath,
+                        newRpmPath,
+                        privateDso: false,
+                        dsoOnly: true,
+                        effectiveOldDebug,
+                        effectiveNewDebug,
+                        currentWorkDir,
+                        resetSigpipe);
+                    (exitCode, stdout, stderr) = await _processExecutor(startInfo, effectiveCt);
                 }
 
-                result = result with
+                var result = InterpretExitCode(exitCode, stdout, stderr);
+                if (attempt < maxAttempts && IsTransientWriteError(result, stderr))
                 {
-                    IsIncomplete = true,
-                    Details = details
-                };
+                    _logger?.LogWarning(
+                        "abipkgdiff reported a transient archive write error on attempt {Attempt}/{MaxAttempts}; retrying in a fresh working directory. WorkDir={WorkDir}, Stderr={Stderr}",
+                        attempt,
+                        maxAttempts,
+                        currentWorkDir,
+                        stderr.Trim());
+                    TryDeleteWorkDirectory(currentWorkDir);
+                    currentWorkDir = null;
+                    continue;
+                }
+
+                if (result.ToolMissing && result.ErrorMessage?.Contains("rpm", StringComparison.OrdinalIgnoreCase) == true)
+                {
+                    _rpmSupportUnavailable = true;
+                    _cachedRpmErrorMessage = result.ErrorMessage;
+                    _logger?.LogError("abipkgdiff on host system lacks RPM support. Short-circuiting future diffs: {Error}", result.ErrorMessage);
+                }
+
+                if (result.Succeeded)
+                {
+                    var hasPairedDebuginfo = effectiveOldDebug != null && effectiveNewDebug != null;
+                    var isAsymmetricalDebuginfo = (effectiveOldDebug != null) ^ (effectiveNewDebug != null);
+
+                    if (!hasPairedDebuginfo || isAsymmetricalDebuginfo)
+                    {
+                        var details = result.Details;
+                        if (isAsymmetricalDebuginfo)
+                        {
+                            var note = "[Native Analysis: Debuginfo was provided for only one package side; type-level validation was omitted]";
+                            details = string.IsNullOrWhiteSpace(details) ? note : $"{details}\n{note}";
+                        }
+
+                        result = result with
+                        {
+                            IsIncomplete = true,
+                            Details = details
+                        };
+                    }
+
+                    TryDeleteWorkDirectory(currentWorkDir);
+                    currentWorkDir = null;
+                    return result;
+                }
+
+                if (exitCode is 126 or 127)
+                {
+                    _logger?.LogError(
+                        "Libabigail abipkgdiff executable '{Path}' could not be executed (exit code: {ExitCode}): {Error}",
+                        _options.AbipkgdiffExecutablePath,
+                        exitCode,
+                        result.ErrorMessage);
+                    TryDeleteWorkDirectory(currentWorkDir);
+                    currentWorkDir = null;
+                    return result;
+                }
+
+                PersistFailureSnapshot(
+                    currentWorkDir,
+                    baseTemp,
+                    startInfo,
+                    exitCode,
+                    stdout,
+                    stderr,
+                    oldRpmPath,
+                    newRpmPath,
+                    effectiveOldDebug,
+                    effectiveNewDebug);
+                currentWorkDir = null;
+                return result;
             }
 
-            return result;
+            // Unreachable under normal loop termination, kept for compiler exhaustiveness.
+            return AbiDiffResult.NotPerformed("abipkgdiff did not produce a comparison result.");
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            try
-            {
-                if (process is { HasExited: false })
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-            }
-            catch
-            {
-                // Ignore kill errors
-            }
-
+            TryDeleteWorkDirectory(currentWorkDir);
             _logger?.LogWarning("abipkgdiff process timed out after {Timeout} seconds.", _options.TimeoutSeconds);
             return new AbiDiffResult(
                 Succeeded: false,
@@ -214,21 +300,12 @@ public class ProcessAbiDiffRunner : IAbiDiffRunner
         }
         catch (OperationCanceledException)
         {
-            try
-            {
-                if (process is { HasExited: false })
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-            }
-            catch
-            {
-                // Ignore kill errors
-            }
+            TryDeleteWorkDirectory(currentWorkDir);
             throw;
         }
         catch (System.ComponentModel.Win32Exception ex)
         {
+            TryDeleteWorkDirectory(currentWorkDir);
             _logger?.LogError(ex, "Libabigail abipkgdiff executable '{Path}' not found on host system. ABI compliance checks cannot run.", _options.AbipkgdiffExecutablePath);
             return new AbiDiffResult(
                 Succeeded: false,
@@ -240,6 +317,7 @@ public class ProcessAbiDiffRunner : IAbiDiffRunner
         }
         catch (FileNotFoundException ex)
         {
+            TryDeleteWorkDirectory(currentWorkDir);
             _logger?.LogError(ex, "Libabigail abipkgdiff executable '{Path}' not found on host system. ABI compliance checks cannot run.", _options.AbipkgdiffExecutablePath);
             return new AbiDiffResult(
                 Succeeded: false,
@@ -251,6 +329,7 @@ public class ProcessAbiDiffRunner : IAbiDiffRunner
         }
         catch (Exception ex)
         {
+            TryDeleteWorkDirectory(currentWorkDir);
             _logger?.LogWarning(ex, "Failed to run abipkgdiff executable '{Path}'. Skipping ABI analysis.", _options.AbipkgdiffExecutablePath);
             return new AbiDiffResult(
                 Succeeded: false,
@@ -259,9 +338,369 @@ public class ProcessAbiDiffRunner : IAbiDiffRunner
                 Details: string.Empty,
                 ErrorMessage: $"abipkgdiff execution failed: {ex.Message}");
         }
+    }
+
+    internal string ResolveBaseTempDirectory()
+    {
+        return !string.IsNullOrWhiteSpace(_options.TempExtractionDirectory)
+            ? _options.TempExtractionDirectory
+            : Path.GetTempPath();
+    }
+
+    internal static bool IsTransientWriteError(AbiDiffResult result, string? stderr)
+    {
+        if (result.Succeeded || result.ToolMissing || string.IsNullOrWhiteSpace(stderr))
+        {
+            return false;
+        }
+
+        return stderr.Contains("Error writing archive", StringComparison.OrdinalIgnoreCase) ||
+               stderr.Contains("Write error", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool ProbeEnvDefaultSigpipeCore()
+    {
+        if (!OperatingSystem.IsLinux() || !File.Exists("/usr/bin/env"))
+        {
+            return false;
+        }
+
+        Process? process = null;
+        try
+        {
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "/usr/bin/env",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            startInfo.ArgumentList.Add("--default-signal=PIPE");
+            startInfo.ArgumentList.Add("true");
+
+            process = new Process { StartInfo = startInfo };
+            process.Start();
+            process.WaitForExitAsync(timeoutCts.Token).GetAwaiter().GetResult();
+            return process.ExitCode == 0;
+        }
+        catch
+        {
+            try
+            {
+                if (process is { HasExited: false })
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+                // Best-effort cleanup during capability probe
+            }
+
+            return false;
+        }
         finally
         {
             process?.Dispose();
+        }
+    }
+
+    private static async Task<(int ExitCode, string Stdout, string Stderr)> ExecuteProcessAsync(
+        ProcessStartInfo startInfo,
+        CancellationToken ct)
+    {
+        using var process = new Process { StartInfo = startInfo };
+        try
+        {
+            process.Start();
+
+            var stdoutTask = process.StandardOutput.ReadToEndAsync(ct);
+            var stderrTask = process.StandardError.ReadToEndAsync(ct);
+
+            await process.WaitForExitAsync(ct);
+            var stdout = await stdoutTask;
+            var stderr = await stderrTask;
+            return (process.ExitCode, stdout, stderr);
+        }
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+                // Ignore kill errors during cancellation
+            }
+
+            throw;
+        }
+    }
+
+    private void PersistFailureSnapshot(
+        string workDir,
+        string baseTemp,
+        ProcessStartInfo startInfo,
+        int exitCode,
+        string stdout,
+        string stderr,
+        string oldRpmPath,
+        string newRpmPath,
+        string? oldDebuginfoPath,
+        string? newDebuginfoPath)
+    {
+        var diagnosticWritten = false;
+        try
+        {
+            var commandLine = FormatCommandLine(startInfo);
+            var tmpDir = startInfo.Environment.TryGetValue("TMPDIR", out var configuredTmpDir)
+                ? configuredTmpDir
+                : Environment.GetEnvironmentVariable("TMPDIR");
+            var homeDir = Environment.GetEnvironmentVariable("HOME");
+            var diagnostic = BuildFailureDiagnostic(
+                commandLine,
+                workDir,
+                tmpDir,
+                homeDir,
+                exitCode,
+                stdout,
+                stderr,
+                oldRpmPath,
+                newRpmPath,
+                oldDebuginfoPath,
+                newDebuginfoPath);
+
+            _logger?.LogWarning("abipkgdiff comparison failed; retaining diagnostic snapshot in '{WorkDir}'.\n{Diagnostic}", workDir, diagnostic);
+
+            Directory.CreateDirectory(workDir);
+            File.WriteAllText(Path.Combine(workDir, DiagnosticFileName), diagnostic, Encoding.UTF8);
+            diagnosticWritten = true;
+
+            TryCopyRpmForSnapshot(workDir, "old-", oldRpmPath, _logger);
+            TryCopyRpmForSnapshot(workDir, "new-", newRpmPath, _logger);
+            TryCopyRpmForSnapshot(workDir, "old-debug-", oldDebuginfoPath, _logger);
+            TryCopyRpmForSnapshot(workDir, "new-debug-", newDebuginfoPath, _logger);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "Failed to persist full ABI diagnostic snapshot inside '{WorkDir}'.", workDir);
+            if (!diagnosticWritten)
+            {
+                // Avoid leaving un-prunable orphan directories when diagnostic.err could not be created.
+                TryDeleteWorkDirectory(workDir);
+            }
+        }
+
+        PruneRetainedFailureDirectories(baseTemp, MaxRetainedFailureSnapshots, MaxRetainedFailureBytes, _logger);
+    }
+
+    internal static void PruneRetainedFailureDirectories(
+        string baseTemp,
+        int maxRetained,
+        long maxTotalBytes = MaxRetainedFailureBytes,
+        ILogger? logger = null)
+    {
+        if (maxRetained < 0 || maxTotalBytes < 0 || !Directory.Exists(baseTemp))
+        {
+            return;
+        }
+
+        try
+        {
+            var orderedSnapshots = Directory.EnumerateDirectories(baseTemp, $"{RetainedWorkDirPrefix}*")
+                .Where(dir => File.Exists(Path.Combine(dir, DiagnosticFileName)))
+                .Select(dir => new DirectoryInfo(dir))
+                .OrderByDescending(info => info.LastWriteTimeUtc)
+                .ThenByDescending(info => info.Name, StringComparer.Ordinal)
+                .ToList();
+
+            var keptCount = 0;
+            long keptBytes = 0;
+            foreach (var snapshot in orderedSnapshots)
+            {
+                var snapshotBytes = GetDirectorySizeBytes(snapshot.FullName);
+                var withinCount = keptCount < maxRetained;
+                var withinSize = keptCount == 0 || keptBytes + snapshotBytes <= maxTotalBytes;
+                if (withinCount && withinSize)
+                {
+                    keptCount++;
+                    keptBytes += snapshotBytes;
+                    continue;
+                }
+
+                TryDeleteDirectory(snapshot.FullName, logger);
+            }
+        }
+        catch
+        {
+            // Retention pruning must never mask the primary ABI diff result
+        }
+    }
+
+    private static long GetDirectorySizeBytes(string directoryPath)
+    {
+        try
+        {
+            long total = 0;
+            foreach (var file in Directory.EnumerateFiles(directoryPath, "*", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    total += new FileInfo(file).Length;
+                }
+                catch
+                {
+                    // Ignore files disappearing concurrently during size calculation
+                }
+            }
+
+            return total;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static string BuildFailureDiagnostic(
+        string commandLine,
+        string workDir,
+        string? tmpDir,
+        string? homeDir,
+        int exitCode,
+        string stdout,
+        string stderr,
+        string oldRpmPath,
+        string newRpmPath,
+        string? oldDebuginfoPath,
+        string? newDebuginfoPath)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine(CultureInfo.InvariantCulture, $"Command: {commandLine}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"WorkingDirectory: {workDir}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"TMPDIR: {tmpDir ?? "<unset>"}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"HOME: {homeDir ?? "<unset>"}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"ExitCode: {exitCode}");
+        sb.AppendLine("Inputs:");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"  old: {DescribeFile(oldRpmPath)}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"  new: {DescribeFile(newRpmPath)}");
+        if (!string.IsNullOrWhiteSpace(oldDebuginfoPath))
+        {
+            sb.AppendLine(CultureInfo.InvariantCulture, $"  oldDebuginfo: {DescribeFile(oldDebuginfoPath)}");
+        }
+        if (!string.IsNullOrWhiteSpace(newDebuginfoPath))
+        {
+            sb.AppendLine(CultureInfo.InvariantCulture, $"  newDebuginfo: {DescribeFile(newDebuginfoPath)}");
+        }
+        sb.AppendLine("--- stdout ---");
+        sb.AppendLine(string.IsNullOrEmpty(stdout) ? "<empty>" : stdout.TrimEnd());
+        sb.AppendLine("--- stderr ---");
+        sb.AppendLine(string.IsNullOrEmpty(stderr) ? "<empty>" : stderr.TrimEnd());
+        return sb.ToString();
+    }
+
+    private static string FormatCommandLine(ProcessStartInfo startInfo)
+    {
+        var parts = new List<string>(1 + startInfo.ArgumentList.Count) { QuoteCommandArgument(startInfo.FileName) };
+        foreach (var arg in startInfo.ArgumentList)
+        {
+            parts.Add(QuoteCommandArgument(arg));
+        }
+
+        return string.Join(' ', parts);
+    }
+
+    private static string QuoteCommandArgument(string value)
+    {
+        return string.IsNullOrEmpty(value) || value.Any(char.IsWhiteSpace)
+            ? $"\"{value}\""
+            : value;
+    }
+
+    private static string DescribeFile(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return $"{path} (missing)";
+            }
+
+            var info = new FileInfo(path);
+            var permissions = !OperatingSystem.IsWindows()
+                ? File.GetUnixFileMode(path).ToString()
+                : info.Attributes.ToString();
+            return string.Create(CultureInfo.InvariantCulture, $"{path} (size={info.Length} bytes, mode={permissions})");
+        }
+        catch (Exception ex)
+        {
+            return $"{path} (metadata unavailable: {ex.Message})";
+        }
+    }
+
+    private static void TryCopyRpmForSnapshot(
+        string workDir,
+        string prefix,
+        string? sourcePath,
+        ILogger? logger = null)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+        {
+            return;
+        }
+
+        var fileName = Path.GetFileName(sourcePath);
+        var destination = Path.Combine(workDir, prefix + fileName);
+        try
+        {
+            File.Copy(sourcePath, destination, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            logger?.LogWarning(ex, "Failed to copy RPM '{SourcePath}' into diagnostic snapshot '{WorkDir}'.", sourcePath, workDir);
+            try
+            {
+                if (File.Exists(destination))
+                {
+                    File.Delete(destination);
+                }
+            }
+            catch
+            {
+                // Best-effort cleanup of partial RPM copy
+            }
+        }
+    }
+
+    private void TryDeleteWorkDirectory(string? path)
+        => TryDeleteDirectory(path, _logger, _deleteDirectory);
+
+    private static void TryDeleteDirectory(
+        string? path,
+        ILogger? logger = null,
+        Action<string>? deleteAction = null)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                var remove = deleteAction ?? (static dir => Directory.Delete(dir, recursive: true));
+                remove(path);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger?.LogWarning(ex, "Failed to delete temporary ABI working directory '{WorkDir}'.", path);
         }
     }
 
@@ -282,6 +721,36 @@ public class ProcessAbiDiffRunner : IAbiDiffRunner
         const int abidiffUsage = 2;
         const int abidiffChange = 4;
         const int abidiffIncompatible = 8;
+
+        // POSIX shells and /usr/bin/env exit with 127 (not found) or 126 (cannot invoke);
+        // Libabigail's bitmask only uses bits 0..15, so these codes unambiguously indicate a missing/unusable tool.
+        if (exitCode == 127)
+        {
+            var trimmedStderr = stderr.Trim();
+            return new AbiDiffResult(
+                Succeeded: false,
+                HasAbiChange: false,
+                IsBreakingChange: false,
+                Details: trimmedStderr,
+                ErrorMessage: string.IsNullOrEmpty(trimmedStderr)
+                    ? "abipkgdiff executable not found (exit code: 127)"
+                    : $"abipkgdiff executable not found: {trimmedStderr}",
+                ToolMissing: true);
+        }
+
+        if (exitCode == 126)
+        {
+            var trimmedStderr = stderr.Trim();
+            return new AbiDiffResult(
+                Succeeded: false,
+                HasAbiChange: false,
+                IsBreakingChange: false,
+                Details: trimmedStderr,
+                ErrorMessage: string.IsNullOrEmpty(trimmedStderr)
+                    ? "abipkgdiff executable cannot be invoked (exit code: 126)"
+                    : $"abipkgdiff executable cannot be invoked: {trimmedStderr}",
+                ToolMissing: true);
+        }
 
         // 1. Inspect stderr for missing tools / extraction failure / crashes first.
         // Ubuntu 22.04 exits with code 1 when libabigail lacks RPM support.

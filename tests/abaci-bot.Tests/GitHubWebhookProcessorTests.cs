@@ -3650,6 +3650,94 @@ public class GitHubWebhookProcessorTests
         Assert.Empty(github.LabelOperations);
     }
 
+    [Fact]
+    public async Task ProcessWebhookAsync_WorkflowRunMissingTriggeringActorJson_FallsBackAndAppliesAbiLabels()
+    {
+        var github = new FakeGitHubService();
+        github.RemoteLabels.Add(GitHubLabels.WorkflowReadyForReview);
+
+        var artifactService = Substitute.For<IArtifactService>();
+        var abiDiffService = Substitute.For<IAbiDiffService>();
+
+        var tempDir = Path.Combine(Path.GetTempPath(), "abaci_test_abi_json_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        var prRpm = Path.Combine(tempDir, "libgpg-error-1.61-999.or.x86_64.rpm");
+        var baselineRpm = Path.Combine(tempDir, "libgpg-error-baseline.rpm");
+        await File.WriteAllBytesAsync(prRpm, SyntheticRpmBytesWithSharedLib);
+        await File.WriteAllTextAsync(baselineRpm, "dummy-baseline-data");
+
+        try
+        {
+            artifactService.DownloadRunRpmArtifactsAsync("owner", "repo", 888L, Arg.Any<string>(), Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult<IReadOnlyList<string>>(new[] { prRpm }));
+
+            artifactService.DownloadBaselineRpmAsync("libgpg-error", Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult<string?>(baselineRpm));
+
+            abiDiffService.CompareRpmsAsync(baselineRpm, prRpm, Arg.Any<CancellationToken>())
+                .Returns(Task.FromResult(new AbiDiffResult(
+                    Succeeded: true,
+                    HasAbiChange: true,
+                    IsBreakingChange: true,
+                    Details: "SONAME changed; 2 removed functions")));
+
+            var processor = CreateAbiProcessor(github, artifactService, abiDiffService);
+
+            // Live GitHub workflow_run webhooks can omit required Octokit properties such as triggering_actor.
+            const string rawJson = """
+                {
+                  "action": "completed",
+                  "workflow_run": {
+                    "id": 888,
+                    "name": "build",
+                    "conclusion": "success",
+                    "head_sha": "head-sha-r74",
+                    "pull_requests": [
+                      { "number": 42 }
+                    ]
+                  },
+                  "repository": {
+                    "name": "repo",
+                    "owner": { "login": "owner" }
+                  },
+                  "sender": {
+                    "login": "github-actions[bot]"
+                  }
+                }
+                """;
+
+            var headers = new WebhookHeaders { Event = "workflow_run", Delivery = "delivery-r74-tolerant" };
+            var webhookEvent = processor.DeserializeWebhookEvent(headers, rawJson);
+            await processor.ProcessWebhookAsync(headers, webhookEvent);
+
+            await artifactService.Received(1).DownloadRunRpmArtifactsAsync("owner", "repo", 888L, Arg.Any<string>(), Arg.Any<CancellationToken>());
+            await abiDiffService.Received(1).CompareRpmsAsync(baselineRpm, prRpm, Arg.Any<CancellationToken>());
+
+            Assert.Contains($"add:{GitHubLabels.ImpactAbi}", github.LabelOperations);
+            Assert.Contains($"add:{GitHubLabels.ImpactBreakingChange}", github.LabelOperations);
+            Assert.Contains(github.CreatedComments, c => c.IssueNumber == 42 && c.Comment.Contains("ABI Breaking Change Detected", StringComparison.Ordinal));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void DeserializeWebhookEvent_WorkflowRunMalformedJson_StillThrowsJsonException()
+    {
+        var github = new FakeGitHubService();
+        var processor = CreateAbiProcessor(github);
+
+        Assert.ThrowsAny<System.Text.Json.JsonException>(() =>
+            processor.DeserializeWebhookEvent(
+                new WebhookHeaders { Event = "workflow_run", Delivery = "delivery-r74-invalid" },
+                "{not-valid-json"));
+    }
+
     private sealed class TestFakeTimeProvider : TimeProvider
     {
         private DateTimeOffset _utcNow;

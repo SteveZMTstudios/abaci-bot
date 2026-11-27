@@ -144,6 +144,11 @@ public class PullRequestContext
     public string Title { get; private set; }
 
     /// <summary>
+    /// Prior title carried on pull request <c>edited</c> webhook deliveries when the title changed.
+    /// </summary>
+    public string? PreviousTitle { get; }
+
+    /// <summary>
     /// The markdown description body of the pull request or comment.
     /// </summary>
     public string? Body { get; private set; }
@@ -386,6 +391,7 @@ public class PullRequestContext
         PullRequestReviewCommentAction? reviewCommentAction = null,
         PullRequestReviewCommentEvent? reviewCommentEvent = null,
         IFileContentCache? fileContentCache = null,
+        string? previousTitle = null,
         CancellationToken cancellationToken = default)
     {
         _gitHubService = gitHubService;
@@ -401,6 +407,7 @@ public class PullRequestContext
         IsDraft = isDraft;
         IsMerged = isMerged;
         Title = title;
+        PreviousTitle = previousTitle ?? (prEvent as PullRequestEditedEvent)?.Changes?.Title?.From;
         Body = body;
         SenderLogin = senderLogin;
         SenderType = senderType;

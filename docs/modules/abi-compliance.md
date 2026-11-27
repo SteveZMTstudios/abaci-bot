@@ -79,7 +79,7 @@ Configured under the `AbiCompliance` JSON section:
 | `TempExtractionDirectory` | `string?` | `null` | Path for temporary extraction buffers (null uses system temporary path). |
 | `TimeoutSeconds` | `int` | `300` | Process execution timeout in seconds. |
 | `MaxTotalPayloadBytes` | `long` | `1073741824` | Maximum uncompressed total payload bytes processed by managed ELF/RPM engine (1 GB). |
-| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique `http`/`https` links (`Title`, optional `TitleZh`, `Url`) appended to the consolidated PR review footer when `AbiCompliance` posts a breaking-change or unverified notice. |
+| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique non-empty URL strings (rendered verbatim) (`Title`, optional `TitleZh`, `Url`) appended to the consolidated PR review footer when `AbiCompliance` posts a breaking-change or unverified notice. |
 
 ---
 
@@ -89,6 +89,8 @@ Configured under the `AbiCompliance` JSON section:
 |---|---|---|---|
 | **Tier 1 (Native)** | Libabigail `abipkgdiff` with `rpm` (`rpm2cpio`), `cpio`, `libicu` | Full DWARF type layout comparison, struct padding, enum sizes, symbol versioning, SONAME checks. | Fedora 45+ OCI container or host with native Libabigail and RPM v4/v6 tools. |
 | **Tier 3 (Managed Workaround)** | Pure C# ELF header parser | Symbol-level export/import table comparison and SONAME checking. **No DWARF type validation**. | Pure managed environments where `AllowManagedFallback = true` is explicitly configured. |
+
+`ProcessAbiDiffRunner` runs each native `abipkgdiff` invocation in an isolated per-attempt writable working directory (`abaci-abi-<guid>` under `TempExtractionDirectory` or the system temp directory, also exported as `TMPDIR`), wraps execution with `/usr/bin/env --default-signal=PIPE` on Linux when supported (restoring default `SIGPIPE` handling for nested `rpm2cpio | cpio` pipelines), retries once in a fresh working directory on transient archive write errors (`Error writing archive` / `Write error`), and on persistent failure logs full execution/RPM diagnostics while retaining up to 5 recent self-contained failure snapshots capped at 512 MiB total (`diagnostic.err` plus copied input RPMs) for post-mortem reproduction.
 
 ---
 

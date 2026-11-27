@@ -1,4 +1,5 @@
 using System.Runtime.ExceptionServices;
+using System.Text.Json;
 using abaci_bot.Contexts;
 using abaci_bot.Modules;
 using abaci_bot.Options;
@@ -250,6 +251,62 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         }, cancellationToken);
     }
 
+    internal sealed record WorkflowRunPayload(
+        string Action,
+        string Owner,
+        string Repo,
+        long RunId,
+        string? WorkflowName,
+        string? WorkflowPath,
+        string? HeadSha,
+        string? HeadBranch,
+        string? Event,
+        string? Conclusion,
+        string? HeadRepositoryFullName,
+        string? HeadRepositoryOwnerLogin,
+        IReadOnlyList<int> PullRequestNumbers);
+
+    private sealed record TolerantWorkflowRunWebhookEvent(WorkflowRunPayload Payload) : WebhookEvent;
+
+    public override WebhookEvent DeserializeWebhookEvent(WebhookHeaders headers, string body)
+    {
+        try
+        {
+            return base.DeserializeWebhookEvent(headers, body);
+        }
+        catch (JsonException ex) when (string.Equals(headers.Event, "workflow_run", StringComparison.OrdinalIgnoreCase))
+        {
+            if (TryParseTolerantWorkflowRun(body, out var payload))
+            {
+                _logger?.LogWarning(
+                    ex,
+                    "Octokit.Webhooks failed strict deserialization for workflow_run (action={Action}, runId={RunId}); falling back to tolerant payload extraction.",
+                    payload.Action,
+                    payload.RunId);
+                return new TolerantWorkflowRunWebhookEvent(payload);
+            }
+
+            throw;
+        }
+    }
+
+    public override ValueTask ProcessWebhookAsync(
+        WebhookHeaders headers,
+        WebhookEvent webhookEvent,
+        CancellationToken cancellationToken = default)
+    {
+        if (webhookEvent is TolerantWorkflowRunWebhookEvent tolerant)
+        {
+            return ExecuteWithDeliveryDedupAsync(
+                headers,
+                $"workflow_run.{tolerant.Payload.Action}",
+                ct => ProcessWorkflowRunPayloadCoreAsync(headers, tolerant.Payload, ct),
+                cancellationToken);
+        }
+
+        return base.ProcessWebhookAsync(headers, webhookEvent, cancellationToken);
+    }
+
     protected override ValueTask ProcessWorkflowRunWebhookAsync(
         WebhookHeaders headers,
         WorkflowRunEvent workflowRunEvent,
@@ -261,6 +318,102 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
             $"workflow_run.{action}",
             ct => ProcessWorkflowRunCoreAsync(headers, workflowRunEvent, action, ct),
             cancellationToken);
+    }
+
+    private static bool TryParseTolerantWorkflowRun(string body, out WorkflowRunPayload payload)
+    {
+        payload = default!;
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            var action = TryGetStringProperty(root, "action");
+            if (string.IsNullOrWhiteSpace(action))
+            {
+                return false;
+            }
+
+            if (!root.TryGetProperty("repository", out var repoEl) || repoEl.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            var owner = repoEl.TryGetProperty("owner", out var ownerEl) && ownerEl.ValueKind == JsonValueKind.Object
+                ? TryGetStringProperty(ownerEl, "login")
+                : null;
+            var repo = TryGetStringProperty(repoEl, "name");
+            if (string.IsNullOrWhiteSpace(owner) || string.IsNullOrWhiteSpace(repo))
+            {
+                return false;
+            }
+
+            if (!root.TryGetProperty("workflow_run", out var runEl) || runEl.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            var runId = runEl.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.Number && idEl.TryGetInt64(out var parsedId)
+                ? parsedId
+                : 0L;
+
+            string? headRepoFullName = null;
+            string? headRepoOwnerLogin = null;
+            if (runEl.TryGetProperty("head_repository", out var headRepoEl) && headRepoEl.ValueKind == JsonValueKind.Object)
+            {
+                headRepoFullName = TryGetStringProperty(headRepoEl, "full_name");
+                if (headRepoEl.TryGetProperty("owner", out var headOwnerEl) && headOwnerEl.ValueKind == JsonValueKind.Object)
+                {
+                    headRepoOwnerLogin = TryGetStringProperty(headOwnerEl, "login");
+                }
+            }
+
+            var prNumbers = new List<int>();
+            if (runEl.TryGetProperty("pull_requests", out var prsEl) && prsEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var prEl in prsEl.EnumerateArray())
+                {
+                    if (prEl.ValueKind == JsonValueKind.Object &&
+                        prEl.TryGetProperty("number", out var numEl) &&
+                        numEl.ValueKind == JsonValueKind.Number &&
+                        numEl.TryGetInt32(out var prNum))
+                    {
+                        prNumbers.Add(prNum);
+                    }
+                }
+            }
+
+            payload = new WorkflowRunPayload(
+                Action: action,
+                Owner: owner,
+                Repo: repo,
+                RunId: runId,
+                WorkflowName: TryGetStringProperty(runEl, "name"),
+                WorkflowPath: TryGetStringProperty(runEl, "path"),
+                HeadSha: TryGetStringProperty(runEl, "head_sha"),
+                HeadBranch: TryGetStringProperty(runEl, "head_branch"),
+                Event: TryGetStringProperty(runEl, "event"),
+                Conclusion: TryGetStringProperty(runEl, "conclusion"),
+                HeadRepositoryFullName: headRepoFullName,
+                HeadRepositoryOwnerLogin: headRepoOwnerLogin,
+                PullRequestNumbers: prNumbers);
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static string? TryGetStringProperty(JsonElement obj, string propertyName)
+    {
+        return obj.TryGetProperty(propertyName, out var el) && el.ValueKind == JsonValueKind.String
+            ? el.GetString()
+            : null;
     }
 
     private async ValueTask ExecuteWithDeliveryDedupAsync(
@@ -380,30 +533,66 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         }
     }
 
-    private async ValueTask ProcessWorkflowRunCoreAsync(
+    private ValueTask ProcessWorkflowRunCoreAsync(
         WebhookHeaders headers,
         WorkflowRunEvent workflowRunEvent,
         WorkflowRunAction action,
         CancellationToken cancellationToken)
     {
         if (action != WorkflowRunAction.Completed)
-            return;
+        {
+            return ValueTask.CompletedTask;
+        }
 
         if (!TryGetRepositoryContext(workflowRunEvent.Repository, out var owner, out var repo))
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        var run = workflowRunEvent.WorkflowRun;
+        var prNumbers = run?.PullRequests?.Select(pr => (int)pr.Number).ToList() ?? [];
+        var payload = new WorkflowRunPayload(
+            Action: "completed",
+            Owner: owner,
+            Repo: repo,
+            RunId: run?.Id ?? 0,
+            WorkflowName: run?.Name,
+            WorkflowPath: run?.Path,
+            HeadSha: run?.HeadSha,
+            HeadBranch: run?.HeadBranch,
+            Event: run?.Event,
+            Conclusion: run?.Conclusion?.StringValue,
+            HeadRepositoryFullName: run?.HeadRepository?.FullName,
+            HeadRepositoryOwnerLogin: run?.HeadRepository?.Owner?.Login,
+            PullRequestNumbers: prNumbers);
+
+        return ProcessWorkflowRunPayloadCoreAsync(headers, payload, cancellationToken);
+    }
+
+    private async ValueTask ProcessWorkflowRunPayloadCoreAsync(
+        WebhookHeaders headers,
+        WorkflowRunPayload payload,
+        CancellationToken cancellationToken)
+    {
+        if (!string.Equals(payload.Action, "completed", StringComparison.OrdinalIgnoreCase))
             return;
 
-        var runId = workflowRunEvent.WorkflowRun?.Id ?? 0;
+        var owner = payload.Owner;
+        var repo = payload.Repo;
+        if (string.IsNullOrWhiteSpace(owner) || string.IsNullOrWhiteSpace(repo))
+            return;
+
+        var runId = payload.RunId;
         var teamName = _config["GitHubApp:TeamName"] ?? string.Empty;
-        var runHeadSha = workflowRunEvent.WorkflowRun?.HeadSha;
-        var pullRequests = workflowRunEvent.WorkflowRun?.PullRequests;
+        var runHeadSha = payload.HeadSha;
+        var prNumbers = payload.PullRequestNumbers;
 
         // Pre-fetch PRs and guard against outdated runs before performing heavy artifact downloads
         var validPrs = new List<Octokit.PullRequest>();
-        if (pullRequests is { Count: > 0 })
+        if (prNumbers.Count > 0)
         {
-            foreach (var pr in pullRequests)
+            foreach (var prNumber in prNumbers)
             {
-                var prNumber = (int)pr.Number;
                 var fullPr = await _github.GetPullRequestAsync(owner, repo, prNumber, cancellationToken);
                 if (fullPr == null)
                 {
@@ -426,10 +615,10 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
         }
         else
         {
-            var runEvent = workflowRunEvent.WorkflowRun?.Event;
-            var headOwner = workflowRunEvent.WorkflowRun?.HeadRepository?.Owner?.Login;
-            var headBranch = workflowRunEvent.WorkflowRun?.HeadBranch;
-            var headRepoFullName = workflowRunEvent.WorkflowRun?.HeadRepository?.FullName;
+            var runEvent = payload.Event;
+            var headOwner = payload.HeadRepositoryOwnerLogin;
+            var headBranch = payload.HeadBranch;
+            var headRepoFullName = payload.HeadRepositoryFullName;
             var isPullRequestOrForkRun =
                 string.Equals(runEvent, "pull_request", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(runEvent, "pull_request_target", StringComparison.OrdinalIgnoreCase) ||
@@ -473,8 +662,8 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
             return;
 
         // Determine if this workflow is authorized for ABI compliance checks
-        var workflowName = workflowRunEvent.WorkflowRun?.Name;
-        var workflowPath = workflowRunEvent.WorkflowRun?.Path;
+        var workflowName = payload.WorkflowName;
+        var workflowPath = payload.WorkflowPath;
         var workflowNames = _abiOptions.WorkflowNames != null && _abiOptions.WorkflowNames.Count > 0
             ? _abiOptions.WorkflowNames
             : new List<string> { "build", "package", "rpm" };
@@ -490,7 +679,7 @@ public class GitHubWebhookProcessor : WebhookEventProcessor
 
         // Perform ABI diff analysis if artifact & abiDiff services are available, run succeeded, and workflow matches
         AbiDiffResult? abiResult = null;
-        var conclusion = workflowRunEvent.WorkflowRun?.Conclusion?.StringValue;
+        var conclusion = payload.Conclusion;
         var isSuccess = string.Equals(conclusion, "success", StringComparison.OrdinalIgnoreCase);
 
         if (isAbiWorkflow && _artifactService != null && _abiDiffService != null && runId > 0 && isSuccess)

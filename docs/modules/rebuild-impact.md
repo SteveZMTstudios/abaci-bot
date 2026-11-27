@@ -60,7 +60,7 @@ Configured under the `RebuildImpact` JSON section:
 | `MaxDepth` | `int?` | `null` | Optional ceiling for dependency traversal depth (null is unlimited). |
 | `BlockThreshold` | `int` | `1001` | Dependent package count threshold triggering `Workflow: Blocked`. |
 | `TargetBranchToBlock` | `string` | `"Rolling"` | Release stream subject to rebuild blocking (`"Rolling"` or `"LTS"`). |
-| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique `http`/`https` links (`Title`, optional `TitleZh`, `Url`). Rendered dynamically in the consolidated PR governance review comment footer when `RebuildImpactModule` triggers a blocked rebuild gate (deduplicated against inline body URLs and `BotState:GeneralDocumentationLinks`); empty emits no module links. |
+| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique non-empty URL strings (rendered verbatim) (`Title`, optional `TitleZh`, `Url`). Rendered dynamically in the consolidated PR governance review comment footer when `RebuildImpactModule` triggers a blocked rebuild gate (deduplicated against inline body URLs and `BotState:GeneralDocumentationLinks`); empty emits no module links. |
 
 > **Migration from legacy key**: Existing `appsettings.json` deployments using `RebuildImpact:VerificationGuideLinks` should split links into `BotState:GeneralDocumentationLinks` (shared across consolidated review modules when general guidance is requested) and per-module `<Section>:DocumentationLinks` (for example `RebuildImpact:DocumentationLinks`, emitted only when that module triggers). A startup warning is logged if the legacy key is still present.
 

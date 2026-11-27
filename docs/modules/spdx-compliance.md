@@ -46,7 +46,7 @@ Configured under the `SpdxCompliance` JSON section:
 | `AutoUpdateIntervalHours` | `double` | `24` | Interval in hours between background updates of the local SPDX database. `0` disables periodic refresh. |
 | `AllowLegacyAliases` | `bool` | `true` | When `true`, accepts recognized legacy aliases (e.g. `GPLv2+`) without flagging an issue. |
 | `MaxDegreeOfParallelism` | `int` | `8` | Maximum concurrent license expressions evaluated in parallel. |
-| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique `http`/`https` links (`Title`, optional `TitleZh`, `Url`) appended to the consolidated PR review footer when SPDX compliance issues are reported. |
+| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique non-empty URL strings (rendered verbatim) (`Title`, optional `TitleZh`, `Url`) appended to the consolidated PR review footer when SPDX compliance issues are reported. |
 
 ---
 

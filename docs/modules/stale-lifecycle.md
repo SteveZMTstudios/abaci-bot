@@ -58,7 +58,7 @@ Configured under the `StaleLifecycle` JSON section:
 | `CheckIntervalHours` | `int` | `24` | Interval in hours between sweeps. |
 | `RequestThrottleMilliseconds` | `int` | `500` | Delay between consecutive API calls to prevent secondary rate limit throttling. |
 | `MinRateLimitRemaining` | `int` | `100` | Core API quota threshold; sweeps halt if quota drops below this value. |
-| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique `http`/`https` links (`Title`, optional `TitleZh`, `Url`) appended to stale warning and auto-close comments. |
+| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique non-empty URL strings (rendered verbatim) (`Title`, optional `TitleZh`, `Url`) appended to stale warning and auto-close comments. |
 
 ---
 

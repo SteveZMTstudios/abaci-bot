@@ -205,18 +205,24 @@ public class DocumentationLinksTests
     [Fact]
     public void FormatWipTip_And_StaleLifecycleOptions_RenderConfiguredDocumentationLinks()
     {
-        var formatter = new GovernanceCommentFormatter();
+        var botState = Microsoft.Extensions.Options.Options.Create(new BotStateOptions
+        {
+            GeneralDocumentationLinks = new List<DocumentationLink> { GeneralLink }
+        });
+        var formatter = new GovernanceCommentFormatter(botState);
         var links = new List<DocumentationLink> { SpdxLink };
 
-        var tipEn = formatter.FormatWipTip(WipTipKind.Draft, "https://github.com/owner/repo/pull/1", "en", links);
-        Assert.Contains("> **See also**:", tipEn, StringComparison.Ordinal);
-        Assert.Contains("> - [SPDX Guide](https://docs.openruyi.org/spdx)", tipEn, StringComparison.Ordinal);
+        var tipEn = formatter.FormatWipTip(WipTipKind.Draft, "https://github.com/owner/repo/pull/1", "en", links, "abaci-bot-test[bot]");
+        Assert.Contains("## abaci-bot-test Review Notes", tipEn, StringComparison.Ordinal);
+        Assert.Contains("For more details, see:\n- [SPDX Guide](https://docs.openruyi.org/spdx)\n- [Contribution Guide](https://docs.openruyi.org/contributing)", tipEn.Replace("\r\n", "\n", StringComparison.Ordinal), StringComparison.Ordinal);
+        Assert.DoesNotContain("> **See also**:", tipEn, StringComparison.Ordinal);
         Assert.True(WipDraftModule.TryParseTipKind(tipEn, out var parsedKind));
         Assert.Equal(WipTipKind.Draft, parsedKind);
 
-        var tipZh = formatter.FormatWipTip(WipTipKind.Ready, "https://github.com/owner/repo/pull/1", "zh-CN", links);
-        Assert.Contains("> **另请参阅**：", tipZh, StringComparison.Ordinal);
-        Assert.Contains("> - [SPDX 指南](https://docs.openruyi.org/spdx)", tipZh, StringComparison.Ordinal);
+        var tipZh = formatter.FormatWipTip(WipTipKind.Ready, "https://github.com/owner/repo/pull/1", "zh-CN", links, "abaci-bot-test[bot]");
+        Assert.Contains("## abaci-bot-test 审查说明", tipZh, StringComparison.Ordinal);
+        Assert.Contains("更多参考文档：\n- [SPDX 指南](https://docs.openruyi.org/spdx)\n- [贡献指南](https://docs.openruyi.org/contributing)", tipZh.Replace("\r\n", "\n", StringComparison.Ordinal), StringComparison.Ordinal);
+        Assert.DoesNotContain("> **另请参阅**：", tipZh, StringComparison.Ordinal);
         Assert.True(WipDraftModule.TryParseTipKind(tipZh, out var parsedReadyKind));
         Assert.Equal(WipTipKind.Ready, parsedReadyKind);
 

@@ -192,7 +192,9 @@ public class GovernanceCommentFormatterTests
         const string prUrl = "https://github.com/openRuyi-Project/openRuyi/pull/42";
 
         var draftEn = _formatter.FormatWipTip(WipTipKind.Draft, prUrl, "en");
-        Assert.StartsWith("> [!TIP]", draftEn, StringComparison.Ordinal);
+        Assert.StartsWith("Thank you for your contribution!", draftEn, StringComparison.Ordinal);
+        Assert.Contains("## abaci-bot Review Notes", draftEn, StringComparison.Ordinal);
+        Assert.Contains("> [!TIP]", draftEn, StringComparison.Ordinal);
         Assert.Contains("**Convert to draft**", draftEn, StringComparison.Ordinal);
         Assert.Contains($"[Open the pull request]({prUrl})", draftEn, StringComparison.Ordinal);
         Assert.EndsWith(GovernanceCommentFormatter.WipDraftTipMarker, draftEn, StringComparison.Ordinal);
@@ -202,7 +204,9 @@ public class GovernanceCommentFormatterTests
         AssertNoEmojis(draftEn);
 
         var readyEn = _formatter.FormatWipTip(WipTipKind.Ready, prUrl, "en");
-        Assert.StartsWith("> [!TIP]", readyEn, StringComparison.Ordinal);
+        Assert.StartsWith("Thank you for your contribution!", readyEn, StringComparison.Ordinal);
+        Assert.Contains("## abaci-bot Review Notes", readyEn, StringComparison.Ordinal);
+        Assert.Contains("> [!TIP]", readyEn, StringComparison.Ordinal);
         Assert.Contains("**Ready for review**", readyEn, StringComparison.Ordinal);
         Assert.Contains($"[Open the pull request]({prUrl})", readyEn, StringComparison.Ordinal);
         Assert.EndsWith(GovernanceCommentFormatter.WipReadyTipMarker, readyEn, StringComparison.Ordinal);
@@ -210,12 +214,18 @@ public class GovernanceCommentFormatterTests
         AssertNoEmojis(readyEn);
 
         var draftZh = _formatter.FormatWipTip(WipTipKind.Draft, prUrl, "zh-CN");
+        Assert.StartsWith("感谢您的贡献！我们发现以下几个需要您关注的事项：", draftZh, StringComparison.Ordinal);
+        Assert.Contains("## abaci-bot 审查说明", draftZh, StringComparison.Ordinal);
+        Assert.Contains("> [!TIP]", draftZh, StringComparison.Ordinal);
         Assert.Contains("Convert to draft", draftZh, StringComparison.Ordinal);
         Assert.Contains($"[打开拉取请求]({prUrl})", draftZh, StringComparison.Ordinal);
         Assert.EndsWith(GovernanceCommentFormatter.WipDraftTipMarker, draftZh, StringComparison.Ordinal);
         AssertNoEmojis(draftZh);
 
         var readyZh = _formatter.FormatWipTip(WipTipKind.Ready, prUrl, "zh-CN");
+        Assert.StartsWith("感谢您的贡献！我们发现以下几个需要您关注的事项：", readyZh, StringComparison.Ordinal);
+        Assert.Contains("## abaci-bot 审查说明", readyZh, StringComparison.Ordinal);
+        Assert.Contains("> [!TIP]", readyZh, StringComparison.Ordinal);
         Assert.Contains("Ready for review", readyZh, StringComparison.Ordinal);
         Assert.Contains($"[打开拉取请求]({prUrl})", readyZh, StringComparison.Ordinal);
         Assert.EndsWith(GovernanceCommentFormatter.WipReadyTipMarker, readyZh, StringComparison.Ordinal);

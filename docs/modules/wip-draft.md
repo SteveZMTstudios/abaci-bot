@@ -20,12 +20,12 @@ Maintains a single idempotent GitHub `> [!TIP]` reminder comment helping contrib
 | Closed / Merged / Complete | Any | Any | Any | Delete existing TIP(s) |
 | Open | Yes | No | None / Draft / Ready | Create or update single `draft` TIP (and delete duplicates) |
 | Open | Yes | Yes | Draft / Ready | Delete existing TIP(s) |
-| Open | No | Yes | Draft | Update existing TIP to `ready` TIP (and delete duplicates) |
+| Open | No | Yes | Draft (or `None` when `edited` just removed WIP via `Changes.Title.From`) | Create or update single `ready` TIP (and delete duplicates) |
 | Open | No | Yes | Ready | Keep existing `ready` TIP (and delete duplicates; otherwise no-op) |
-| Open | No | Yes | None | Do nothing (respect manual draft) |
+| Open | No | Yes | None (and not just renamed from WIP) | Do nothing (respect manual draft) |
 | Open | No | No | Any | Delete existing TIP(s) |
 
-The comment uses pure GitHub Flavored Markdown (`> [!TIP]` + `[Open the pull request](https://github.com/openRuyi-Project/openRuyi/pull/1)`) without embedded HTML `<button>` elements, requires no GraphQL mutations, and does not write any labels.
+The comment frames the pure GitHub Flavored Markdown tip (`> [!TIP]` + `[Open the pull request](https://github.com/openRuyi-Project/openRuyi/pull/1)`) inside the standard contributor thank-you opener and `## <bot> Review Notes` heading, appends a dynamic bottom footer combining `WipDraft:DocumentationLinks` with `BotState:GeneralDocumentationLinks`, uses no embedded HTML `<button>` elements, requires no GraphQL mutations, and does not write any labels.
 
 ---
 
@@ -37,7 +37,7 @@ Configured under the `WipDraft` section in `appsettings.json` (`Options/WipDraft
 |---|---|---|---|
 | `Enabled` | `bool` | `true` | Enables or disables WIP-to-Draft TIP reminder comment reconciliation on pull requests. |
 | `DryRun` | `bool` | `false` | When `true`, logs intended TIP comment actions without creating, updating, or deleting comments on GitHub. |
-| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique `http`/`https` links (`Title`, optional `TitleZh`, `Url`) rendered inside `> [!TIP]` reminder comments. |
+| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique non-empty URL strings (rendered verbatim) (`Title`, optional `TitleZh`, `Url`) appended in the consolidated footer below `> [!TIP]` reminder comments (merged with `BotState:GeneralDocumentationLinks`). |
 
 ---
 

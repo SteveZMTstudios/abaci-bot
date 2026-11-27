@@ -44,13 +44,14 @@ public interface IGovernanceCommentFormatter
         IReadOnlySet<string>? excludedUrls = null) => string.Empty;
 
     /// <summary>
-    /// Formats a standalone WIP-to-Draft TIP notice comment without HTML buttons.
+    /// Formats a WIP-to-Draft TIP notice comment inside the unified review header/footer frame without HTML buttons.
     /// </summary>
     string FormatWipTip(
         WipTipKind kind,
         string prUrl,
         string? locale = null,
-        IReadOnlyList<DocumentationLink>? documentationLinks = null) => string.Empty;
+        IReadOnlyList<DocumentationLink>? documentationLinks = null,
+        string? botDisplayName = null) => string.Empty;
 
     /// <summary>
     /// Formats an SPDX license compliance check failure notice using GFM [!WARNING].

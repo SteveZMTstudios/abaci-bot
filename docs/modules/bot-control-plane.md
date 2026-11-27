@@ -43,7 +43,7 @@ Configured under the `BotState` JSON section:
 | `RepositoryDefaultLocales` | `object` | `{}` | Map of `"owner/repo"` to `"en"`, `"zh"`, or `"en-*"` / `"zh-*"` subtags. Fallback when the user has not chosen a personal preference. |
 | `EphemeralReplyDeleteMinutes` | `int` | `5` | Delay in minutes (`0..1440`) before ephemeral usage and rejection replies are processed by `EphemeralReplyService` (author confirmation prompts use `AuthorLockConfirmTimeoutMinutes`). Setting `0` disables automatic cleanup. |
 | `EphemeralReplyAction` | `enum` | `"Delete"` | Action taken on expired ephemeral replies: `"Delete"` (deletes the comment) or `"Minimize"` (minimizes as `OUTDATED`). |
-| `GeneralDocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique `http`/`https` links (`Title`, optional `TitleZh`, `Url`). Rendered once in consolidated PR governance review footers alongside triggered module `DocumentationLinks` when at least one triggered section enables `IncludeGeneralDocs`. |
+| `GeneralDocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique non-empty URL strings (rendered verbatim) (`Title`, optional `TitleZh`, `Url`). Rendered once in consolidated PR governance review footers alongside triggered module `DocumentationLinks` when at least one triggered section enables `IncludeGeneralDocs`. |
 
 ---
 

@@ -16,6 +16,10 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
     public const string WipDraftTipMarker = "<!-- abaci-bot:wip-tip:draft -->";
     public const string WipReadyTipMarker = "<!-- abaci-bot:wip-tip:ready -->";
 
+    internal const string ConsolidatedOpenerEn =
+        "Thank you for your contribution! We have identified a few points that require your attention:";
+    internal const string ConsolidatedOpenerZh =
+        "感谢您的贡献！我们发现以下几个需要您关注的事项：";
     internal const string WipDraftTipLeadEn =
         "> This pull request title contains `WIP`. If it is not ready for review, use **Convert to draft** under the pull request description.";
     internal const string WipDraftTipLeadZh =
@@ -49,13 +53,13 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
 
         if (isZh)
         {
-            sb.AppendLine("感谢您的贡献！我们发现以下几个需要您关注的事项：");
+            sb.AppendLine(ConsolidatedOpenerZh);
             sb.AppendLine();
             sb.Append(CultureInfo.InvariantCulture, $"## {displayName} 审查说明");
         }
         else
         {
-            sb.AppendLine("Thank you for your contribution! We have identified a few points that require your attention:");
+            sb.AppendLine(ConsolidatedOpenerEn);
             sb.AppendLine();
             sb.Append(CultureInfo.InvariantCulture, $"## {displayName} Review Notes");
         }
@@ -88,12 +92,15 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
         WipTipKind kind,
         string prUrl,
         string? locale = null,
-        IReadOnlyList<DocumentationLink>? documentationLinks = null)
+        IReadOnlyList<DocumentationLink>? documentationLinks = null,
+        string? botDisplayName = null)
     {
         var isZh = IsChinese(locale);
         var sb = new StringBuilder();
         var marker = kind == WipTipKind.Draft ? WipDraftTipMarker : WipReadyTipMarker;
 
+        sb.AppendLine(FormatConsolidatedHeader(locale, botDisplayName));
+        sb.AppendLine();
         sb.AppendLine("> [!TIP]");
         if (kind == WipTipKind.Draft)
         {
@@ -126,13 +133,14 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
             }
         }
 
-        var seeAlsoBlockquote = DocumentationLinkFormatter.FormatSeeAlsoBlockquoteFooter(documentationLinks, isZh);
-        if (!string.IsNullOrEmpty(seeAlsoBlockquote))
+        var footer = FormatConsolidatedFooter(locale, documentationLinks, includeGeneralDocs: true);
+        if (!string.IsNullOrEmpty(footer))
         {
-            sb.AppendLine(">");
-            sb.AppendLine(seeAlsoBlockquote);
+            sb.AppendLine();
+            sb.AppendLine(footer);
         }
 
+        sb.AppendLine();
         sb.Append(marker);
         return sb.ToString();
     }

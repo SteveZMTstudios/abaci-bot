@@ -115,48 +115,18 @@ public static partial class DocumentationLinkFormatter
         bool isChinese,
         IReadOnlySet<string>? excludedUrls = null)
     {
-        return FormatListSection(
-            links,
-            isChinese,
-            excludedUrls,
-            heading: isChinese ? "更多参考文档：" : "For more details, see:",
-            linePrefix: "- ");
-    }
-
-    /// <summary>
-    /// Formats a GFM blockquote-indented "See also" / "另请参阅" section for callout blocks (e.g., <c>&gt; [!TIP]</c>),
-    /// or <see cref="string.Empty"/> when no valid links remain.
-    /// </summary>
-    public static string FormatSeeAlsoBlockquoteFooter(
-        IEnumerable<DocumentationLink?>? links,
-        bool isChinese)
-    {
-        return FormatListSection(
-            links,
-            isChinese,
-            excludedUrls: null,
-            heading: isChinese ? "> **另请参阅**：" : "> **See also**:",
-            linePrefix: "> - ");
-    }
-
-    private static string FormatListSection(
-        IEnumerable<DocumentationLink?>? links,
-        bool isChinese,
-        IReadOnlySet<string>? excludedUrls,
-        string heading,
-        string linePrefix)
-    {
         var resolvedLinks = ResolveLinks(links, isChinese, excludedUrls);
         if (resolvedLinks.Count == 0)
         {
             return string.Empty;
         }
 
+        var heading = isChinese ? "更多参考文档：" : "For more details, see:";
         var sb = new StringBuilder();
         sb.AppendLine(heading);
         foreach (var (title, url) in resolvedLinks)
         {
-            sb.AppendLine(CultureInfo.InvariantCulture, $"{linePrefix}[{title}]({url})");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"- [{title}]({url})");
         }
 
         return sb.ToString().TrimEnd();
