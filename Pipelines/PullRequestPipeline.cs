@@ -23,10 +23,12 @@ public class PullRequestPipeline
     private readonly RuntimeHealthState? _runtimeHealth;
     private readonly TimeSpan _recoveryTimeout;
     private readonly Func<TimeSpan, CancellationToken, Task> _commentRetryDelayAsync;
+    private readonly TimeProvider _timeProvider;
+    private readonly IEphemeralCommentGateway? _commentGateway;
     private const int MaxUnflushedCommentEntries = 1024;
-    private static readonly TimeSpan UnflushedCommentTtl = TimeSpan.FromHours(1);
+    private static readonly TimeSpan UnflushedCommentTtl = TimeSpan.FromHours(3);
     private readonly object _unflushedCommentsLock = new();
-    private readonly Dictionary<string, (string? HeadSha, IReadOnlyList<string> Comments, DateTimeOffset ExpiresAtUtc)> _unflushedCommentsByPr =
+    private readonly Dictionary<string, (string? HeadSha, IReadOnlyList<PendingCommentSection> Comments, DateTimeOffset ExpiresAtUtc)> _unflushedCommentsByPr =
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
@@ -46,7 +48,9 @@ public class PullRequestPipeline
         ILocaleResolver? localeResolver = null,
         Func<TimeSpan, CancellationToken, Task>? commentRetryDelayAsync = null,
         RuntimeHealthState? runtimeHealth = null,
-        IBotIdentityProvider? botIdentity = null)
+        IBotIdentityProvider? botIdentity = null,
+        TimeProvider? timeProvider = null,
+        IEphemeralCommentGateway? commentGateway = null)
     {
         _modules = modules.OrderBy(m => m.Priority).ToList();
         _mutexEngine = mutexEngine;
@@ -58,6 +62,8 @@ public class PullRequestPipeline
         _localeResolver = localeResolver;
         _botIdentity = botIdentity ?? gitHubService as IBotIdentityProvider;
         _commentRetryDelayAsync = commentRetryDelayAsync ?? Task.Delay;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _commentGateway = commentGateway ?? gitHubService as IEphemeralCommentGateway;
     }
 
     /// <summary>
@@ -198,6 +204,7 @@ public class PullRequestPipeline
         {
             await ApplyDiffAsync(context, diff, tracker, cancellationToken);
             await FlushPendingCommentsAsync(context, cancellationToken);
+            await FlushPendingNoticesAsync(context, cancellationToken);
         }
         catch (Exception ex) when (ex is not CommentPostingTransientException)
         {
@@ -261,6 +268,7 @@ public class PullRequestPipeline
                     context.Owner, context.Repo, context.PrNumber, tracker.CompletedWrites, recoveryTracker?.CompletedWrites ?? 0);
 
                 await FlushPendingCommentsAsync(context, cancellationToken);
+                await FlushPendingNoticesAsync(context, cancellationToken);
             }
             else
             {
@@ -357,14 +365,14 @@ public class PullRequestPipeline
         }
     }
 
-    private IReadOnlyList<string> MergeWithCarriedOverComments(
+    private IReadOnlyList<PendingCommentSection> MergeWithCarriedOverComments(
         string prKey,
         string? headSha,
-        IReadOnlyList<string> pendingComments,
+        IReadOnlyList<PendingCommentSection> pendingComments,
         bool rebuildGateConfirmedOnRemote = false)
     {
-        IReadOnlyList<string>? carried = null;
-        var now = DateTimeOffset.UtcNow;
+        IReadOnlyList<PendingCommentSection>? carried = null;
+        var now = _timeProvider.GetUtcNow();
         lock (_unflushedCommentsLock)
         {
             if (_unflushedCommentsByPr.TryGetValue(prKey, out var entry))
@@ -381,39 +389,63 @@ public class PullRequestPipeline
             }
         }
 
-        if (carried == null || carried.Count == 0)
-        {
-            return pendingComments;
-        }
-
-        var merged = new List<string>(carried.Count + pendingComments.Count);
+        var carriedCount = carried?.Count ?? 0;
+        var merged = new List<PendingCommentSection>(carriedCount + pendingComments.Count);
+        var indexByBody = new Dictionary<string, int>(StringComparer.Ordinal);
         var hasCurrentRebuildGate = pendingComments.Any(c =>
-            c.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, StringComparison.Ordinal));
+            c.Body.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, StringComparison.Ordinal));
 
-        foreach (var prior in carried)
+        if (carried != null)
         {
-            if ((hasCurrentRebuildGate || rebuildGateConfirmedOnRemote) &&
-                prior.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, StringComparison.Ordinal))
+            foreach (var prior in carried)
             {
-                continue;
-            }
+                if ((hasCurrentRebuildGate || rebuildGateConfirmedOnRemote) &&
+                    prior.Body.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, StringComparison.Ordinal))
+                {
+                    continue;
+                }
 
-            if (!pendingComments.Contains(prior, StringComparer.Ordinal) &&
-                !merged.Contains(prior, StringComparer.Ordinal))
-            {
-                merged.Add(prior);
+                MergeCommentSection(prior, merged, indexByBody);
             }
         }
 
         foreach (var current in pendingComments)
         {
-            if (!merged.Contains(current, StringComparer.Ordinal))
-            {
-                merged.Add(current);
-            }
+            MergeCommentSection(current, merged, indexByBody);
         }
 
         return merged;
+    }
+
+    private static void MergeCommentSection(
+        PendingCommentSection section,
+        List<PendingCommentSection> merged,
+        Dictionary<string, int> indexByBody)
+    {
+        if (indexByBody.TryGetValue(section.Body, out var existingIndex))
+        {
+            var existing = merged[existingIndex];
+            var mergedIncludeGeneral = existing.IncludeGeneralDocs || section.IncludeGeneralDocs;
+            IReadOnlyList<Options.DocumentationLink>? mergedLinks = (existing.DocumentationLinks, section.DocumentationLinks) switch
+            {
+                (null or { Count: 0 }, _) => section.DocumentationLinks,
+                (_, null or { Count: 0 }) => existing.DocumentationLinks,
+                _ => [.. existing.DocumentationLinks, .. section.DocumentationLinks]
+            };
+            if (mergedIncludeGeneral != existing.IncludeGeneralDocs || !ReferenceEquals(mergedLinks, existing.DocumentationLinks))
+            {
+                merged[existingIndex] = existing with
+                {
+                    IncludeGeneralDocs = mergedIncludeGeneral,
+                    DocumentationLinks = mergedLinks
+                };
+            }
+        }
+        else
+        {
+            indexByBody[section.Body] = merged.Count;
+            merged.Add(section);
+        }
     }
 
     private void ClearCarriedOverComments(string prKey)
@@ -424,14 +456,14 @@ public class PullRequestPipeline
         }
     }
 
-    private void SaveCarriedOverComments(string prKey, string? headSha, IReadOnlyList<string> comments)
+    private void SaveCarriedOverComments(string prKey, string? headSha, IReadOnlyList<PendingCommentSection> comments)
     {
         if (comments.Count == 0)
         {
             return;
         }
 
-        var now = DateTimeOffset.UtcNow;
+        var now = _timeProvider.GetUtcNow();
         lock (_unflushedCommentsLock)
         {
             if (_unflushedCommentsByPr.Count >= MaxUnflushedCommentEntries && !_unflushedCommentsByPr.ContainsKey(prKey))
@@ -496,16 +528,47 @@ public class PullRequestPipeline
         }
 
         var hasRebuildGateMarker = effectiveComments.Any(c =>
-            c.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, StringComparison.Ordinal));
+            c.Body.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, StringComparison.Ordinal));
 
         var botDisplayName = await TryResolveBotDisplayNameAsync(cancellationToken);
         var sb = new System.Text.StringBuilder();
         sb.AppendLine(_formatter.FormatConsolidatedHeader(context.PreferredLocale, botDisplayName));
         sb.AppendLine();
-        foreach (var comment in effectiveComments)
+        foreach (var section in effectiveComments)
         {
-            sb.AppendLine(comment);
+            sb.AppendLine(section.Body);
             sb.AppendLine();
+        }
+
+        var moduleLinks = new List<Options.DocumentationLink>();
+        var includeGeneralDocs = false;
+        foreach (var section in effectiveComments)
+        {
+            if (section.IncludeGeneralDocs)
+            {
+                includeGeneralDocs = true;
+            }
+
+            if (section.DocumentationLinks is { Count: > 0 })
+            {
+                moduleLinks.AddRange(section.DocumentationLinks);
+            }
+        }
+
+        if (moduleLinks.Count > 0 || includeGeneralDocs)
+        {
+            var existingBodyUrls = DocumentationLinkFormatter.ExtractNormalizedHttpUrls(
+                effectiveComments.Select(static s => s.Body));
+            var footer = _formatter.FormatConsolidatedFooter(
+                context.PreferredLocale,
+                moduleLinks,
+                includeGeneralDocs,
+                existingBodyUrls);
+            if (!string.IsNullOrWhiteSpace(footer))
+            {
+                sb.AppendLine(footer);
+                sb.AppendLine();
+            }
         }
 
         var consolidatedComment = sb.ToString().TrimEnd();
@@ -570,5 +633,104 @@ public class PullRequestPipeline
                 throw new CommentPostingTransientException(ex);
             }
         }
+    }
+
+    private async Task FlushPendingNoticesAsync(
+        PullRequestContext context,
+        CancellationToken cancellationToken)
+    {
+        if (context.PendingNotices.Count == 0)
+        {
+            return;
+        }
+
+        var intents = context.PendingNotices.ToList();
+        foreach (var intent in intents)
+        {
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (intent.Delete)
+                {
+                    if (intent.ExistingCommentId.HasValue && _commentGateway != null)
+                    {
+                        try
+                        {
+                            await _commentGateway.DeleteCommentAsync(
+                                context.Owner,
+                                context.Repo,
+                                intent.ExistingCommentId.Value,
+                                cancellationToken);
+                        }
+                        catch (NotFoundException)
+                        {
+                            _logger?.LogDebug(
+                                "Notice comment {CommentId} ({Marker}) already absent on {Owner}/{Repo}#{PrNumber}; treating delete as idempotent.",
+                                intent.ExistingCommentId.Value, intent.Marker, context.Owner, context.Repo, context.PrNumber);
+                        }
+                    }
+                }
+                else if (intent.ExistingCommentId.HasValue)
+                {
+                    if (!string.IsNullOrWhiteSpace(intent.Body))
+                    {
+                        try
+                        {
+                            await _gitHubService.UpdateCommentAsync(
+                                context.Owner,
+                                context.Repo,
+                                intent.ExistingCommentId.Value,
+                                intent.Body,
+                                cancellationToken);
+                        }
+                        catch (NotFoundException)
+                        {
+                            _logger?.LogDebug(
+                                "Notice comment {CommentId} ({Marker}) deleted concurrently on {Owner}/{Repo}#{PrNumber}; clearing update intent.",
+                                intent.ExistingCommentId.Value, intent.Marker, context.Owner, context.Repo, context.PrNumber);
+                        }
+                    }
+                }
+                else if (!string.IsNullOrWhiteSpace(intent.Body))
+                {
+                    await _gitHubService.CreateCommentAsync(
+                        context.Owner,
+                        context.Repo,
+                        context.PrNumber,
+                        intent.Body,
+                        cancellationToken);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (TransientErrorPolicy.IsNonRetriable(ex))
+            {
+                _logger?.LogError(
+                    ex,
+                    "Non-retriable error flushing notice {Marker} on PR {Owner}/{Repo}#{PrNumber}; retaining applied labels fail-closed.",
+                    intent.Marker, context.Owner, context.Repo, context.PrNumber);
+                _runtimeHealth?.RecordError(
+                    nameof(PullRequestPipeline),
+                    ex,
+                    $"Non-retriable notice failure ({intent.Marker}) on {context.Owner}/{context.Repo}#{context.PrNumber}");
+            }
+            catch (Exception ex)
+            {
+                _runtimeHealth?.RecordError(
+                    nameof(PullRequestPipeline),
+                    ex,
+                    $"Transient notice failure ({intent.Marker}) on {context.Owner}/{context.Repo}#{context.PrNumber}");
+                _logger?.LogWarning(
+                    ex,
+                    "Transient error flushing notice {Marker} on PR {Owner}/{Repo}#{PrNumber}; surfacing for dispatcher retry.",
+                    intent.Marker, context.Owner, context.Repo, context.PrNumber);
+                throw new CommentPostingTransientException(ex);
+            }
+        }
+
+        context.PendingNotices.Clear();
     }
 }

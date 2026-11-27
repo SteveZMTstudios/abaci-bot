@@ -3883,6 +3883,238 @@ public class PipelineAndModulesTests
         Assert.False(TransientErrorPolicy.IsNonRetriable(emptyAggregate));
     }
 
+    [Fact]
+    public void ShinyNewPrModule_TerminalPr_ShouldProcess_ReturnsFalse()
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var module = new ShinyNewPrModule();
+        var mergedOpened = new PullRequestContext(
+            gitHubService: gitHub,
+            teamName: "captains",
+            headers: null,
+            eventType: PullRequestEventType.PullRequest,
+            owner: "owner",
+            repo: "repo",
+            prNumber: 88,
+            headSha: "sha",
+            baseBranch: "main",
+            isDraft: false,
+            isMerged: true,
+            title: "Merged PR",
+            body: null,
+            senderLogin: "author",
+            authorLogin: "author",
+            action: "opened",
+            existingLabels: Array.Empty<string>(),
+            prAction: WebhookPullRequestAction.Opened);
+
+        Assert.True(mergedOpened.IsTerminal);
+        Assert.False(module.ShouldProcess(mergedOpened));
+    }
+
+    [Fact]
+    public async Task ShinyNewPrModule_TerminalPr_Process_DoesNotAddNewLabel()
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var module = new ShinyNewPrModule();
+        var mergedOpened = new PullRequestContext(
+            gitHubService: gitHub,
+            teamName: "captains",
+            headers: null,
+            eventType: PullRequestEventType.PullRequest,
+            owner: "owner",
+            repo: "repo",
+            prNumber: 88,
+            headSha: "sha",
+            baseBranch: "main",
+            isDraft: false,
+            isMerged: true,
+            title: "Merged PR",
+            body: null,
+            senderLogin: "author",
+            authorLogin: "author",
+            action: "opened",
+            existingLabels: Array.Empty<string>(),
+            prAction: WebhookPullRequestAction.Opened);
+
+        await module.ProcessAsync(mergedOpened, CancellationToken.None);
+
+        Assert.DoesNotContain(GitHubLabels.StatusNew, mergedOpened.LabelsToAdd);
+        Assert.Empty(mergedOpened.LabelsToAdd);
+    }
+
+    [Fact]
+    public void ShinyNewPrModule_WorkflowCompleteLabel_ShouldProcess_ReturnsFalseForOpened()
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var module = new ShinyNewPrModule();
+        var completeOpened = new PullRequestContext(
+            gitHubService: gitHub,
+            teamName: "captains",
+            headers: null,
+            eventType: PullRequestEventType.PullRequest,
+            owner: "owner",
+            repo: "repo",
+            prNumber: 89,
+            headSha: "sha",
+            baseBranch: "main",
+            isDraft: false,
+            isMerged: false,
+            title: "Completed PR",
+            body: null,
+            senderLogin: "author",
+            authorLogin: "author",
+            action: "opened",
+            existingLabels: new[] { GitHubLabels.WorkflowComplete },
+            prAction: WebhookPullRequestAction.Opened);
+
+        Assert.True(completeOpened.IsTerminal);
+        Assert.False(module.ShouldProcess(completeOpened));
+    }
+
+    [Fact]
+    public async Task ShinyNewPrModule_TerminalPr_WithHumanComment_RemovesStatusNew()
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var module = new ShinyNewPrModule();
+        var mergedComment = new PullRequestContext(
+            gitHubService: gitHub,
+            teamName: "captains",
+            headers: null,
+            eventType: PullRequestEventType.IssueComment,
+            owner: "owner",
+            repo: "repo",
+            prNumber: 90,
+            headSha: "sha",
+            baseBranch: "main",
+            isDraft: false,
+            isMerged: true,
+            title: "Merged PR",
+            body: null,
+            senderLogin: "reviewer",
+            authorLogin: "author",
+            action: "created",
+            existingLabels: new[] { GitHubLabels.StatusNew },
+            commentAction: WebhookIssueCommentAction.Created);
+
+        Assert.True(mergedComment.IsTerminal);
+        Assert.True(module.ShouldProcess(mergedComment));
+
+        await module.ProcessAsync(mergedComment, CancellationToken.None);
+
+        Assert.Contains(GitHubLabels.StatusNew, mergedComment.LabelsToRemove);
+        Assert.DoesNotContain(GitHubLabels.StatusNew, mergedComment.LabelsToAdd);
+    }
+
+    [Fact]
+    public async Task WebhookDispatcher_DelayedOpenedOnClosedPr_DoesNotAddStatusNew()
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var closedPr = (PullRequest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(PullRequest));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Draft))?.SetValue(closedPr, false);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.State))?.SetValue(closedPr, new StringEnum<ItemState>(ItemState.Closed));
+        typeof(PullRequest).GetProperty(nameof(PullRequest.MergedAt))?.SetValue(closedPr, (DateTimeOffset?)null);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(closedPr, Array.Empty<Octokit.Label>());
+
+        var fetchCalls = 0;
+        gitHub.GetPullRequestAsync("owner", "repo", 91, Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                if (Interlocked.Increment(ref fetchCalls) <= 2)
+                {
+                    return Task.FromException<PullRequest?>(
+                        new HttpRequestException("transient refresh failure", null, System.Net.HttpStatusCode.ServiceUnavailable));
+                }
+
+                return Task.FromResult<PullRequest?>(closedPr);
+            });
+
+        var pipeline = new PullRequestPipeline(
+            new IPullRequestModule[] { new WorkflowStateModule(), new ShinyNewPrModule() },
+            new LabelMutexEngine(),
+            gitHub);
+
+        using var dispatcher = new WebhookDispatcher(
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<WebhookDispatcher>.Instance,
+            retryDelaySelector: _ => TimeSpan.Zero);
+        await dispatcher.StartAsync(CancellationToken.None);
+
+        var attempts = 0;
+        var workCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(dispatcher.TryEnqueue(
+            "del-late-opened-closed",
+            "pull_request:opened",
+            async ct =>
+            {
+                Interlocked.Increment(ref attempts);
+                var ctx = CreateMockContext(
+                    gitHub,
+                    prNumber: 91,
+                    action: nameof(WebhookPullRequestAction.Opened),
+                    prAction: WebhookPullRequestAction.Opened,
+                    mockRefresh: false);
+                await pipeline.ExecuteAsync(ctx, ct);
+                workCompleted.TrySetResult();
+            }));
+
+        await workCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.StopAsync(CancellationToken.None);
+
+        Assert.Equal(2, attempts);
+        await gitHub.DidNotReceive().AddLabelsAsync(
+            "owner",
+            "repo",
+            91,
+            Arg.Is<string[]>(labels => labels.Contains(GitHubLabels.StatusNew)),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Theory]
+    [InlineData("[WIP] add patch", true)]
+    [InlineData("(wip) add patch", true)]
+    [InlineData("WIP: add patch", true)]
+    [InlineData("WIP-fix build", true)]
+    [InlineData("WIP：修复构建", true)]
+    [InlineData("feat: add wip flag", false)]
+    [InlineData("SWIPE optimization", false)]
+    public async Task WorkflowStateModule_UsesSharedWipTokenMatching(string title, bool expectedInDev)
+    {
+        var gitHub = Substitute.For<IGitHubService>();
+        var module = new WorkflowStateModule();
+        var ctx = new PullRequestContext(
+            gitHubService: gitHub,
+            teamName: "captains",
+            headers: null,
+            eventType: PullRequestEventType.PullRequest,
+            owner: "owner",
+            repo: "repo",
+            prNumber: 92,
+            headSha: "sha",
+            baseBranch: "main",
+            isDraft: false,
+            isMerged: null,
+            title: title,
+            body: null,
+            senderLogin: "author",
+            authorLogin: "author",
+            action: "opened",
+            existingLabels: Array.Empty<string>(),
+            prAction: WebhookPullRequestAction.Opened);
+
+        await module.ProcessAsync(ctx, CancellationToken.None);
+
+        if (expectedInDev)
+        {
+            Assert.Contains(GitHubLabels.WorkflowInDev, ctx.LabelsToAdd);
+            Assert.DoesNotContain(GitHubLabels.WorkflowReadyForReview, ctx.LabelsToAdd);
+        }
+        else
+        {
+            Assert.Contains(GitHubLabels.WorkflowReadyForReview, ctx.LabelsToAdd);
+            Assert.DoesNotContain(GitHubLabels.WorkflowInDev, ctx.LabelsToAdd);
+        }
+    }
+
     #endregion
 
     #endregion

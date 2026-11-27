@@ -85,6 +85,8 @@ public class PackageUpdateOptionsValidator : IValidateOptions<PackageUpdateOptio
             }
         }
 
+        DocumentationLinkValidator.Validate(options.DocumentationLinks, nameof(options.DocumentationLinks), failures);
+
         return failures.Count > 0
             ? ValidateOptionsResult.Fail(failures)
             : ValidateOptionsResult.Success;

@@ -6,19 +6,17 @@ namespace abaci_bot.Services;
 /// <summary>
 /// Interim <see cref="IRebuildVerificationOrchestrator"/> implementation returning
 /// <see cref="RebuildVerificationState.ManualVerificationRequired"/> with contributor guidance
-/// toward isolated reverse-dependency verification and optional configured reference links.
+/// toward isolated reverse-dependency verification.
 /// </summary>
 public class ManualGuideRebuildVerificationOrchestrator : IRebuildVerificationOrchestrator
 {
     private readonly IGovernanceCommentFormatter _formatter;
-    private readonly RebuildImpactOptions _options;
 
     public ManualGuideRebuildVerificationOrchestrator(
         IGovernanceCommentFormatter formatter,
-        IOptions<RebuildImpactOptions> options)
+        IOptions<RebuildImpactOptions>? options = null)
     {
         _formatter = formatter ?? throw new ArgumentNullException(nameof(formatter));
-        _options = (options ?? throw new ArgumentNullException(nameof(options))).Value;
     }
 
     public Task<RebuildVerificationResult> RequestVerificationAsync(
@@ -33,7 +31,7 @@ public class ManualGuideRebuildVerificationOrchestrator : IRebuildVerificationOr
             request.Threshold,
             request.TargetBranch,
             locale: request.Locale,
-            referenceLinks: _options.VerificationGuideLinks);
+            referenceLinks: null);
 
         return Task.FromResult(new RebuildVerificationResult(
             State: RebuildVerificationState.ManualVerificationRequired,

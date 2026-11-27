@@ -1,61 +1,4 @@
-using System.Diagnostics.CodeAnalysis;
-
 namespace abaci_bot.Options;
-
-/// <summary>
-/// A titled external reference link rendered in consolidated PR governance review headers
-/// and deduplicated against rebuild-gate guidance.
-/// </summary>
-public sealed record VerificationReferenceLink
-{
-    [ConfigField(
-        Description = "Display title used for English and default locales (single line).",
-        Format = "1..120 character single-line title",
-        Example = "\"Contribution Guide\"",
-        Required = true)]
-    public string Title { get; set; } = string.Empty;
-
-    [ConfigField(
-        Description = "Optional Chinese display title used in Chinese locales.",
-        Format = "optional 1..120 character single-line title",
-        EmptyBehavior = "falls back to Title when null or blank.",
-        Example = "\"贡献指南\"")]
-    public string? TitleZh { get; set; }
-
-    [ConfigField(
-        Description = "Absolute HTTP or HTTPS destination URL.",
-        Format = "absolute http/https URI without whitespace or control characters",
-        Example = "\"https://openruyi.org/docs/contributing\"",
-        Required = true)]
-    public string Url { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Validates and normalizes <paramref name="rawUrl"/> as an absolute HTTP/HTTPS URI with no whitespace or control characters.
-    /// </summary>
-    internal static bool TryNormalizeHttpUrl(string? rawUrl, [NotNullWhen(true)] out Uri? normalizedUri)
-    {
-        normalizedUri = null;
-        if (string.IsNullOrWhiteSpace(rawUrl))
-        {
-            return false;
-        }
-
-        var trimmed = rawUrl.Trim();
-        if (trimmed.Any(c => char.IsWhiteSpace(c) || char.IsControl(c)))
-        {
-            return false;
-        }
-
-        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var candidate) ||
-            (candidate.Scheme != Uri.UriSchemeHttp && candidate.Scheme != Uri.UriSchemeHttps))
-        {
-            return false;
-        }
-
-        normalizedUri = candidate;
-        return true;
-    }
-}
 
 /// <summary>
 /// Configuration options for RPM dependency DAG building and rebuild impact gating.
@@ -111,9 +54,9 @@ public class RebuildImpactOptions
     public string TargetBranchToBlock { get; set; } = "Rolling";
 
     [ConfigField(
-        Description = "Configured governance reference links rendered once in the consolidated PR review comment header (and deduplicated against rebuild-gate guidance).",
+        Description = "Module-specific documentation links appended dynamically to the consolidated PR review footer when RebuildImpact triggers a blocked rebuild gate (deduplicated against inline body URLs and BotState:GeneralDocumentationLinks).",
         Format = "JSON array of up to 5 objects { \"Title\": \"...\", \"TitleZh\": \"...\" (optional), \"Url\": \"https://...\" }",
-        EmptyBehavior = "no external reference links are rendered in consolidated review comments.",
-        Example = "[{ \"Title\": \"Contribution Guide\", \"TitleZh\": \"贡献指南\", \"Url\": \"https://openruyi.org/docs/contributing\" }]")]
-    public List<VerificationReferenceLink> VerificationGuideLinks { get; set; } = new();
+        EmptyBehavior = "no rebuild-specific documentation links are appended.",
+        Example = "[{ \"Title\": \"Rebuild Verification Guide\", \"TitleZh\": \"重构验证指南\", \"Url\": \"https://openruyi.org/docs/rebuild\" }]")]
+    public List<DocumentationLink> DocumentationLinks { get; set; } = new();
 }

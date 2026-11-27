@@ -84,6 +84,7 @@ Configured under the `PackageUpdate` JSON section in `appsettings.json`:
 | `MinRateLimitRemaining` | `int` | `500` | Minimum core GitHub API quota required to begin a sweep. |
 | `RequestThrottleMilliseconds` | `int` | `2000` | Delay in milliseconds inserted after publishing each update pull request to prevent secondary rate limits. |
 | `MaxArchiveBytes` | `long` | `104857600` | Maximum compressed repository tarball size in bytes (100 MiB) accepted via HTTP `Content-Length` pre-check and `BoundedReadStream` streaming read before falling back to Git Tree API (`0` disables the compressed archive cap; individual and cumulative decompressed `.spec` entries remain capped at 4 MiB per spec and 256 MiB total). |
+| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique `http`/`https` links (`Title`, optional `TitleZh`, `Url`) appended to automated package update stepped-aside warnings, failed-PR TTL closure comments, and post-merge OBS blocked tracking issue bodies (before the hidden package marker). |
 
 ### Nested Options
 

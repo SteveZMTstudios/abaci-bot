@@ -551,7 +551,7 @@ public class WebhookDispatcherTests
             {
                 if (Interlocked.Increment(ref moduleRuns) == 1)
                 {
-                    ci.Arg<PullRequestContext>().PendingComments.Add(commentBody);
+                    ci.Arg<PullRequestContext>().AddPendingComment(commentBody);
                 }
 
                 return Task.CompletedTask;

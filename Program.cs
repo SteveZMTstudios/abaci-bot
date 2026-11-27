@@ -81,18 +81,35 @@ builder.Services.AddHttpClient();
 
 builder.Services.Configure<TargetClassificationOptions>(config.GetSection("TargetClassification"));
 builder.Services.Configure<ChangeTypeClassificationOptions>(config.GetSection("ChangeTypeClassification"));
+builder.Services.AddOptions<WipDraftOptions>()
+    .Bind(config.GetSection("WipDraft"))
+    .ValidateOnStart();
+builder.Services.AddSingleton<Microsoft.Extensions.Options.IValidateOptions<WipDraftOptions>>(_ =>
+    new DocumentationLinksOptionsValidator<WipDraftOptions>(o => o.DocumentationLinks));
 builder.Services.AddOptions<StaleLifecycleOptions>()
     .Bind(config.GetSection("StaleLifecycle"))
     .ValidateOnStart();
 builder.Services.AddSingleton<Microsoft.Extensions.Options.IValidateOptions<StaleLifecycleOptions>, StaleLifecycleOptionsValidator>();
 builder.Services.Configure<BotDetectionOptions>(config.GetSection("BotDetection"));
-builder.Services.Configure<SpdxComplianceOptions>(config.GetSection("SpdxCompliance"));
-builder.Services.Configure<CveSecurityOptions>(config.GetSection("CveSecurity"));
+builder.Services.AddOptions<SpdxComplianceOptions>()
+    .Bind(config.GetSection("SpdxCompliance"))
+    .ValidateOnStart();
+builder.Services.AddSingleton<Microsoft.Extensions.Options.IValidateOptions<SpdxComplianceOptions>>(_ =>
+    new DocumentationLinksOptionsValidator<SpdxComplianceOptions>(o => o.DocumentationLinks));
+builder.Services.AddOptions<CveSecurityOptions>()
+    .Bind(config.GetSection("CveSecurity"))
+    .ValidateOnStart();
+builder.Services.AddSingleton<Microsoft.Extensions.Options.IValidateOptions<CveSecurityOptions>>(_ =>
+    new DocumentationLinksOptionsValidator<CveSecurityOptions>(o => o.DocumentationLinks));
 builder.Services.AddOptions<RebuildImpactOptions>()
     .Bind(config.GetSection("RebuildImpact"))
     .ValidateOnStart();
 builder.Services.AddSingleton<Microsoft.Extensions.Options.IValidateOptions<RebuildImpactOptions>, RebuildImpactOptionsValidator>();
-builder.Services.Configure<AbiComplianceOptions>(config.GetSection("AbiCompliance"));
+builder.Services.AddOptions<AbiComplianceOptions>()
+    .Bind(config.GetSection("AbiCompliance"))
+    .ValidateOnStart();
+builder.Services.AddSingleton<Microsoft.Extensions.Options.IValidateOptions<AbiComplianceOptions>>(_ =>
+    new DocumentationLinksOptionsValidator<AbiComplianceOptions>(o => o.DocumentationLinks));
 builder.Services.Configure<FileCacheOptions>(config.GetSection("FileCache"));
 builder.Services.AddSingleton<IFileContentCache, FileContentCache>();
 builder.Services.AddOptions<PackageUpdateOptions>()
@@ -171,6 +188,7 @@ builder.Services.AddSingleton<IPullRequestModule, WorkflowStateModule>();
 builder.Services.AddSingleton<IPullRequestModule, StaleUnstaleModule>();
 builder.Services.AddSingleton<IPullRequestModule, ShinyNewPrModule>();
 builder.Services.AddSingleton<IPullRequestModule, UserContributionModule>();
+builder.Services.AddSingleton<IPullRequestModule, WipDraftModule>();
 builder.Services.AddSingleton<IPullRequestModule, TargetClassificationModule>();
 builder.Services.AddSingleton<IPullRequestModule, BuildSystemAnalysisModule>();
 builder.Services.AddSingleton<IPullRequestModule, ChangeTypeClassificationModule>();
@@ -209,6 +227,13 @@ builder.Services.AddSingleton<WebhookEventProcessor, GitHubWebhookProcessor>();
 
 var app = builder.Build();
 
+if (config.GetSection("RebuildImpact:VerificationGuideLinks").Exists())
+{
+    app.Logger.LogWarning(
+        "Configuration key 'RebuildImpact:VerificationGuideLinks' has been replaced by per-module 'DocumentationLinks' " +
+        "(for example 'RebuildImpact:DocumentationLinks') and 'BotState:GeneralDocumentationLinks', and is no longer read.");
+}
+
 // Eagerly initialize persistent state store at startup so unwritable state directories
 // fail fast and expired user preferences are pruned immediately.
 app.Services.GetRequiredService<IBotStateStore>();
@@ -227,7 +252,8 @@ app.MapGet("/health", (
     IOptions<AbiComplianceOptions> abiCompliance,
     IOptions<RebuildImpactOptions> rebuildImpact,
     IOptions<SpdxComplianceOptions> spdxCompliance,
-    IOptions<CveSecurityOptions> cveSecurity) =>
+    IOptions<CveSecurityOptions> cveSecurity,
+    IOptions<WipDraftOptions> wipDraft) =>
 {
     var verboseParam = httpContext.Request.Query["verbose"].ToString();
     var isVerbose = httpContext.Request.Query.ContainsKey("verbose") &&
@@ -245,7 +271,8 @@ app.MapGet("/health", (
         abiCompliance.Value,
         rebuildImpact.Value,
         spdxCompliance.Value,
-        cveSecurity.Value));
+        cveSecurity.Value,
+        wipDraft.Value));
 });
 
 app.Run();

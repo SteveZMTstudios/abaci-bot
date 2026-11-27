@@ -90,7 +90,7 @@ public class WorkflowStateModule : IPullRequestModule
             {
                 if (!context.IsBlocked && !context.IsTerminal)
                 {
-                    if (context.IsDraft || context.Title.StartsWith("WIP", StringComparison.OrdinalIgnoreCase))
+                    if (context.IsDraft || WipTitleHelper.IsWip(context.Title))
                     {
                         context.LabelsToAdd.Add(GitHubLabels.WorkflowInDev);
                     }
@@ -133,7 +133,7 @@ public class WorkflowStateModule : IPullRequestModule
         }
 
         // Draft PRs and WIP titles indicate work-in-progress development
-        if (context.IsDraft || context.Title.StartsWith("WIP", StringComparison.OrdinalIgnoreCase))
+        if (context.IsDraft || WipTitleHelper.IsWip(context.Title))
         {
             context.LabelsToAdd.Add(GitHubLabels.WorkflowInDev);
             context.LabelsToRemove.Add(GitHubLabels.WorkflowReadyForReview);
@@ -199,7 +199,7 @@ public class WorkflowStateModule : IPullRequestModule
         if (captains.Contains(sender) &&
             !context.IsBlocked &&
             !isDraft &&
-            !context.Title.StartsWith("WIP", StringComparison.OrdinalIgnoreCase))
+            !WipTitleHelper.IsWip(context.Title))
         {
             context.LabelsToRemove.Add(GitHubLabels.WorkflowReadyForReview);
             context.LabelsToAdd.Add(GitHubLabels.WorkflowInReview);

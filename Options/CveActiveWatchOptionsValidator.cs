@@ -52,6 +52,8 @@ public class CveActiveWatchOptionsValidator : IValidateOptions<CveActiveWatchOpt
             failures.Add($"{nameof(options.TargetRepository)} must be in 'owner/repo' format (got '{options.TargetRepository}').");
         }
 
+        DocumentationLinkValidator.Validate(options.DocumentationLinks, nameof(options.DocumentationLinks), failures);
+
         return failures.Count > 0
             ? ValidateOptionsResult.Fail(failures)
             : ValidateOptionsResult.Success;

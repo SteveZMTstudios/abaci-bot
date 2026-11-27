@@ -163,6 +163,10 @@ public class GitHubPackageUpdatePublisher : IPackageUpdatePublisher
                         var warningComment = $"A newer upstream version `{candidate.TargetVersion}` is available for `{candidate.PackageName}`, " +
                                              $"but branch `{branchName}` contains human commits by {actorMention}. " +
                                              "Automated update has stepped aside to prevent overwriting manual work.";
+                        warningComment = DocumentationLinkFormatter.AppendFooter(
+                            warningComment,
+                            _options.DocumentationLinks,
+                            isChinese: false);
                         await _gitHubService.CreateCommentAsync(owner, repo, existingPr.Number, warningComment, ct);
                     }
                 }

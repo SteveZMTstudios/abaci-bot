@@ -37,6 +37,8 @@ public class StaleLifecycleOptionsValidator : IValidateOptions<StaleLifecycleOpt
             failures.Add($"{nameof(options.MinRateLimitRemaining)} cannot be negative (got {options.MinRateLimitRemaining}).");
         }
 
+        DocumentationLinkValidator.Validate(options.DocumentationLinks, nameof(options.DocumentationLinks), failures);
+
         return failures.Count > 0
             ? ValidateOptionsResult.Fail(failures)
             : ValidateOptionsResult.Success;

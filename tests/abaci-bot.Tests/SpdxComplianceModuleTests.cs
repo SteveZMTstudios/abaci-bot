@@ -194,8 +194,10 @@ public class SpdxComplianceModuleTests
 
         Assert.Contains(GitHubLabels.ComplianceLicenseIssue, context.LabelsToAdd);
         Assert.NotEmpty(context.PendingComments);
-        Assert.Contains("SPDX License Tag Update Suggested", context.PendingComments[0]);
-        Assert.Contains("ProprietaryNonStandard", context.PendingComments[0]);
+        Assert.True(context.PendingComments[0].IncludeGeneralDocs);
+        Assert.Equal(options.Value.DocumentationLinks, context.PendingComments[0].DocumentationLinks);
+        Assert.Contains("SPDX License Tag Update Suggested", context.PendingComments[0].Body);
+        Assert.Contains("ProprietaryNonStandard", context.PendingComments[0].Body);
     }
 
     [Fact]
@@ -215,7 +217,7 @@ public class SpdxComplianceModuleTests
 
         Assert.Contains(GitHubLabels.ComplianceLicenseIssue, context.LabelsToAdd);
         Assert.NotEmpty(context.PendingComments);
-        Assert.Contains("Missing required `License:` field declaration", context.PendingComments[0]);
+        Assert.Contains("Missing required `License:` field declaration", context.PendingComments[0].Body);
     }
 
     [Fact]
@@ -289,7 +291,7 @@ public class SpdxComplianceModuleTests
 
         Assert.Contains(GitHubLabels.ComplianceLicenseIssue, context.LabelsToAdd);
         Assert.NotEmpty(context.PendingComments);
-        Assert.Contains("InvalidFakeLicense123", context.PendingComments[0]);
+        Assert.Contains("InvalidFakeLicense123", context.PendingComments[0].Body);
     }
 
     [Fact]
@@ -617,7 +619,7 @@ public class SpdxComplianceModuleTests
         // Must report compliance license issue because zero-byte spec misses License tag
         Assert.Contains(GitHubLabels.ComplianceLicenseIssue, context.LabelsToAdd);
         Assert.NotEmpty(context.PendingComments);
-        Assert.Contains("Missing required `License:` field declaration", context.PendingComments[0]);
+        Assert.Contains("Missing required `License:` field declaration", context.PendingComments[0].Body);
     }
 
     [Fact]
@@ -724,7 +726,7 @@ public class SpdxComplianceModuleTests
         // P3 guardian: peak must be > 1 to prove concurrent execution
         Assert.True(peak > 1, $"Expected concurrent fetches, observed peak was {peak}");
 
-        var comment = context.PendingComments[0];
+        var comment = context.PendingComments[0].Body;
         // Ensure deterministic sorting: pkg01 appears before pkg02, pkg02 before pkg03, etc.
         var lastIndex = -1;
         for (var i = 1; i <= 20; i++)

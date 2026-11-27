@@ -139,6 +139,13 @@ public class PackageUpdateOptions
         Range = ">= 0",
         EmptyBehavior = "0 disables the compressed archive cap and streams any compressed archive size.")]
     public long MaxArchiveBytes { get; set; } = 100L * 1024 * 1024;
+
+    [ConfigField(
+        Description = "Module-specific documentation links appended to automated package update PR comments (stepped-aside notices and failed-PR TTL closures).",
+        Format = "JSON array of up to 5 objects { \"Title\": \"...\", \"TitleZh\": \"...\" (optional), \"Url\": \"https://...\" }",
+        EmptyBehavior = "no documentation links are appended to package update PR comments.",
+        Example = "[{ \"Title\": \"Auto-Update Guide\", \"TitleZh\": \"自动更新指南\", \"Url\": \"https://openruyi.org/docs/autoupdate\" }]")]
+    public List<DocumentationLink> DocumentationLinks { get; set; } = new();
 }
 
 public class LookoutUpdateOptions

@@ -497,7 +497,7 @@ public class StaleLifecycleService : BackgroundService
         // Protection: WIP titles are pre-filtered before lock acquisition and verified authoritatively under lock.
         // Note: Draft PRs cannot be detected here because GitHub Issues API omits 'draft' from embedded pull_request objects;
         // authoritative draft verification is performed via GetPullRequestAsync inside TryVerifyEligibilityAsync.
-        if (item.Title.StartsWith("WIP", StringComparison.OrdinalIgnoreCase))
+        if (WipTitleHelper.IsWip(item.Title))
             return true;
 
         return false;

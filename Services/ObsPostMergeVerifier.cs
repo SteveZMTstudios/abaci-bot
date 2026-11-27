@@ -831,6 +831,7 @@ public class ObsPostMergeVerifier
         var versionLine = !string.IsNullOrWhiteSpace(targetVersion)
             ? $"\n- **Package Version**: `{targetVersion}`"
             : string.Empty;
+        var blockedMarker = $"<!-- abaci-obs-blocked: {packageName} -->";
         var issueBody = $"""
             ## Post-Merge OBS Build Gate Blocked
             Package `{packageName}` failed post-merge Open Build Service verification after merging PR #{prNumber}.
@@ -840,8 +841,13 @@ public class ObsPostMergeVerifier
             - **Synchronized Commit**: `{mergeSha}`{versionLine}
             - **Resolution**: Automated updates for `{packageName}` are paused until OBS reports a fresh `Succeeded` build, `main` upgrades past this version, or a maintainer closes this tracking issue.
 
-            <!-- abaci-obs-blocked: {packageName} -->
+            {blockedMarker}
             """;
+        issueBody = DocumentationLinkFormatter.AppendFooterBeforeMarker(
+            issueBody,
+            blockedMarker,
+            _options.DocumentationLinks,
+            isChinese: false);
 
         try
         {

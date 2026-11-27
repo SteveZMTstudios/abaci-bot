@@ -39,6 +39,7 @@ public class BotStateOptionsValidator : IValidateOptions<BotStateOptions>
 
         ValidateLocaleMap(options.RepositoryForcedLocales, nameof(options.RepositoryForcedLocales), failures);
         ValidateLocaleMap(options.RepositoryDefaultLocales, nameof(options.RepositoryDefaultLocales), failures);
+        DocumentationLinkValidator.Validate(options.GeneralDocumentationLinks, nameof(options.GeneralDocumentationLinks), failures);
 
         return failures.Count > 0
             ? ValidateOptionsResult.Fail(failures)

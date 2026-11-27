@@ -42,4 +42,11 @@ public class SpdxComplianceOptions
         Range = ">= 1",
         EmptyBehavior = "higher values use more CPU; values < 1 restrict parallelism to 1.")]
     public int MaxDegreeOfParallelism { get; set; } = 8;
+
+    [ConfigField(
+        Description = "Module-specific documentation links appended to the consolidated PR review footer when SpdxCompliance triggers a license compliance notice.",
+        Format = "JSON array of up to 5 objects { \"Title\": \"...\", \"TitleZh\": \"...\" (optional), \"Url\": \"https://...\" }",
+        EmptyBehavior = "no SPDX-specific documentation links are appended.",
+        Example = "[{ \"Title\": \"SPDX License Policy\", \"TitleZh\": \"SPDX 许可证规范\", \"Url\": \"https://openruyi.org/docs/spdx\" }]")]
+    public List<DocumentationLink> DocumentationLinks { get; set; } = new();
 }

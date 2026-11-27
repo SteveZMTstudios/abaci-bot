@@ -3,6 +3,15 @@ using abaci_bot.Options;
 namespace abaci_bot.Services;
 
 /// <summary>
+/// Kind of standalone WIP-to-Draft TIP reminder comment rendered on pull requests.
+/// </summary>
+public enum WipTipKind
+{
+    Draft,
+    Ready
+}
+
+/// <summary>
 /// Service abstraction for formatting pull request governance reports, warnings, and gating advisories
 /// using GitHub Flavored Markdown (GFM) blockquote alerts without emojis or internal task codes.
 /// </summary>
@@ -25,6 +34,25 @@ public interface IGovernanceCommentFormatter
         FormatConsolidatedHeader(locale);
 
     /// <summary>
+    /// Formats the optional post-findings governance documentation footer combining
+    /// triggered module documentation links with optional general documentation links.
+    /// </summary>
+    string FormatConsolidatedFooter(
+        string? locale = null,
+        IReadOnlyList<DocumentationLink>? moduleDocumentationLinks = null,
+        bool includeGeneralDocs = true,
+        IReadOnlySet<string>? excludedUrls = null) => string.Empty;
+
+    /// <summary>
+    /// Formats a standalone WIP-to-Draft TIP notice comment without HTML buttons.
+    /// </summary>
+    string FormatWipTip(
+        WipTipKind kind,
+        string prUrl,
+        string? locale = null,
+        IReadOnlyList<DocumentationLink>? documentationLinks = null) => string.Empty;
+
+    /// <summary>
     /// Formats an SPDX license compliance check failure notice using GFM [!WARNING].
     /// </summary>
     string FormatSpdxLicenseIssue(IReadOnlyList<(string File, string Expression, string Details)> issues, string? locale = null);
@@ -43,7 +71,7 @@ public interface IGovernanceCommentFormatter
         int threshold,
         string targetBranch,
         string? locale = null,
-        IReadOnlyList<VerificationReferenceLink>? referenceLinks = null);
+        IReadOnlyList<DocumentationLink>? referenceLinks = null);
 
     /// <summary>
     /// Formats an ABI breaking change warning using GFM [!CAUTION].

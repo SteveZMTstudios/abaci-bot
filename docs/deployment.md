@@ -288,7 +288,7 @@ Deployments adapting `abaci-bot` to other RPM-based Linux distributions should r
 2. In the App settings, open **Advanced → Recent Deliveries** and use **Redeliver**.
    A correctly configured deployment returns 200. Note that `X-GitHub-Delivery` deduplication is held in process memory (`10`-minute TTL, `4,096` entries); duplicate redeliveries within that window are skipped immediately, whereas redeliveries after a process restart run once idempotently against live GitHub PR state.
 
-   Also note the **processing durability contract**: in-memory queue durability is `at-most-once` (`WebhookDispatcher` capacity `256`, `4` concurrent workers; `PullRequestPipeline` unsent consolidated comment carryover has a `1`-hour TTL, max `1,024` entries pinned to `HeadSha`), while active execution may retry up to `3` attempts. Unfinished queued webhooks or carried-over comments are discarded on process crash or forced restart; use GitHub **Redeliver** (or push a new PR update) to replay affected events idempotently.
+   Also note the **processing durability contract**: in-memory queue durability is `at-most-once` (`WebhookDispatcher` capacity `256`, `4` concurrent workers; `PullRequestPipeline` unsent consolidated comment carryover has a `3`-hour TTL, max `1,024` entries pinned to `HeadSha`), while active execution may retry up to `3` attempts. Unfinished queued webhooks or carried-over comments are discarded on process crash or forced restart; use GitHub **Redeliver** (or push a new PR update) to replay affected events idempotently.
 3. Check `http://<your-host>/health` and open a draft pull request to confirm the
    `Status: New` and workflow labels.
 

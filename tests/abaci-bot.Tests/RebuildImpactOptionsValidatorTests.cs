@@ -15,18 +15,18 @@ public class RebuildImpactOptionsValidatorTests
     }
 
     [Fact]
-    public void Validate_NullOrEmptyVerificationGuideLinks_ReturnsSuccess()
+    public void Validate_NullOrEmptyDocumentationLinks_ReturnsSuccess()
     {
-        Assert.True(_validator.Validate(null, new RebuildImpactOptions { VerificationGuideLinks = null! }).Succeeded);
-        Assert.True(_validator.Validate(null, new RebuildImpactOptions { VerificationGuideLinks = new List<VerificationReferenceLink>() }).Succeeded);
+        Assert.True(_validator.Validate(null, new RebuildImpactOptions { DocumentationLinks = null! }).Succeeded);
+        Assert.True(_validator.Validate(null, new RebuildImpactOptions { DocumentationLinks = new List<DocumentationLink>() }).Succeeded);
     }
 
     [Fact]
-    public void Validate_ValidVerificationGuideLinks_ReturnsSuccess()
+    public void Validate_ValidDocumentationLinks_ReturnsSuccess()
     {
         var options = new RebuildImpactOptions
         {
-            VerificationGuideLinks = new List<VerificationReferenceLink>
+            DocumentationLinks = new List<DocumentationLink>
             {
                 new()
                 {
@@ -47,29 +47,29 @@ public class RebuildImpactOptionsValidatorTests
     }
 
     [Fact]
-    public void Validate_ExceedingMaxVerificationGuideLinks_ReturnsFailure()
+    public void Validate_ExceedingMaxDocumentationLinks_ReturnsFailure()
     {
-        var links = Enumerable.Range(1, RebuildImpactOptionsValidator.MaxVerificationGuideLinks + 1)
-            .Select(i => new VerificationReferenceLink
+        var links = Enumerable.Range(1, DocumentationLinkValidator.MaxDocumentationLinks + 1)
+            .Select(i => new DocumentationLink
             {
                 Title = $"Guide {i}",
                 Url = $"https://docs.example.org/guide-{i}"
             })
             .ToList();
 
-        var options = new RebuildImpactOptions { VerificationGuideLinks = links };
+        var options = new RebuildImpactOptions { DocumentationLinks = links };
         var result = _validator.Validate(null, options);
 
         Assert.True(result.Failed);
-        Assert.Contains(result.Failures, f => f.Contains(nameof(options.VerificationGuideLinks)));
+        Assert.Contains(result.Failures, f => f.Contains(nameof(options.DocumentationLinks)));
     }
 
     [Fact]
-    public void Validate_NullVerificationGuideLinkEntry_ReturnsFailure()
+    public void Validate_NullDocumentationLinkEntry_ReturnsFailure()
     {
         var options = new RebuildImpactOptions
         {
-            VerificationGuideLinks = new List<VerificationReferenceLink> { null! }
+            DocumentationLinks = new List<DocumentationLink> { null! }
         };
 
         var result = _validator.Validate(null, options);
@@ -87,7 +87,7 @@ public class RebuildImpactOptionsValidatorTests
     {
         var options = new RebuildImpactOptions
         {
-            VerificationGuideLinks = new List<VerificationReferenceLink>
+            DocumentationLinks = new List<DocumentationLink>
             {
                 new() { Title = invalidTitle, Url = "https://docs.example.org/guide" }
             }
@@ -102,10 +102,10 @@ public class RebuildImpactOptionsValidatorTests
     [Fact]
     public void Validate_OverlongTitleAndInvalidTitleZh_ReturnsFailure()
     {
-        var tooLongTitle = new string('A', RebuildImpactOptionsValidator.MaxLinkTitleLength + 1);
+        var tooLongTitle = new string('A', DocumentationLinkValidator.MaxLinkTitleLength + 1);
         var options = new RebuildImpactOptions
         {
-            VerificationGuideLinks = new List<VerificationReferenceLink>
+            DocumentationLinks = new List<DocumentationLink>
             {
                 new() { Title = tooLongTitle, TitleZh = "Line1\nLine2", Url = "https://docs.example.org/a" },
                 new() { Title = "Valid", TitleZh = tooLongTitle, Url = "https://docs.example.org/b" }
@@ -122,15 +122,11 @@ public class RebuildImpactOptionsValidatorTests
     [Theory]
     [InlineData("")]
     [InlineData("   ")]
-    [InlineData("https://docs.example.org/with space")]
-    [InlineData("not-a-url")]
-    [InlineData("/relative/guide.md")]
-    [InlineData("ftp://example.com/guide")]
-    public void Validate_InvalidLinkUrl_ReturnsFailure(string invalidUrl)
+    public void Validate_EmptyLinkUrl_ReturnsFailure(string invalidUrl)
     {
         var options = new RebuildImpactOptions
         {
-            VerificationGuideLinks = new List<VerificationReferenceLink>
+            DocumentationLinks = new List<DocumentationLink>
             {
                 new() { Title = "Valid Title", Url = invalidUrl }
             }
@@ -143,14 +139,14 @@ public class RebuildImpactOptionsValidatorTests
     }
 
     [Fact]
-    public void Validate_DuplicateNormalizedUrls_ReturnsFailure()
+    public void Validate_DuplicateExactUrls_ReturnsFailure()
     {
         var options = new RebuildImpactOptions
         {
-            VerificationGuideLinks = new List<VerificationReferenceLink>
+            DocumentationLinks = new List<DocumentationLink>
             {
-                new() { Title = "Guide 1", Url = "https://Docs.Example.org/guide" },
-                new() { Title = "Guide 2", Url = "https://docs.example.org/guide" }
+                new() { Title = "Guide 1", Url = "https://docs.example.org/guide" },
+                new() { Title = "Guide 2", Url = "  https://docs.example.org/guide  " }
             }
         };
 

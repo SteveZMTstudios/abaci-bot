@@ -116,11 +116,30 @@ internal static class ConfigSchemaValidator
         }
 
         var expectedType = Nullable.GetUnderlyingType(field.ClrType) ?? field.ClrType;
-        if (!expectedType.IsInstanceOfType(field.PlaceholderValue))
+        if (!IsCompatiblePlaceholderValue(expectedType, field.PlaceholderValue))
         {
             failures.Add(
                 $"{field.Path}: PlaceholderValue type '{field.PlaceholderValue.GetType().Name}' is not assignable to '{expectedType.Name}'");
         }
+    }
+
+    private static bool IsCompatiblePlaceholderValue(Type expectedType, object value)
+    {
+        if (expectedType.IsInstanceOfType(value))
+        {
+            return true;
+        }
+
+        // Only strictly lossless CLR numeric widenings are accepted.
+        return value switch
+        {
+            int => expectedType == typeof(long)
+                   || expectedType == typeof(double)
+                   || expectedType == typeof(decimal),
+            long => expectedType == typeof(decimal),
+            float => expectedType == typeof(double),
+            _ => false,
+        };
     }
 
     private static void ValidateBoolean(ConfigFieldDescriptor field, List<string> failures)

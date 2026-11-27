@@ -53,4 +53,11 @@ public class ConversationGuardOptions
         Unit = "pull requests per repository per sweep",
         Range = "1..500")]
     public int MaxLocksPerSweep { get; set; } = 50;
+
+    [ConfigField(
+        Description = "Module-specific documentation links appended to persistent ConversationGuard announcements and replies (omitted on ephemeral replies and dry-run logs).",
+        Format = "JSON array of up to 5 objects { \"Title\": \"...\", \"TitleZh\": \"...\" (optional), \"Url\": \"https://...\" }",
+        EmptyBehavior = "no documentation links are appended to ConversationGuard comments.",
+        Example = "[{ \"Title\": \"Moderation Policy\", \"TitleZh\": \"协作管理规范\", \"Url\": \"https://openruyi.org/docs/moderation\" }]")]
+    public List<DocumentationLink> DocumentationLinks { get; set; } = new();
 }

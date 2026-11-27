@@ -19,8 +19,10 @@ public static class HealthResponseBuilder
         AbiComplianceOptions abiCompliance,
         RebuildImpactOptions rebuildImpact,
         SpdxComplianceOptions spdxCompliance,
-        CveSecurityOptions cveSecurity)
+        CveSecurityOptions cveSecurity,
+        WipDraftOptions? wipDraft = null)
     {
+        var effectiveWipDraft = wipDraft ?? new WipDraftOptions();
         var now = runtimeHealth.GetUtcNow();
         if (!verbose)
         {
@@ -64,7 +66,8 @@ public static class HealthResponseBuilder
                 abiCompliance = new { enabled = abiCompliance.Enabled, allowManagedFallback = abiCompliance.AllowManagedFallback },
                 rebuildImpact = new { enabled = rebuildImpact.Enabled },
                 spdxCompliance = new { enabled = spdxCompliance.Enabled },
-                vulnerability = new { enabled = cveSecurity.Enabled }
+                vulnerability = new { enabled = cveSecurity.Enabled },
+                wipDraft = new { enabled = effectiveWipDraft.Enabled, dryRun = effectiveWipDraft.DryRun }
             },
             runtime = new
             {

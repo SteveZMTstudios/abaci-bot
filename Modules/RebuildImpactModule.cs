@@ -200,7 +200,10 @@ public partial class RebuildImpactModule : IPullRequestModule
                 if (!suppressDuplicateManualGuide &&
                     !string.IsNullOrWhiteSpace(outcome.AdvisoryComment))
                 {
-                    context.PendingComments.Add(outcome.AdvisoryComment);
+                    context.AddPendingComment(
+                        outcome.AdvisoryComment,
+                        includeGeneralDocs: true,
+                        documentationLinks: _options.DocumentationLinks);
                 }
 
                 _logger?.LogWarning(
@@ -213,7 +216,7 @@ public partial class RebuildImpactModule : IPullRequestModule
 
                 if (!string.IsNullOrWhiteSpace(outcome.AdvisoryComment))
                 {
-                    context.PendingComments.Add(outcome.AdvisoryComment);
+                    context.AddPendingComment(outcome.AdvisoryComment, includeGeneralDocs: false);
                 }
 
                 _logger?.LogInformation(

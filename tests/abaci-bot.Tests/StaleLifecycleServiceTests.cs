@@ -495,21 +495,32 @@ public class StaleLifecycleServiceTests
             MinRateLimitRemaining = 100
         });
 
+        var sweepExecuted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _gitHub.GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>())
+            .Returns(_ => new GitHubRateLimitSnapshot(5000, DateTimeOffset.UtcNow.AddHours(1), 30, DateTimeOffset.UtcNow.AddMinutes(1)));
+
         _gitHub.SearchStaleCandidatesAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
-            .Returns(new List<Issue>());
+            .Returns(_ =>
+            {
+                sweepExecuted.TrySetResult();
+                return new List<Issue>();
+            });
 
         var service = new TestableStaleLifecycleService(_gitHub, options, _config, _lockManager, NullLogger<StaleLifecycleService>.Instance)
         {
             StartupDelay = TimeSpan.FromMilliseconds(5)
         };
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(60));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         await service.StartAsync(cts.Token);
 
-        // Wait brief moment for the initial sweep to execute
-        await Task.Delay(30);
+        await sweepExecuted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await cts.CancelAsync();
+        await service.StopAsync(CancellationToken.None);
 
         await _gitHub.Received().GetRateLimitSnapshotAsync(Arg.Any<CancellationToken>());
+        await _gitHub.Received().SearchStaleCandidatesAsync(
+            "openRuyi-Project", "openRuyi", Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -526,16 +537,38 @@ public class StaleLifecycleServiceTests
         _gitHub.SearchStaleCandidatesAsync(Arg.Any<string>(), Arg.Any<string>(), Arg.Any<DateTimeOffset>(), Arg.Any<bool>(), Arg.Any<string?>(), Arg.Any<CancellationToken>())
             .Returns<IReadOnlyList<Issue>>(_ => throw new InvalidOperationException("Simulated unexpected sweep failure"));
 
+        var errorLogged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Exception? loggedException = null;
         var logger = Substitute.For<ILogger<StaleLifecycleService>>();
+        logger.WhenForAnyArgs(l => l.Log(
+                LogLevel.Error,
+                default,
+                default!,
+                default,
+                default!))
+            .Do(ci =>
+            {
+                if (ci.ArgAt<LogLevel>(0) == LogLevel.Error)
+                {
+                    loggedException = ci.ArgAt<Exception?>(3);
+                    errorLogged.TrySetResult();
+                }
+            });
+
         var service = new TestableStaleLifecycleService(_gitHub, options, _config, _lockManager, logger)
         {
             StartupDelay = TimeSpan.FromMilliseconds(5)
         };
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(60));
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         await service.StartAsync(cts.Token);
 
-        await Task.Delay(30);
+        await errorLogged.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await cts.CancelAsync();
+        await service.StopAsync(CancellationToken.None);
+
+        Assert.IsType<InvalidOperationException>(loggedException);
+        Assert.Equal("Simulated unexpected sweep failure", loggedException!.Message);
 
         // Verify the exception was logged as error
         logger.ReceivedWithAnyArgs().Log(

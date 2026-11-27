@@ -39,7 +39,7 @@ flowchart TD
 ## 3. Managed Labels and Mutex Group
 
 ### Workflow Lifecycle (Single-Choice Mutex)
-- `Workflow: In Dev`
+- `Workflow: In Dev`: Applied while PR is draft or carries a leading/bracketed `WIP` title marker (`WIP:`, `WIP-`, `WIP：`, `[WIP]`, `(WIP)` via `WipTitleHelper.IsWip`, excluding mid-title prose like `feat: add wip flag` and substrings like `SWIPE`).
 - `Workflow: Ready For Review`
 - `Workflow: In Review`
 - `Workflow: Blocked`

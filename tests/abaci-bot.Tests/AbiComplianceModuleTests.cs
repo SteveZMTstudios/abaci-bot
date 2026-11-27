@@ -79,8 +79,10 @@ public class AbiComplianceModuleTests
         Assert.Contains(GitHubLabels.ImpactAbi, context.LabelsToAdd);
         Assert.Contains(GitHubLabels.ImpactBreakingChange, context.LabelsToAdd);
         Assert.NotEmpty(context.PendingComments);
-        Assert.Contains("ABI Breaking Change Detected", context.PendingComments[0]);
-        Assert.Contains("SONAME changed", context.PendingComments[0]);
+        Assert.True(context.PendingComments[0].IncludeGeneralDocs);
+        Assert.Equal(options.Value.DocumentationLinks, context.PendingComments[0].DocumentationLinks);
+        Assert.Contains("ABI Breaking Change Detected", context.PendingComments[0].Body);
+        Assert.Contains("SONAME changed", context.PendingComments[0].Body);
     }
 
     [Fact]
@@ -106,8 +108,10 @@ public class AbiComplianceModuleTests
         Assert.DoesNotContain(GitHubLabels.ImpactAbi, context.LabelsToAdd);
         Assert.DoesNotContain(GitHubLabels.ImpactBreakingChange, context.LabelsToAdd);
         Assert.NotEmpty(context.PendingComments);
-        Assert.Contains("ABI Comparison Not Completed", context.PendingComments[0]);
-        Assert.Contains("abidiff binary not available", context.PendingComments[0]);
+        Assert.False(context.PendingComments[0].IncludeGeneralDocs);
+        Assert.Equal(options.Value.DocumentationLinks, context.PendingComments[0].DocumentationLinks);
+        Assert.Contains("ABI Comparison Not Completed", context.PendingComments[0].Body);
+        Assert.Contains("abidiff binary not available", context.PendingComments[0].Body);
     }
 
     [Fact]
@@ -133,8 +137,8 @@ public class AbiComplianceModuleTests
         Assert.DoesNotContain(GitHubLabels.ImpactAbi, context.LabelsToAdd);
 
         Assert.Equal(2, context.PendingComments.Count);
-        Assert.Contains(context.PendingComments, c => c.Contains("ABI Comparison Not Completed") && c.Contains("Baseline package missing"));
-        Assert.Contains(context.PendingComments, c => c.Contains("ABI Breaking Change Detected") && c.Contains("SONAME changed"));
+        Assert.Contains(context.PendingComments, c => c.Body.Contains("ABI Comparison Not Completed") && c.Body.Contains("Baseline package missing"));
+        Assert.Contains(context.PendingComments, c => c.Body.Contains("ABI Breaking Change Detected") && c.Body.Contains("SONAME changed"));
     }
 
     [Fact]
@@ -182,7 +186,7 @@ public class AbiComplianceModuleTests
         Assert.Contains(GitHubLabels.ImpactAbi, context.LabelsToAdd);
 
         Assert.Single(context.PendingComments);
-        Assert.Contains("ABI Breaking Change Detected", context.PendingComments[0]);
+        Assert.Contains("ABI Breaking Change Detected", context.PendingComments[0].Body);
     }
 
     [Fact]

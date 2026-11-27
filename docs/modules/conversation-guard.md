@@ -84,6 +84,7 @@ Configured under the `ConversationGuard` JSON section:
 | `SweepIntervalHours` | `int` | `12` | `1..72` | Execution interval in hours for the background inactive PR lock sweep service. |
 | `AuthorLockConfirmTimeoutMinutes` | `int` | `15` | `1..60` | Time window in minutes for the PR author to reply with `@<bot> lock confirm` (or `@<bot> archive confirm`) before the confirmation request expires. |
 | `MaxLocksPerSweep` | `int` | `50` | `1..500` | Maximum inactive closed pull requests locked per repository per sweep; remaining PRs defer to subsequent sweeps (500 is the search transport cap). |
+| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 `DocumentationLink` objects | Optional `http`/`https` links appended to persistent ConversationGuard announcements and non-ephemeral replies. |
 
 ---
 

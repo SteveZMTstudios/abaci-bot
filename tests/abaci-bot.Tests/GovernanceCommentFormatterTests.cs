@@ -56,12 +56,12 @@ public class GovernanceCommentFormatterTests
     }
 
     [Fact]
-    public void FormatConsolidatedHeader_UsesDynamicBotDisplayName_AndConfiguredVerificationGuideLinks()
+    public void FormatConsolidatedHeader_UsesDynamicBotDisplayName_AndOmitsReferenceLinks()
     {
         var formatterWithLinks = new GovernanceCommentFormatter(
-            Microsoft.Extensions.Options.Options.Create(new RebuildImpactOptions
+            Microsoft.Extensions.Options.Options.Create(new BotStateOptions
             {
-                VerificationGuideLinks = new List<VerificationReferenceLink>
+                GeneralDocumentationLinks = new List<DocumentationLink>
                 {
                     new()
                     {
@@ -81,33 +81,44 @@ public class GovernanceCommentFormatterTests
         var enLines = enHeader.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
         Assert.Equal("Thank you for your contribution! We have identified a few points that require your attention:", enLines[0]);
         Assert.Contains("## abaci-bot-test Review Notes", enHeader, StringComparison.Ordinal);
-        Assert.Contains("[Governance Docs](https://docs.openruyi.org/governance)", enHeader, StringComparison.Ordinal);
-        Assert.DoesNotContain("Duplicate Ignored", enHeader, StringComparison.Ordinal);
+        Assert.DoesNotContain("https://docs.openruyi.org/governance", enHeader, StringComparison.Ordinal);
 
         var zhHeader = formatterWithLinks.FormatConsolidatedHeader("zh-CN", "openruyi-bot");
         Assert.StartsWith("感谢您的贡献！我们发现以下几个需要您关注的事项：", zhHeader, StringComparison.Ordinal);
         Assert.Contains("## openruyi-bot 审查说明", zhHeader, StringComparison.Ordinal);
-        Assert.Contains("[治理文档](https://docs.openruyi.org/governance)", zhHeader, StringComparison.Ordinal);
+        Assert.DoesNotContain("https://docs.openruyi.org/governance", zhHeader, StringComparison.Ordinal);
 
         var fallbackHeader = formatterWithLinks.FormatConsolidatedHeader("en", "   ");
         Assert.Contains("## abaci-bot Review Notes", fallbackHeader, StringComparison.Ordinal);
+
+        var enFooter = formatterWithLinks.FormatConsolidatedFooter("en");
+        Assert.StartsWith("For more details, see:", enFooter, StringComparison.Ordinal);
+        Assert.Contains("[Governance Docs](https://docs.openruyi.org/governance)", enFooter, StringComparison.Ordinal);
+        Assert.DoesNotContain("Duplicate Ignored", enFooter, StringComparison.Ordinal);
+
+        var zhFooter = formatterWithLinks.FormatConsolidatedFooter("zh-CN");
+        Assert.StartsWith("更多参考文档：", zhFooter, StringComparison.Ordinal);
+        Assert.Contains("[治理文档](https://docs.openruyi.org/governance)", zhFooter, StringComparison.Ordinal);
+
+        Assert.Equal(string.Empty, _formatter.FormatConsolidatedFooter("en"));
+        Assert.Equal(string.Empty, _formatter.FormatConsolidatedFooter("zh-CN"));
     }
 
     [Fact]
-    public void ConsolidatedMessage_MultiSectionAndAbiOnly_IncludesSingleOpenerAndConfiguredLinkOnce()
+    public void ConsolidatedMessage_MultiSectionAndAbiOnly_PlacesReferenceFooterAfterFindings()
     {
         const string enOpener = "Thank you for your contribution! We have identified a few points that require your attention:";
         const string zhOpener = "感谢您的贡献！我们发现以下几个需要您关注的事项：";
         const string configuredUrl = "https://docs.openruyi.org/ci-guide";
-        var configuredLinks = new List<VerificationReferenceLink>
+        var configuredLinks = new List<DocumentationLink>
         {
             new() { Title = "CI Reference", TitleZh = "CI 文档", Url = configuredUrl }
         };
 
         var configuredFormatter = new GovernanceCommentFormatter(
-            Microsoft.Extensions.Options.Options.Create(new RebuildImpactOptions
+            Microsoft.Extensions.Options.Options.Create(new BotStateOptions
             {
-                VerificationGuideLinks = configuredLinks
+                GeneralDocumentationLinks = configuredLinks
             }));
 
         var spdxEn = configuredFormatter.FormatSpdxLicenseIssue(
@@ -118,7 +129,7 @@ public class GovernanceCommentFormatterTests
                 ("CVE-2025-0001", 7.5, "High", "OSV")
             });
         var rebuildEn = configuredFormatter.FormatRebuildGateBlocked(
-            new[] { "pkg" }, 1200, 1001, "Rolling", "en", configuredLinks);
+            new[] { "pkg" }, 1200, 1001, "Rolling", "en", referenceLinks: null);
         var abiFailedEn = configuredFormatter.FormatAbiCheckFailed("Missing baseline");
         var abiBreakingEn = configuredFormatter.FormatAbiBreakingChange("1 removed symbol");
 
@@ -128,7 +139,8 @@ public class GovernanceCommentFormatterTests
             spdxEn,
             cveEn,
             rebuildEn,
-            abiBreakingEn);
+            abiBreakingEn,
+            configuredFormatter.FormatConsolidatedFooter("en", moduleDocumentationLinks: configuredLinks, includeGeneralDocs: true));
 
         Assert.StartsWith(enOpener, multiEn, StringComparison.Ordinal);
         Assert.Equal(1, multiEn.Split(enOpener, StringSplitOptions.None).Length - 1);
@@ -143,7 +155,7 @@ public class GovernanceCommentFormatterTests
             abiFailedEn);
         Assert.StartsWith(enOpener, abiOnlyEn, StringComparison.Ordinal);
         Assert.Equal(1, abiOnlyEn.Split(enOpener, StringSplitOptions.None).Length - 1);
-        Assert.Contains($"[CI Reference]({configuredUrl})", abiOnlyEn, StringComparison.Ordinal);
+        Assert.DoesNotContain(configuredUrl, abiOnlyEn, StringComparison.Ordinal);
         AssertNoEmojis(abiOnlyEn);
 
         var spdxZh = configuredFormatter.FormatSpdxLicenseIssue(
@@ -155,7 +167,7 @@ public class GovernanceCommentFormatterTests
             },
             "zh-CN");
         var rebuildZh = configuredFormatter.FormatRebuildGateBlocked(
-            new[] { "pkg" }, 1200, 1001, "Rolling", "zh-CN", configuredLinks);
+            new[] { "pkg" }, 1200, 1001, "Rolling", "zh-CN", referenceLinks: null);
         var abiFailedZh = configuredFormatter.FormatAbiCheckFailed("缺少基线包", "zh-CN");
 
         var multiZh = string.Join(
@@ -164,13 +176,50 @@ public class GovernanceCommentFormatterTests
             spdxZh,
             cveZh,
             rebuildZh,
-            abiFailedZh);
+            abiFailedZh,
+            configuredFormatter.FormatConsolidatedFooter("zh-CN", moduleDocumentationLinks: configuredLinks, includeGeneralDocs: true));
 
         Assert.StartsWith(zhOpener, multiZh, StringComparison.Ordinal);
         Assert.Equal(1, multiZh.Split(zhOpener, StringSplitOptions.None).Length - 1);
         Assert.Equal(1, multiZh.Split("感谢您的贡献！", StringSplitOptions.None).Length - 1);
         Assert.Equal(1, multiZh.Split(configuredUrl, StringSplitOptions.None).Length - 1);
         AssertNoEmojis(multiZh);
+    }
+
+    [Fact]
+    public void FormatWipTip_DraftAndReady_RenderPureMarkdownTipsWithoutHtmlButtons()
+    {
+        const string prUrl = "https://github.com/openRuyi-Project/openRuyi/pull/42";
+
+        var draftEn = _formatter.FormatWipTip(WipTipKind.Draft, prUrl, "en");
+        Assert.StartsWith("> [!TIP]", draftEn, StringComparison.Ordinal);
+        Assert.Contains("**Convert to draft**", draftEn, StringComparison.Ordinal);
+        Assert.Contains($"[Open the pull request]({prUrl})", draftEn, StringComparison.Ordinal);
+        Assert.EndsWith(GovernanceCommentFormatter.WipDraftTipMarker, draftEn, StringComparison.Ordinal);
+        Assert.DoesNotContain("<button", draftEn, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("data-url", draftEn, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("class=", draftEn, StringComparison.OrdinalIgnoreCase);
+        AssertNoEmojis(draftEn);
+
+        var readyEn = _formatter.FormatWipTip(WipTipKind.Ready, prUrl, "en");
+        Assert.StartsWith("> [!TIP]", readyEn, StringComparison.Ordinal);
+        Assert.Contains("**Ready for review**", readyEn, StringComparison.Ordinal);
+        Assert.Contains($"[Open the pull request]({prUrl})", readyEn, StringComparison.Ordinal);
+        Assert.EndsWith(GovernanceCommentFormatter.WipReadyTipMarker, readyEn, StringComparison.Ordinal);
+        Assert.DoesNotContain("<button", readyEn, StringComparison.OrdinalIgnoreCase);
+        AssertNoEmojis(readyEn);
+
+        var draftZh = _formatter.FormatWipTip(WipTipKind.Draft, prUrl, "zh-CN");
+        Assert.Contains("Convert to draft", draftZh, StringComparison.Ordinal);
+        Assert.Contains($"[打开拉取请求]({prUrl})", draftZh, StringComparison.Ordinal);
+        Assert.EndsWith(GovernanceCommentFormatter.WipDraftTipMarker, draftZh, StringComparison.Ordinal);
+        AssertNoEmojis(draftZh);
+
+        var readyZh = _formatter.FormatWipTip(WipTipKind.Ready, prUrl, "zh-CN");
+        Assert.Contains("Ready for review", readyZh, StringComparison.Ordinal);
+        Assert.Contains($"[打开拉取请求]({prUrl})", readyZh, StringComparison.Ordinal);
+        Assert.EndsWith(GovernanceCommentFormatter.WipReadyTipMarker, readyZh, StringComparison.Ordinal);
+        AssertNoEmojis(readyZh);
     }
 
     [Fact]
@@ -252,10 +301,10 @@ public class GovernanceCommentFormatterTests
     public void FormatRebuildGateBlocked_WithReferenceLinks_RendersBilingualSeeAlsoAndEscapesAndDedups()
     {
         var packages = new[] { "glibc" };
-        var links = new List<VerificationReferenceLink>
+        var links = new List<DocumentationLink>
         {
             null!,
-            new() { Title = "Ignored Bad Url", Url = "ftp://invalid.example.com" },
+            new() { Title = "Ignored Empty Url", Url = "   " },
             new() { Title = "   ", Url = "https://ignored-empty-title.example.org" },
             new()
             {
@@ -266,7 +315,7 @@ public class GovernanceCommentFormatterTests
             new()
             {
                 Title = "Duplicate Ignored",
-                Url = "https://docs.example.org/obs-guide"
+                Url = "https://Docs.Example.org/obs-guide"
             },
             new()
             {
@@ -278,13 +327,13 @@ public class GovernanceCommentFormatterTests
 
         var enOutput = _formatter.FormatRebuildGateBlocked(packages, 1200, 1001, "Rolling", "en", links);
         Assert.Contains("> **See also**:", enOutput);
-        Assert.Contains("> - [OBS \\[Reverse-Dep\\]\\\\Guide With Newline](https://docs.example.org/obs-guide)", enOutput);
+        Assert.Contains("> - [OBS \\[Reverse-Dep\\]\\\\Guide With Newline](https://Docs.Example.org/obs-guide)", enOutput);
         Assert.Contains("> - [Fallback Distro Policy](https://example.org/policy)", enOutput);
         Assert.DoesNotContain("Duplicate Ignored", enOutput);
-        Assert.DoesNotContain("Ignored Bad Url", enOutput);
+        Assert.DoesNotContain("Ignored Empty Url", enOutput);
         Assert.DoesNotContain("ignored-empty-title", enOutput);
 
-        var zhWithoutLinks = _formatter.FormatRebuildGateBlocked(packages, 1200, 1001, "Rolling", "zh-CN", Array.Empty<VerificationReferenceLink>());
+        var zhWithoutLinks = _formatter.FormatRebuildGateBlocked(packages, 1200, 1001, "Rolling", "zh-CN", Array.Empty<DocumentationLink>());
         Assert.Contains("Rebuild 影响范围暂缓合并", zhWithoutLinks);
         Assert.Contains("外部贡献者无需进行额外环境配置", zhWithoutLinks);
         Assert.DoesNotContain("OBS", zhWithoutLinks, StringComparison.OrdinalIgnoreCase);
@@ -294,7 +343,7 @@ public class GovernanceCommentFormatterTests
 
         var zhWithLinks = _formatter.FormatRebuildGateBlocked(packages, 1200, 1001, "Rolling", "zh-CN", links);
         Assert.Contains("> **另请参阅**：", zhWithLinks);
-        Assert.Contains("> - [OBS 反向依赖\\\\\\[指南\\]](https://docs.example.org/obs-guide)", zhWithLinks);
+        Assert.Contains("> - [OBS 反向依赖\\\\\\[指南\\]](https://Docs.Example.org/obs-guide)", zhWithLinks);
         Assert.Contains("> - [Fallback Distro Policy](https://example.org/policy)", zhWithLinks);
         AssertNoEmojis(zhWithLinks);
         AssertNoInternalTaskCodes(zhWithLinks);

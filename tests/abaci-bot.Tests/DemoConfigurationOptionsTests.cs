@@ -145,11 +145,11 @@ public class DemoConfigurationOptionsTests
 
         // Verify key validator bounds stay reflected in [ConfigField] metadata using whole-token matching
         var rebuildSection = Assert.Single(sections, s => s.SectionName == "RebuildImpact");
-        var guideLinksField = Assert.Single(rebuildSection.Fields, f => f.Name == nameof(RebuildImpactOptions.VerificationGuideLinks));
-        AssertMatchesWord(RebuildImpactOptionsValidator.MaxVerificationGuideLinks, guideLinksField.Format);
+        var guideLinksField = Assert.Single(rebuildSection.Fields, f => f.Name == nameof(RebuildImpactOptions.DocumentationLinks));
+        AssertMatchesWord(DocumentationLinkValidator.MaxDocumentationLinks, guideLinksField.Format);
 
-        var titleItemField = Assert.Single(guideLinksField.ItemFields, f => f.Name == nameof(VerificationReferenceLink.Title));
-        AssertMatchesWord(RebuildImpactOptionsValidator.MaxLinkTitleLength, titleItemField.Format);
+        var titleItemField = Assert.Single(guideLinksField.ItemFields, f => f.Name == nameof(DocumentationLink.Title));
+        AssertMatchesWord(DocumentationLinkValidator.MaxLinkTitleLength, titleItemField.Format);
 
         // Verify property-level XML <summary> prose is not duplicated alongside [ConfigField]
         var optionsDir = Path.Combine(repoRoot, "Options");
@@ -207,10 +207,10 @@ public class DemoConfigurationOptionsTests
             File.Move(tempPath, DemoConfigPath, overwrite: true);
         }
 
-        // Scope VerificationGuideLinks item-field assertions to its contiguous comment block so adding
+        // Scope DocumentationLinks item-field assertions to its contiguous comment block so adding
         // additional ObjectArray settings never deadlocks UPDATE_DEMO_CONFIG=1 regeneration.
         var generatedLines = generated.Split('\n');
-        var guideLinksComments = ExtractPrecedingComments(generatedLines, "\"VerificationGuideLinks\":");
+        var guideLinksComments = ExtractPrecedingComments(generatedLines, "\"GeneralDocumentationLinks\":");
         Assert.Contains(
             guideLinksComments,
             l => l.Contains("Item field Title:", StringComparison.Ordinal)
@@ -316,8 +316,8 @@ public class DemoConfigurationOptionsTests
                         Name: "Links",
                         Path: "Sample:Links",
                         Kind: ConfigFieldKind.ObjectArray,
-                        ClrType: typeof(List<VerificationReferenceLink>),
-                        DefaultValue: new List<VerificationReferenceLink>
+                        ClrType: typeof(List<DocumentationLink>),
+                        DefaultValue: new List<DocumentationLink>
                         {
                             new() { Title = "Docs", Url = "https://example.org/docs" },
                         },
@@ -575,6 +575,144 @@ public class DemoConfigurationOptionsTests
         Assert.Contains(failures, f => f.Contains("Invalid:OptionalWithPlaceholder", StringComparison.Ordinal) && f.Contains("Required", StringComparison.Ordinal));
         Assert.Contains(failures, f => f.Contains("Invalid:WhitespacePlaceholder", StringComparison.Ordinal) && f.Contains("empty or whitespace", StringComparison.Ordinal));
         Assert.Contains(failures, f => f.Contains("Invalid:LeakedSecret", StringComparison.Ordinal) && f.Contains("Secret field", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Generate_NonRequiredOrWhitespacePlaceholder_FallsBackToDefaultValueWithoutPlaceholderComment()
+    {
+        var syntheticSections = new List<ConfigSectionDescriptor>
+        {
+            new(
+                SectionName: "EdgePlaceholders",
+                Title: "Placeholder guard edge cases",
+                DefaultsSource: "unit-test",
+                ValidatorSource: null,
+                Fields:
+                [
+                    new ConfigFieldDescriptor(
+                        Name: "OptionalSetting",
+                        Path: "EdgePlaceholders:OptionalSetting",
+                        Kind: ConfigFieldKind.String,
+                        ClrType: typeof(string),
+                        DefaultValue: "en",
+                        PlaceholderValue: "zh",
+                        Description: "Optional setting.",
+                        Format: "locale code",
+                        Unit: null,
+                        Range: null,
+                        AllowedValues: null,
+                        TrueBehavior: null,
+                        FalseBehavior: null,
+                        EmptyBehavior: "uses default.",
+                        Example: null,
+                        Required: false,
+                        RequiredWhen: null,
+                        Secret: false,
+                        Multiline: false,
+                        MapKeyFormat: null,
+                        MapValueFormat: null,
+                        NestedFields: [],
+                        ItemFields: []),
+                    new ConfigFieldDescriptor(
+                        Name: "BlankRequired",
+                        Path: "EdgePlaceholders:BlankRequired",
+                        Kind: ConfigFieldKind.String,
+                        ClrType: typeof(string),
+                        DefaultValue: "fallback",
+                        PlaceholderValue: "   ",
+                        Description: "Required setting with blank placeholder.",
+                        Format: "token",
+                        Unit: null,
+                        Range: null,
+                        AllowedValues: null,
+                        TrueBehavior: null,
+                        FalseBehavior: null,
+                        EmptyBehavior: "aborts.",
+                        Example: null,
+                        Required: true,
+                        RequiredWhen: null,
+                        Secret: false,
+                        Multiline: false,
+                        MapKeyFormat: null,
+                        MapValueFormat: null,
+                        NestedFields: [],
+                        ItemFields: []),
+                ]),
+        };
+
+        var output = ConfigDemoGenerator.Generate(syntheticSections);
+
+        Assert.Contains("\"OptionalSetting\": \"en\"", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"OptionalSetting\": \"zh\"", output, StringComparison.Ordinal);
+        Assert.Contains("\"BlankRequired\": \"fallback\"", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("placeholder shown below", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ConfigSchemaValidator_EnforcesStrictlyLosslessNumericWideningOnly()
+    {
+        static ConfigFieldDescriptor MakeNumericField(string path, Type clrType, object placeholder) => new(
+            Name: path.Split(':')[^1],
+            Path: path,
+            Kind: clrType == typeof(long) ? ConfigFieldKind.Integer : ConfigFieldKind.Number,
+            ClrType: clrType,
+            DefaultValue: null,
+            PlaceholderValue: placeholder,
+            Description: "Numeric test field.",
+            Format: null,
+            Unit: "units",
+            Range: "> 0",
+            AllowedValues: null,
+            TrueBehavior: null,
+            FalseBehavior: null,
+            EmptyBehavior: "aborts.",
+            Example: null,
+            Required: true,
+            RequiredWhen: null,
+            Secret: false,
+            Multiline: false,
+            MapKeyFormat: null,
+            MapValueFormat: null,
+            NestedFields: [],
+            ItemFields: []);
+
+        var validSections = new List<ConfigSectionDescriptor>
+        {
+            new(
+                SectionName: "LosslessNumeric",
+                Title: "Lossless numeric widenings",
+                DefaultsSource: "unit-test",
+                ValidatorSource: null,
+                Fields:
+                [
+                    MakeNumericField("LosslessNumeric:IntToDouble", typeof(double), 1),
+                    MakeNumericField("LosslessNumeric:IntToLong", typeof(long), 42),
+                    MakeNumericField("LosslessNumeric:FloatToDouble", typeof(double), 1.5f),
+                ]),
+        };
+
+        Assert.Empty(ConfigSchemaValidator.Validate(validSections));
+
+        var invalidSections = new List<ConfigSectionDescriptor>
+        {
+            new(
+                SectionName: "InvalidNumeric",
+                Title: "Lossy or narrowing conversions rejected",
+                DefaultsSource: "unit-test",
+                ValidatorSource: null,
+                Fields:
+                [
+                    MakeNumericField("InvalidNumeric:IntToFloat", typeof(float), 1),
+                    MakeNumericField("InvalidNumeric:LongToDouble", typeof(double), 1L),
+                    MakeNumericField("InvalidNumeric:DoubleToInt", typeof(int), 1.5d),
+                ]),
+        };
+
+        var failures = ConfigSchemaValidator.Validate(invalidSections);
+        Assert.Equal(3, failures.Count);
+        Assert.Contains(failures, f => f.Contains("InvalidNumeric:IntToFloat", StringComparison.Ordinal));
+        Assert.Contains(failures, f => f.Contains("InvalidNumeric:LongToDouble", StringComparison.Ordinal));
+        Assert.Contains(failures, f => f.Contains("InvalidNumeric:DoubleToInt", StringComparison.Ordinal));
     }
 
     private static List<Type> DiscoverRootOptionsTypes()

@@ -49,4 +49,11 @@ public class CveSecurityOptions
         Unit = "seconds",
         Range = "> 0")]
     public double RequestTimeoutSeconds { get; set; } = 15;
+
+    [ConfigField(
+        Description = "Module-specific documentation links appended to the consolidated PR review footer when VulnerabilityModule posts a CVE security breakdown notice.",
+        Format = "JSON array of up to 5 objects { \"Title\": \"...\", \"TitleZh\": \"...\" (optional), \"Url\": \"https://...\" }",
+        EmptyBehavior = "no CVE-specific documentation links are appended.",
+        Example = "[{ \"Title\": \"CVE Advisory Process\", \"TitleZh\": \"CVE 漏洞处理流程\", \"Url\": \"https://openruyi.org/docs/cve\" }]")]
+    public List<DocumentationLink> DocumentationLinks { get; set; } = new();
 }

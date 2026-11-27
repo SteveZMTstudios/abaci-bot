@@ -60,4 +60,11 @@ public class BotStateOptions
         Description = "Cleanup action executed when an ephemeral bot reply exceeds EphemeralReplyDeleteMinutes.",
         AllowedValues = "\"Delete\" (deletes via REST API) or \"Minimize\" (folds as OUTDATED via GraphQL API)")]
     public EphemeralReplyAction EphemeralReplyAction { get; set; } = EphemeralReplyAction.Delete;
+
+    [ConfigField(
+        Description = "General documentation links rendered once in consolidated PR governance review comment footers when at least one triggered review finding requests general contribution guidance.",
+        Format = "JSON array of up to 5 objects { \"Title\": \"...\", \"TitleZh\": \"...\" (optional), \"Url\": \"https://...\" }",
+        EmptyBehavior = "no general contribution links are appended to consolidated review comment footers.",
+        Example = "[{ \"Title\": \"Contribution Guide\", \"TitleZh\": \"贡献指南\", \"Url\": \"https://openruyi.org/docs/contributing\" }]")]
+    public List<DocumentationLink> GeneralDocumentationLinks { get; set; } = new();
 }

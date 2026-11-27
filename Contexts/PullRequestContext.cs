@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
+using abaci_bot.Options;
 using abaci_bot.Services;
 using Octokit;
 using Octokit.Webhooks;
@@ -47,6 +48,20 @@ public readonly record struct RefreshResult(RefreshOutcome Outcome, Exception? E
 {
     public bool IsRefreshed => Outcome == RefreshOutcome.Refreshed;
 }
+
+/// <summary>
+/// Represents a governance module finding section queued for consolidated pull request comment output.
+/// </summary>
+public sealed record PendingCommentSection(
+    string Body,
+    bool IncludeGeneralDocs = false,
+    IReadOnlyList<DocumentationLink>? DocumentationLinks = null);
+
+/// <summary>
+/// Represents an idempotent single-marker notice comment lifecycle action queued by a module
+/// and flushed by <see cref="Pipelines.PullRequestPipeline"/> after label synchronization.
+/// </summary>
+public sealed record NoticeIntent(string Marker, string? Body, long? ExistingCommentId = null, bool Delete = false);
 
 /// <summary>
 /// Encapsulates the runtime context and lazy-loaded dependencies for evaluating pull request governance rules.
@@ -304,9 +319,28 @@ public class PullRequestContext
     }
 
     /// <summary>
-    /// Pending comments to be posted to the pull request.
+    /// Pending comment sections to be consolidated and posted to the pull request.
     /// </summary>
-    public List<string> PendingComments { get; } = new();
+    public List<PendingCommentSection> PendingComments { get; } = new();
+
+    /// <summary>
+    /// Queues a formatted finding section onto <see cref="PendingComments"/>.
+    /// </summary>
+    public void AddPendingComment(
+        string body,
+        bool includeGeneralDocs = false,
+        IReadOnlyList<DocumentationLink>? documentationLinks = null)
+    {
+        var linksSnapshot = documentationLinks
+            ?.Select(static link => link is null ? null! : link with { })
+            .ToArray();
+        PendingComments.Add(new PendingCommentSection(body, includeGeneralDocs, linksSnapshot));
+    }
+
+    /// <summary>
+    /// Standalone single-marker notice lifecycle intents (create/update/delete) flushed after consolidated comments.
+    /// </summary>
+    public List<NoticeIntent> PendingNotices { get; } = new();
 
     /// <summary>
     /// Cross-module item dictionary for passing lightweight intermediate state between modules.

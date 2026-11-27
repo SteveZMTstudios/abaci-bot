@@ -49,13 +49,13 @@ internal static class ConfigSchemaCatalog
             "SpdxCompliance",
             "SPDX license compliance",
             "Options/SpdxComplianceOptions.cs",
-            null),
+            "Options/DocumentationLink.cs"),
         new(
             typeof(CveSecurityOptions),
             "CveSecurity",
             "CVE detection and lifecycle",
             "Options/CveSecurityOptions.cs",
-            null),
+            "Options/DocumentationLink.cs"),
         new(
             typeof(RebuildImpactOptions),
             "RebuildImpact",
@@ -67,7 +67,7 @@ internal static class ConfigSchemaCatalog
             "AbiCompliance",
             "Binary ABI compliance",
             "Options/AbiComplianceOptions.cs",
-            null),
+            "Options/DocumentationLink.cs"),
         new(
             typeof(FileCacheOptions),
             "FileCache",
@@ -104,6 +104,12 @@ internal static class ConfigSchemaCatalog
             "Unified persistent runtime state and localization policy",
             "Options/BotStateOptions.cs",
             "Options/BotStateOptionsValidator.cs"),
+        new(
+            typeof(WipDraftOptions),
+            "WipDraft",
+            "WIP title to draft reminder guidance",
+            "Options/WipDraftOptions.cs",
+            "Options/DocumentationLink.cs"),
     ];
 
     /// <summary>

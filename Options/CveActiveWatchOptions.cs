@@ -79,4 +79,11 @@ public class CveActiveWatchOptions
         Unit = "hours",
         Range = ">= 1")]
     public int CacheExpirationHours { get; set; } = 168; // 7 days
+
+    [ConfigField(
+        Description = "Module-specific documentation links appended to proactive CVE notice and auto-resolution comments.",
+        Format = "JSON array of up to 5 objects { \"Title\": \"...\", \"TitleZh\": \"...\" (optional), \"Url\": \"https://...\" }",
+        EmptyBehavior = "no documentation links are appended to proactive CVE comments.",
+        Example = "[{ \"Title\": \"Security Policy\", \"TitleZh\": \"安全策略\", \"Url\": \"https://openruyi.org/docs/security\" }]")]
+    public List<DocumentationLink> DocumentationLinks { get; set; } = new();
 }

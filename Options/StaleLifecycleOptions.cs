@@ -82,7 +82,8 @@ public class StaleLifecycleOptions
     public string CloseCommentTemplate { get; set; } = DefaultCloseCommentTemplate;
 
     /// <summary>
-    /// Formats the stale notification comment by replacing {StaleDays} and {CloseDays} placeholders.
+    /// Formats the stale notification comment by replacing {StaleDays} and {CloseDays} placeholders
+    /// and appending configured <see cref="DocumentationLinks"/>.
     /// </summary>
     public string FormatStaleComment()
     {
@@ -90,13 +91,16 @@ public class StaleLifecycleOptions
             ? StaleCommentTemplate
             : DefaultStaleCommentTemplate;
 
-        return template
+        var body = template
             .Replace("{StaleDays}", StaleDays.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase)
             .Replace("{CloseDays}", CloseDays.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase);
+
+        return Services.DocumentationLinkFormatter.AppendFooter(body, DocumentationLinks, isChinese: false);
     }
 
     /// <summary>
-    /// Formats the close notification comment by replacing {CloseDays} placeholder.
+    /// Formats the close notification comment by replacing {CloseDays} placeholder
+    /// and appending configured <see cref="DocumentationLinks"/>.
     /// </summary>
     public string FormatCloseComment()
     {
@@ -104,7 +108,8 @@ public class StaleLifecycleOptions
             ? CloseCommentTemplate
             : DefaultCloseCommentTemplate;
 
-        return template.Replace("{CloseDays}", CloseDays.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase);
+        var body = template.Replace("{CloseDays}", CloseDays.ToString(CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase);
+        return Services.DocumentationLinkFormatter.AppendFooter(body, DocumentationLinks, isChinese: false);
     }
 
     [ConfigField(
@@ -127,4 +132,11 @@ public class StaleLifecycleOptions
         Range = ">= 0",
         EmptyBehavior = "0 disables the quota gate so sweeps start regardless of remaining quota.")]
     public int MinRateLimitRemaining { get; set; } = 100;
+
+    [ConfigField(
+        Description = "Module-specific documentation links appended to stale warning and auto-close comments.",
+        Format = "JSON array of up to 5 objects { \"Title\": \"...\", \"TitleZh\": \"...\" (optional), \"Url\": \"https://...\" }",
+        EmptyBehavior = "no documentation links are appended to stale lifecycle comments.",
+        Example = "[{ \"Title\": \"Stale Policy\", \"TitleZh\": \"过期清理规则\", \"Url\": \"https://openruyi.org/docs/stale\" }]")]
+    public List<DocumentationLink> DocumentationLinks { get; set; } = new();
 }

@@ -211,7 +211,8 @@ public partial class ConversationGuardService : IConversationGuardService
         string dryRunAction,
         bool ephemeral,
         CancellationToken cancellationToken,
-        TimeSpan? ephemeralTtl = null)
+        TimeSpan? ephemeralTtl = null,
+        bool isZh = false)
     {
         if (_options.DryRun)
         {
@@ -230,7 +231,10 @@ public partial class ConversationGuardService : IConversationGuardService
             }
             else
             {
-                await _gitHub.CreateCommentAsync(context.Owner, context.Repo, context.PrNumber, commentBody, cancellationToken);
+                var renderedBody = !ephemeral
+                    ? DocumentationLinkFormatter.AppendFooter(commentBody, _options.DocumentationLinks, isZh)
+                    : commentBody;
+                await _gitHub.CreateCommentAsync(context.Owner, context.Repo, context.PrNumber, renderedBody, cancellationToken);
             }
         }
         catch (ForbiddenException ex)
@@ -253,19 +257,21 @@ public partial class ConversationGuardService : IConversationGuardService
         PullRequestContext context,
         string commentBody,
         string actionDescription,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool isZh = false)
     {
+        var renderedBody = DocumentationLinkFormatter.AppendFooter(commentBody, _options.DocumentationLinks, isZh);
         try
         {
             if (_commentGateway != null)
             {
                 var created = await _commentGateway.CreateCommentWithMetadataAsync(
-                    context.Owner, context.Repo, context.PrNumber, commentBody, cancellationToken);
+                    context.Owner, context.Repo, context.PrNumber, renderedBody, cancellationToken);
                 return (true, created?.Id ?? 0);
             }
 
             await _gitHub.CreateCommentAsync(
-                context.Owner, context.Repo, context.PrNumber, commentBody, cancellationToken);
+                context.Owner, context.Repo, context.PrNumber, renderedBody, cancellationToken);
             return (true, 0);
         }
         catch (ForbiddenException ex)
@@ -290,14 +296,16 @@ public partial class ConversationGuardService : IConversationGuardService
         PullRequestContext context,
         long announcementCommentId,
         string commentBody,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool isZh = false)
     {
+        var renderedBody = DocumentationLinkFormatter.AppendFooter(commentBody, _options.DocumentationLinks, isZh);
         if (announcementCommentId > 0)
         {
             try
             {
                 await _gitHub.UpdateCommentAsync(
-                    context.Owner, context.Repo, announcementCommentId, commentBody, cancellationToken);
+                    context.Owner, context.Repo, announcementCommentId, renderedBody, cancellationToken);
                 return;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -309,7 +317,7 @@ public partial class ConversationGuardService : IConversationGuardService
             }
         }
 
-        await TryPostCompensationCommentAsync(context, commentBody, cancellationToken);
+        await TryPostCompensationCommentAsync(context, renderedBody, cancellationToken);
     }
 
     private async Task<bool> ValidateOrRequestAuthorConfirmationAsync(
@@ -428,7 +436,8 @@ public partial class ConversationGuardService : IConversationGuardService
                 ? $"此对话已由 @{senderLogin} 锁定。"
                 : $"This conversation has been locked by @{senderLogin}.",
             "lock",
-            cancellationToken);
+            cancellationToken,
+            isZh);
         if (!posted)
         {
             return;
@@ -448,7 +457,8 @@ public partial class ConversationGuardService : IConversationGuardService
                 isZh
                     ? $"@{senderLogin} 因 GitHub API 错误锁定失败，此对话仍保持未锁定状态。"
                     : $"@{senderLogin} Failed to lock this conversation due to a GitHub API error. The conversation remains unlocked.",
-                cancellationToken);
+                cancellationToken,
+                isZh);
         }
     }
 
@@ -493,7 +503,8 @@ public partial class ConversationGuardService : IConversationGuardService
                     : $"@{senderLogin} This conversation is not currently locked.",
                 "Report conversation is not locked",
                 ephemeral: false,
-                cancellationToken);
+                cancellationToken,
+                isZh: isZh);
             return;
         }
 
@@ -515,7 +526,8 @@ public partial class ConversationGuardService : IConversationGuardService
                     : $"@{senderLogin} Failed to unlock this conversation due to a GitHub API/permission error.",
                 "Report unlock error",
                 ephemeral: false,
-                cancellationToken);
+                cancellationToken,
+                isZh: isZh);
             return;
         }
 
@@ -528,7 +540,8 @@ public partial class ConversationGuardService : IConversationGuardService
             unlockMessage,
             "Post unlock notice",
             ephemeral: false,
-            cancellationToken);
+            cancellationToken,
+            isZh: isZh);
     }
 
     private async Task HandleHideCommandAsync(
@@ -596,7 +609,8 @@ public partial class ConversationGuardService : IConversationGuardService
                     : $"@{senderLogin} Failed to inspect comments due to a GitHub API error.",
                 "Report hide comment inspection error",
                 ephemeral: false,
-                cancellationToken);
+                cancellationToken,
+                isZh: isZh);
             return;
         }
 
@@ -637,7 +651,8 @@ public partial class ConversationGuardService : IConversationGuardService
                     : $"@{senderLogin} No comments authored by @{effectiveTargetUser} were found on this pull request.",
                 $"Report no comments authored by @{effectiveTargetUser}",
                 ephemeral: false,
-                cancellationToken);
+                cancellationToken,
+                isZh: isZh);
             return;
         }
 
@@ -681,7 +696,8 @@ public partial class ConversationGuardService : IConversationGuardService
             summaryMessage,
             $"Post hide summary for @{effectiveTargetUser}",
             ephemeral: false,
-            cancellationToken);
+            cancellationToken,
+            isZh: isZh);
     }
 
     private async Task HandleArchiveCommandAsync(
@@ -751,7 +767,8 @@ public partial class ConversationGuardService : IConversationGuardService
                 ? $"此 Pull Request 已由 @{senderLogin} 归档，对话现已永久关闭。"
                 : $"This pull request has been archived by @{senderLogin}. Conversation is now permanently closed.",
             "archive",
-            cancellationToken);
+            cancellationToken,
+            isZh);
         if (!posted)
         {
             return;
@@ -784,7 +801,8 @@ public partial class ConversationGuardService : IConversationGuardService
                 context,
                 announcementCommentId,
                 compensationComment,
-                cancellationToken);
+                cancellationToken,
+                isZh);
         }
     }
 

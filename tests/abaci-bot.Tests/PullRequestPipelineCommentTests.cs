@@ -1,5 +1,6 @@
 using System.Net;
 using abaci_bot.Contexts;
+using abaci_bot.Modules;
 using abaci_bot.Pipelines;
 using abaci_bot.Services;
 using NSubstitute;
@@ -59,7 +60,7 @@ public class PullRequestPipelineCommentTests
 
         public Task ProcessAsync(PullRequestContext context, CancellationToken cancellationToken)
         {
-            context.PendingComments.Add(_comment);
+            context.AddPendingComment(_comment);
             return Task.CompletedTask;
         }
     }
@@ -262,7 +263,7 @@ public class PullRequestPipelineCommentTests
             {
                 var ctx = ci.Arg<PullRequestContext>();
                 ctx.LabelsToAdd.Add(GitHubLabels.WorkflowBlocked);
-                ctx.PendingComments.Add("> [!TIP]\n> SPDX notice");
+                ctx.AddPendingComment("> [!TIP]\n> SPDX notice", includeGeneralDocs: true);
             });
 
         var commentAttempts = 0;
@@ -299,7 +300,7 @@ public class PullRequestPipelineCommentTests
             {
                 var ctx = ci.Arg<PullRequestContext>();
                 ctx.LabelsToAdd.Add(GitHubLabels.WorkflowBlocked);
-                ctx.PendingComments.Add($"> [!IMPORTANT]\n> Hold\n{GovernanceCommentFormatter.RebuildGateCommentMarker}");
+                ctx.AddPendingComment($"> [!IMPORTANT]\n> Hold\n{GovernanceCommentFormatter.RebuildGateCommentMarker}", includeGeneralDocs: true);
             });
 
         _gitHub.CreateCommentAsync("openRuyi-Project", "openRuyi", 77, Arg.Any<string>(), Arg.Any<CancellationToken>())
@@ -335,7 +336,7 @@ public class PullRequestPipelineCommentTests
             {
                 var ctx = ci.Arg<PullRequestContext>();
                 ctx.LabelsToAdd.Add(GitHubLabels.WorkflowBlocked);
-                ctx.PendingComments.Add($"> [!IMPORTANT]\n> Hold\n{GovernanceCommentFormatter.RebuildGateCommentMarker}");
+                ctx.AddPendingComment($"> [!IMPORTANT]\n> Hold\n{GovernanceCommentFormatter.RebuildGateCommentMarker}", includeGeneralDocs: true);
             });
 
         var resp = Substitute.For<IResponse>();
@@ -374,7 +375,7 @@ public class PullRequestPipelineCommentTests
             {
                 var ctx = ci.Arg<PullRequestContext>();
                 ctx.LabelsToAdd.Add(GitHubLabels.WorkflowBlocked);
-                ctx.PendingComments.Add("> [!TIP]\n> SPDX notice without rebuild marker");
+                ctx.AddPendingComment("> [!TIP]\n> SPDX notice without rebuild marker", includeGeneralDocs: true);
             });
 
         _gitHub.CreateCommentAsync("openRuyi-Project", "openRuyi", 77, Arg.Any<string>(), Arg.Any<CancellationToken>())
@@ -408,7 +409,7 @@ public class PullRequestPipelineCommentTests
                 ctx.LabelsToAdd.Add(GitHubLabels.ComplianceLicenseIssue);
                 if (!ctx.ExistingLabels.Contains(GitHubLabels.ComplianceLicenseIssue))
                 {
-                    ctx.PendingComments.Add("> [!TIP]\n> **SPDX Notice**\n> Invalid license expression");
+                    ctx.AddPendingComment("> [!TIP]\n> **SPDX Notice**\n> Invalid license expression", includeGeneralDocs: true);
                 }
             });
 
@@ -420,7 +421,7 @@ public class PullRequestPipelineCommentTests
             {
                 var ctx = ci.Arg<PullRequestContext>();
                 ctx.LabelsToAdd.Add(GitHubLabels.WorkflowBlocked);
-                ctx.PendingComments.Add($"> [!IMPORTANT]\n> Hold\n{GovernanceCommentFormatter.RebuildGateCommentMarker}");
+                ctx.AddPendingComment($"> [!IMPORTANT]\n> Hold\n{GovernanceCommentFormatter.RebuildGateCommentMarker}", includeGeneralDocs: true);
             });
 
         var postedBodies = new List<string>();
@@ -487,7 +488,7 @@ public class PullRequestPipelineCommentTests
                 var ctx = ci.Arg<PullRequestContext>();
                 if (string.Equals(ctx.HeadSha, "sha-old", StringComparison.Ordinal))
                 {
-                    ctx.PendingComments.Add("> [!TIP]\n> Old commit SPDX error");
+                    ctx.AddPendingComment("> [!TIP]\n> Old commit SPDX error", includeGeneralDocs: true);
                 }
             });
 
@@ -527,7 +528,7 @@ public class PullRequestPipelineCommentTests
                 ctx.LabelsToAdd.Add(GitHubLabels.ComplianceLicenseIssue);
                 if (!ctx.ExistingLabels.Contains(GitHubLabels.ComplianceLicenseIssue))
                 {
-                    ctx.PendingComments.Add("> [!TIP]\n> Pure SPDX-only report");
+                    ctx.AddPendingComment("> [!TIP]\n> Pure SPDX-only report", includeGeneralDocs: true);
                 }
             });
 
@@ -586,7 +587,7 @@ public class PullRequestPipelineCommentTests
                     return;
                 }
 
-                ctx.PendingComments.Add($"> [!IMPORTANT]\n> Hold\n{GovernanceCommentFormatter.RebuildGateCommentMarker}");
+                ctx.AddPendingComment($"> [!IMPORTANT]\n> Hold\n{GovernanceCommentFormatter.RebuildGateCommentMarker}", includeGeneralDocs: true);
             });
 
         var createCalls = 0;
@@ -632,15 +633,15 @@ public class PullRequestPipelineCommentTests
         spdxModule.Priority.Returns(60);
         spdxModule.ShouldProcess(Arg.Any<PullRequestContext>()).Returns(true);
         spdxModule.When(m => m.ProcessAsync(Arg.Any<PullRequestContext>(), Arg.Any<CancellationToken>()))
-            .Do(ci => ci.Arg<PullRequestContext>().PendingComments.Add("> [!TIP]\n> Fix SPDX tag"));
+            .Do(ci => ci.Arg<PullRequestContext>().AddPendingComment("> [!TIP]\n> Fix SPDX tag", includeGeneralDocs: true));
 
         var botIdentity = Substitute.For<IBotIdentityProvider>();
         botIdentity.GetBotLoginAsync(Arg.Any<CancellationToken>()).Returns("abaci-bot-test[bot]");
 
         var formatter = new GovernanceCommentFormatter(
-            Microsoft.Extensions.Options.Options.Create(new Options.RebuildImpactOptions
+            Microsoft.Extensions.Options.Options.Create(new Options.BotStateOptions
             {
-                VerificationGuideLinks = new List<Options.VerificationReferenceLink>
+                GeneralDocumentationLinks = new List<Options.DocumentationLink>
                 {
                     new() { Title = "Review Docs", Url = "https://docs.openruyi.org/review" }
                 }
@@ -667,5 +668,209 @@ public class PullRequestPipelineCommentTests
         Assert.StartsWith("Thank you for your contribution! We have identified a few points that require your attention:", capturedBody, StringComparison.Ordinal);
         Assert.Contains("## abaci-bot-test Review Notes", capturedBody, StringComparison.Ordinal);
         Assert.Contains("[Review Docs](https://docs.openruyi.org/review)", capturedBody, StringComparison.Ordinal);
+        Assert.True(
+            capturedBody.IndexOf("Fix SPDX tag", StringComparison.Ordinal) <
+            capturedBody.IndexOf("For more details, see:", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_FindingsWithoutIncludeGeneralDocsOrModuleLinks_OmitsReferenceLinksFooter()
+    {
+        var cveModule = Substitute.For<IPullRequestModule>();
+        cveModule.Priority.Returns(70);
+        cveModule.ShouldProcess(Arg.Any<PullRequestContext>()).Returns(true);
+        cveModule.When(m => m.ProcessAsync(Arg.Any<PullRequestContext>(), Arg.Any<CancellationToken>()))
+            .Do(ci => ci.Arg<PullRequestContext>().AddPendingComment("> [!NOTE]\n> CVE-2025-0001 summary", includeGeneralDocs: false));
+
+        var formatter = new GovernanceCommentFormatter(
+            Microsoft.Extensions.Options.Options.Create(new Options.BotStateOptions
+            {
+                GeneralDocumentationLinks = new List<Options.DocumentationLink>
+                {
+                    new() { Title = "Review Docs", Url = "https://docs.openruyi.org/review" }
+                }
+            }));
+
+        string? capturedBody = null;
+        _gitHub.CreateCommentAsync("openRuyi-Project", "openRuyi", 77, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                capturedBody = ci.ArgAt<string>(3);
+                return Task.CompletedTask;
+            });
+
+        var pipeline = new PullRequestPipeline(new[] { cveModule }, _mutexEngine, _gitHub, formatter: formatter);
+        await pipeline.ExecuteAsync(CreateContext("sha-no-docs"), CancellationToken.None);
+
+        Assert.NotNull(capturedBody);
+        Assert.Contains("CVE-2025-0001 summary", capturedBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("For more details, see:", capturedBody, StringComparison.Ordinal);
+        Assert.DoesNotContain("https://docs.openruyi.org/review", capturedBody, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_CarriedOverComments_Survive130MinutesWithRefreshFailureAndExpireAfter3Hours()
+    {
+        var timeProvider = new MutableTimeProvider(new DateTimeOffset(2026, 11, 27, 10, 0, 0, TimeSpan.Zero));
+        var formatter = new GovernanceCommentFormatter(
+            Microsoft.Extensions.Options.Options.Create(new Options.BotStateOptions
+            {
+                GeneralDocumentationLinks = new List<Options.DocumentationLink>
+                {
+                    new() { Title = "SPDX Guide", Url = "https://docs.openruyi.org/spdx" }
+                }
+            }));
+
+        var spdxModule = Substitute.For<IPullRequestModule>();
+        spdxModule.Priority.Returns(60);
+        spdxModule.ShouldProcess(Arg.Any<PullRequestContext>()).Returns(true);
+        spdxModule.When(m => m.ProcessAsync(Arg.Any<PullRequestContext>(), Arg.Any<CancellationToken>()))
+            .Do(ci =>
+            {
+                var ctx = ci.Arg<PullRequestContext>();
+                ctx.LabelsToAdd.Add(GitHubLabels.ComplianceLicenseIssue);
+                if (!ctx.ExistingLabels.Contains(GitHubLabels.ComplianceLicenseIssue))
+                {
+                    ctx.AddPendingComment("> [!TIP]\n> Preserved 130m SPDX finding", includeGeneralDocs: true);
+                }
+            });
+
+        var failComments = true;
+        var postedBodies = new List<string>();
+        _gitHub.CreateCommentAsync("openRuyi-Project", "openRuyi", 77, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                if (failComments)
+                {
+                    return Task.FromException(new HttpRequestException("429", null, HttpStatusCode.TooManyRequests));
+                }
+
+                postedBodies.Add(ci.ArgAt<string>(3));
+                return Task.CompletedTask;
+            });
+
+        var openPr = new PullRequest();
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(openPr, Array.Empty<Label>());
+
+        var prWithLabel = new PullRequest();
+        var spdxLabel = (Label)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Label));
+        typeof(Label).GetProperty(nameof(Label.Name))?.SetValue(spdxLabel, GitHubLabels.ComplianceLicenseIssue);
+        typeof(PullRequest).GetProperty(nameof(PullRequest.Labels))?.SetValue(prWithLabel, new[] { spdxLabel });
+
+        var pipeline = new PullRequestPipeline(
+            new[] { spdxModule },
+            _mutexEngine,
+            _gitHub,
+            formatter: formatter,
+            commentRetryDelayAsync: (_, _) => Task.CompletedTask,
+            timeProvider: timeProvider);
+
+        static PullRequestContext BuildRawContext(IGitHubService gh, string headSha) => new(
+            gitHubService: gh,
+            teamName: "captains",
+            headers: null,
+            eventType: PullRequestEventType.PullRequest,
+            owner: "openRuyi-Project",
+            repo: "openRuyi",
+            prNumber: 77,
+            headSha: headSha,
+            baseBranch: "main",
+            isDraft: false,
+            isMerged: null,
+            title: "Test PR",
+            body: "PR body",
+            senderLogin: "contributor",
+            authorLogin: "contributor",
+            action: "opened",
+            existingLabels: Array.Empty<string>(),
+            prAction: PullRequestAction.Opened);
+
+        // T0: Attempt 1 fails transiently on comments after label applied -> saves carryover (3h TTL)
+        _gitHub.GetPullRequestAsync("openRuyi-Project", "openRuyi", 77, Arg.Any<CancellationToken>())
+            .Returns(openPr);
+        var thrown1 = await Assert.ThrowsAnyAsync<Exception>(
+            () => pipeline.ExecuteAsync(BuildRawContext(_gitHub, "sha-ttl-130"), CancellationToken.None));
+        Assert.Equal("CommentPostingTransientException", thrown1.GetType().Name);
+
+        // T0 + 65m: Attempt 2 fails transiently during GetPullRequestAsync refresh (before FlushPendingComments)
+        timeProvider.Advance(TimeSpan.FromMinutes(65));
+        _gitHub.GetPullRequestAsync("openRuyi-Project", "openRuyi", 77, Arg.Any<CancellationToken>())
+            .Returns<PullRequest?>(_ => throw new HttpRequestException("65m refresh timeout", null, HttpStatusCode.ServiceUnavailable));
+        await Assert.ThrowsAsync<HttpRequestException>(
+            () => pipeline.ExecuteAsync(BuildRawContext(_gitHub, "sha-ttl-130"), CancellationToken.None));
+
+        // T0 + 130m (> 2h old TTL, < 3h new TTL): Attempt 3 sees label on PR (module adds nothing),
+        // so ONLY carried-over IncludeGeneralDocs section + reference footer are delivered.
+        timeProvider.Advance(TimeSpan.FromMinutes(65));
+        _gitHub.GetPullRequestAsync("openRuyi-Project", "openRuyi", 77, Arg.Any<CancellationToken>())
+            .Returns(prWithLabel);
+        failComments = false;
+
+        await pipeline.ExecuteAsync(BuildRawContext(_gitHub, "sha-ttl-130"), CancellationToken.None);
+
+        var delivered = Assert.Single(postedBodies);
+        Assert.Contains("Preserved 130m SPDX finding", delivered, StringComparison.Ordinal);
+        Assert.Contains("[SPDX Guide](https://docs.openruyi.org/spdx)", delivered, StringComparison.Ordinal);
+        Assert.True(
+            delivered.IndexOf("Preserved 130m SPDX finding", StringComparison.Ordinal) <
+            delivered.IndexOf("For more details, see:", StringComparison.Ordinal));
+
+        // T0 -> fail -> T0 + 181m (> 3h TTL) -> expired carryover produces 0 CreateCommentAsync writes
+        postedBodies.Clear();
+        failComments = true;
+        _gitHub.GetPullRequestAsync("openRuyi-Project", "openRuyi", 77, Arg.Any<CancellationToken>())
+            .Returns(openPr);
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => pipeline.ExecuteAsync(BuildRawContext(_gitHub, "sha-ttl-expired"), CancellationToken.None));
+
+        timeProvider.Advance(TimeSpan.FromMinutes(181));
+        _gitHub.GetPullRequestAsync("openRuyi-Project", "openRuyi", 77, Arg.Any<CancellationToken>())
+            .Returns(prWithLabel);
+        failComments = false;
+
+        await pipeline.ExecuteAsync(BuildRawContext(_gitHub, "sha-ttl-expired"), CancellationToken.None);
+        Assert.Empty(postedBodies);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_PendingNoticeErrors_HandleNonRetriableAndTransientFailures()
+    {
+        var noticeModule = Substitute.For<IPullRequestModule>();
+        noticeModule.Priority.Returns(22);
+        noticeModule.ShouldProcess(Arg.Any<PullRequestContext>()).Returns(true);
+        noticeModule.When(m => m.ProcessAsync(Arg.Any<PullRequestContext>(), Arg.Any<CancellationToken>()))
+            .Do(ci => ci.Arg<PullRequestContext>().PendingNotices.Add(
+                new NoticeIntent(GovernanceCommentFormatter.WipDraftTipMarker, "> [!TIP]\n> Notice body")));
+
+        var health = new RuntimeHealthState();
+        var pipeline = new PullRequestPipeline(new[] { noticeModule }, _mutexEngine, _gitHub, runtimeHealth: health);
+
+        var forbiddenResp = Substitute.For<IResponse>();
+        forbiddenResp.StatusCode.Returns(HttpStatusCode.Forbidden);
+        _gitHub.CreateCommentAsync("openRuyi-Project", "openRuyi", 77, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new ForbiddenException(forbiddenResp));
+
+        // Non-retriable notice error is recorded without throwing or reverting labels
+        await pipeline.ExecuteAsync(CreateContext("sha-notice-403"), CancellationToken.None);
+        Assert.Contains("Non-retriable notice failure", health.GetLastError().LastError);
+
+        // Transient notice error wraps into CommentPostingTransientException for dispatcher retry
+        _gitHub.CreateCommentAsync("openRuyi-Project", "openRuyi", 77, Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new HttpRequestException("503", null, HttpStatusCode.ServiceUnavailable));
+
+        var thrownNotice = await Assert.ThrowsAnyAsync<Exception>(
+            () => pipeline.ExecuteAsync(CreateContext("sha-notice-503"), CancellationToken.None));
+        Assert.Equal("CommentPostingTransientException", thrownNotice.GetType().Name);
+    }
+
+    private sealed class MutableTimeProvider : TimeProvider
+    {
+        private DateTimeOffset _utcNow;
+
+        public MutableTimeProvider(DateTimeOffset initialUtcNow) => _utcNow = initialUtcNow;
+
+        public void Advance(TimeSpan delta) => _utcNow += delta;
+
+        public override DateTimeOffset GetUtcNow() => _utcNow;
     }
 }

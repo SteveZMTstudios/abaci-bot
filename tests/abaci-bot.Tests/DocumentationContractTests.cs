@@ -29,7 +29,8 @@ public class DocumentationContractTests
         [typeof(PackageUpdateOptions)] = "docs/modules/package-update.md",
         [typeof(CveActiveWatchOptions)] = "docs/modules/cve-active-watch.md",
         [typeof(MilestoneSyncOptions)] = "docs/modules/milestone-sync.md",
-        [typeof(ConversationGuardOptions)] = "docs/modules/conversation-guard.md"
+        [typeof(ConversationGuardOptions)] = "docs/modules/conversation-guard.md",
+        [typeof(WipDraftOptions)] = "docs/modules/wip-draft.md"
     };
 
     private static readonly Dictionary<string, string> ModuleDocs = new()
@@ -38,6 +39,7 @@ public class DocumentationContractTests
         ["StaleUnstaleModule"] = "docs/modules/stale-lifecycle.md",
         ["ShinyNewPrModule"] = "docs/modules/workflow-state.md",
         ["UserContributionModule"] = "docs/modules/user-contribution.md",
+        ["WipDraftModule"] = "docs/modules/wip-draft.md",
         ["TargetClassificationModule"] = "docs/modules/target-classification.md",
         ["BuildSystemAnalysisModule"] = "docs/modules/build-system.md",
         ["ChangeTypeClassificationModule"] = "docs/modules/change-type.md",

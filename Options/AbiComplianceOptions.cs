@@ -66,4 +66,11 @@ public class AbiComplianceOptions
         Unit = "bytes",
         Range = "> 0")]
     public long MaxTotalPayloadBytes { get; set; } = 1024L * 1024 * 1024;
+
+    [ConfigField(
+        Description = "Module-specific documentation links appended to the consolidated PR review footer when AbiCompliance posts an ABI breaking-change or unverified notice.",
+        Format = "JSON array of up to 5 objects { \"Title\": \"...\", \"TitleZh\": \"...\" (optional), \"Url\": \"https://...\" }",
+        EmptyBehavior = "no ABI-specific documentation links are appended.",
+        Example = "[{ \"Title\": \"ABI Compatibility Guide\", \"TitleZh\": \"ABI 兼容性指南\", \"Url\": \"https://openruyi.org/docs/abi\" }]")]
+    public List<DocumentationLink> DocumentationLinks { get; set; } = new();
 }

@@ -745,7 +745,10 @@ public class PackageUpdateService : BackgroundService
                         }
 
                         _logger?.LogInformation("Closing inactive failed bot PR #{Number} (Branch: {Branch}) to free concurrency slot", prNumber, branchName);
-                        var closeMsg = $"Automated pull request has been failing CI and inactive for over {_options.FailedPrTtlDays} days. Closing to reclaim concurrency slot.";
+                        var closeMsg = DocumentationLinkFormatter.AppendFooter(
+                            $"Automated pull request has been failing CI and inactive for over {_options.FailedPrTtlDays} days. Closing to reclaim concurrency slot.",
+                            _options.DocumentationLinks,
+                            isChinese: false);
                         await _gitHubService.CreateCommentAsync(owner, repo, prNumber, closeMsg, ct);
                         await _gitHubService.CloseIssueAsync(owner, repo, prNumber, ct);
 

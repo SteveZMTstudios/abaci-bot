@@ -448,6 +448,12 @@ public class CveActiveWatchService : BackgroundService
                     {UnverifiedNoticeMarker}
                     """;
 
+                notice = DocumentationLinkFormatter.AppendFooterBeforeMarker(
+                    notice,
+                    UnverifiedNoticeMarker,
+                    _options.DocumentationLinks,
+                    isChinese: false);
+
                 await _gitHubService.CreateCommentAsync(owner, repo, openIssue.Number, notice, ct);
                 _logger?.LogInformation(
                     "Posted one-time unverified ecosystem migration notice on legacy CVE issue #{Number} for {Package}",
@@ -470,7 +476,7 @@ public class CveActiveWatchService : BackgroundService
         CancellationToken ct)
     {
         var issueTitle = $"[Security] Outstanding CVEs detected in {finding.PackageName}";
-        var body = GenerateIssueBody(finding);
+        var body = GenerateIssueBody(finding, _options.DocumentationLinks);
         var maxSeverity = CalculateMaxSeverity(finding.DetailedReports);
 
         var labels = new List<string>
@@ -610,7 +616,10 @@ public class CveActiveWatchService : BackgroundService
                         await _gitHubService.AddLabelsAsync(owner, repo, issue.Number, new[] { GitHubLabels.VulnerabilityResolved }, ct);
                         await _gitHubService.CloseIssueAsync(owner, repo, issue.Number, ct);
 
-                        var resolutionComment = "All previously detected CVE vulnerabilities have been resolved in the current package version. Closing issue.";
+                        var resolutionComment = DocumentationLinkFormatter.AppendFooter(
+                            "All previously detected CVE vulnerabilities have been resolved in the current package version. Closing issue.",
+                            _options.DocumentationLinks,
+                            isChinese: false);
                         await _gitHubService.CreateCommentAsync(owner, repo, issue.Number, resolutionComment, ct);
 
                         try
@@ -698,7 +707,9 @@ public class CveActiveWatchService : BackgroundService
         return $"https://osv.dev/vulnerability/{escaped}";
     }
 
-    public static string GenerateIssueBody(PackageVulnerabilityFinding finding)
+    public static string GenerateIssueBody(
+        PackageVulnerabilityFinding finding,
+        IReadOnlyList<DocumentationLink>? documentationLinks = null)
     {
         const int maxDisplayCount = 20;
         var totalCount = Math.Max(finding.TotalVulnerabilityCount, finding.DetailedReports.Count);
@@ -745,6 +756,12 @@ public class CveActiveWatchService : BackgroundService
 
             {footerNote}
             """;
+
+        var seeAlsoFooter = DocumentationLinkFormatter.FormatSeeAlsoFooter(documentationLinks, isChinese: false);
+        if (!string.IsNullOrEmpty(seeAlsoFooter))
+        {
+            body = $"{body}\n\n{seeAlsoFooter}";
+        }
 
         // Hard cap at 60,000 characters to prevent GitHub 422 limit (65536 max) while keeping identity marker intact
         const string overflowNotice = "\n\n> [Content truncated due to size limits]";

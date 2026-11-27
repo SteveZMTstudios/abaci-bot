@@ -60,7 +60,9 @@ Configured under the `RebuildImpact` JSON section:
 | `MaxDepth` | `int?` | `null` | Optional ceiling for dependency traversal depth (null is unlimited). |
 | `BlockThreshold` | `int` | `1001` | Dependent package count threshold triggering `Workflow: Blocked`. |
 | `TargetBranchToBlock` | `string` | `"Rolling"` | Release stream subject to rebuild blocking (`"Rolling"` or `"LTS"`). |
-| `VerificationGuideLinks` | `VerificationReferenceLink[]` | `[]` | Max 5 unique `http`/`https` links (`Title`, optional `TitleZh`, `Url`) | Reference links rendered once in the consolidated PR governance review comment header (across SPDX, CVE, ABI, and rebuild-impact notices) and deduplicated in rebuild-gate guidance; empty emits no external links. |
+| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique `http`/`https` links (`Title`, optional `TitleZh`, `Url`). Rendered dynamically in the consolidated PR governance review comment footer when `RebuildImpactModule` triggers a blocked rebuild gate (deduplicated against inline body URLs and `BotState:GeneralDocumentationLinks`); empty emits no module links. |
+
+> **Migration from legacy key**: Existing `appsettings.json` deployments using `RebuildImpact:VerificationGuideLinks` should split links into `BotState:GeneralDocumentationLinks` (shared across consolidated review modules when general guidance is requested) and per-module `<Section>:DocumentationLinks` (for example `RebuildImpact:DocumentationLinks`, emitted only when that module triggers). A startup warning is logged if the legacy key is still present.
 
 ---
 
@@ -68,8 +70,8 @@ Configured under the `RebuildImpact` JSON section:
 
 - **Missing Repodata**: If the repository primary metadata is not configured or unavailable, the module logs a warning and leaves all `Rebuild:` labels unchanged. It does not assume `Rebuild: 0`.
 - **Cycle Detection**: The transitive traversal algorithm maintains visited sets to prevent infinite loops in cyclic dependencies.
-- **Invalid Configuration Fail-Fast**: `RebuildImpactOptionsValidator` rejects non-positive intervals, negative block thresholds, invalid `CalculationMode` values, and malformed `VerificationGuideLinks` entries (more than 5 links, blank/multiline/overlong titles, non-HTTP/HTTPS URLs, or duplicate normalized URLs) at startup.
-- **Trusted Maintainer Configuration**: `VerificationGuideLinks` comes from maintainer-owned `appsettings.json` (trusted configuration); validation enforces structural bounds while rendering applies minimal link-bracket/newline escaping without over-restricting maintainer-authored titles or URLs.
+- **Invalid Configuration Fail-Fast**: `RebuildImpactOptionsValidator` rejects non-positive intervals, negative block thresholds, invalid `CalculationMode` values, and malformed `DocumentationLinks` entries (more than 5 links, blank/multiline/overlong titles, empty URLs, or duplicate URLs) at startup.
+- **Trusted Maintainer Configuration**: `DocumentationLinks` comes from maintainer-owned `appsettings.json` (trusted configuration); configured URLs are passed through verbatim into GitHub comments and tracking issues (URL encoding, if needed, is the maintainer's responsibility, and credentials should not be embedded for public repositories).
 - **Automated OBS Boundary & State Contract**: `RebuildImpactModule` is stateless with respect to verification lifecycle — persistence, TTLs, restart recovery, retry policies, and manual overrides belong to future automated `IRebuildVerificationOrchestrator` implementations. `ManualVerificationRequired` suppresses duplicate advisory comments after confirming either `<!-- abaci-bot:rebuild-gate -->` or a known own-bot legacy heading (`Rebuild Impact Hold` / `Rebuild Impact Gate` / Chinese equivalents) already exists on the PR comment stream (self-healing by emitting the advisory comment if `Workflow: Blocked` is present without an existing gate comment; when live bot identity lookup is unavailable and no `BotPat` identity is configured, fallback suppression requires `<!-- abaci-bot:rebuild-gate -->` on a bot-typed account rather than plain-text headings), whereas `Pending`/`Failed` transitions post any non-null `AdvisoryComment` updates. Comment failures never roll back `Workflow: Blocked` (strict fail-closed retention): transient rebuild-gate comment failures throw `CommentPostingTransientException` after a single pipeline attempt so `WebhookDispatcher` retries cleanly while marker checks avoid duplicate comments, whereas non-retriable 4xx comment failures retain `Workflow: Blocked`, log `LogError`, and record into `RuntimeHealthState`. Only `RebuildVerificationState.Passed` clears `Workflow: Blocked`.
 - **Production Repodata Endpoint Note**: Production deployments using `RebuildImpact:PrimaryXmlUrl` should point to the active openRuyi repodata mirror (such as `https://boat.openruyi.cn/...`) rather than decommissioned external URLs.
 
@@ -84,7 +86,7 @@ Configured under the `RebuildImpact` JSON section:
     "BlockThreshold": 1001,
     "TargetBranchToBlock": "Rolling",
     "CalculationMode": "Transitive",
-    "VerificationGuideLinks": []
+    "DocumentationLinks": []
   }
 }
 ```

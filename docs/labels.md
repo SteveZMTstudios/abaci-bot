@@ -14,7 +14,7 @@ The table below lists all labels defined in [`Services/GitHubLabels.cs`](../Serv
 
 | Label | Category / Origin | Purpose & Scope |
 |---|---|---|
-| `Workflow: In Dev` | Official Taxonomy | Work in progress (draft PR or title prefixed with `WIP`). |
+| `Workflow: In Dev` | Official Taxonomy | Work in progress (draft PR or title carrying a leading or bracketed `WIP` token, such as `WIP:`, `WIP-`, `[WIP]`, or `(WIP)`). |
 | `Workflow: Ready For Review` | Official Taxonomy | Non-draft PR ready for peer maintainer review. |
 | `Workflow: In Review` | Official Taxonomy | Active review by a team Captain or maintainer. |
 | `Workflow: Blocked` | Official Taxonomy | Downstream rebuild impact threshold exceeded or review hold. |
@@ -153,7 +153,7 @@ gh label create "Target: Rolling" --repo "$REPO" --color "bfdadc" --description 
 gh label create "Target: LTS" --repo "$REPO" --color "d4c5f9" --description "Targets a Long-Term Support release branch." --force
 
 # 4. Contributor Classification
-gh label create "Community: Student contribution" --repo "$REPO" --color "006b75" --description "Contribution from verified student email domains." --force
+gh label create "Community: Student contribution" --repo "$REPO" --color "006b75" --description "Contribution from recognized student email domains." --force
 gh label create "Community: Contribution" --repo "$REPO" --color "bfd4f2" --description "General community contribution." --force
 
 # 5. Change Types & Bot Extensions

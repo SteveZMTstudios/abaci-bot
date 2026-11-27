@@ -13,12 +13,23 @@ namespace abaci_bot.Services;
 public class GovernanceCommentFormatter : IGovernanceCommentFormatter
 {
     public const string RebuildGateCommentMarker = "<!-- abaci-bot:rebuild-gate -->";
+    public const string WipDraftTipMarker = "<!-- abaci-bot:wip-tip:draft -->";
+    public const string WipReadyTipMarker = "<!-- abaci-bot:wip-tip:ready -->";
 
-    private readonly IReadOnlyList<VerificationReferenceLink>? _configuredReferenceLinks;
+    internal const string WipDraftTipLeadEn =
+        "> This pull request title contains `WIP`. If it is not ready for review, use **Convert to draft** under the pull request description.";
+    internal const string WipDraftTipLeadZh =
+        "> 此拉取请求标题包含 `WIP`。如果尚未准备好审查，请在 PR 描述下方点击 **Convert to draft**。";
+    internal const string WipReadyTipLeadEn =
+        "> `WIP` was removed from the title. If the changes are ready, use **Ready for review** under the pull request description.";
+    internal const string WipReadyTipLeadZh =
+        "> `WIP` 已从标题移除。如果更改已准备好审查，请在 PR 描述下方点击 **Ready for review**。";
 
-    public GovernanceCommentFormatter(IOptions<RebuildImpactOptions>? rebuildImpactOptions = null)
+    private readonly IReadOnlyList<DocumentationLink>? _generalDocumentationLinks;
+
+    public GovernanceCommentFormatter(IOptions<BotStateOptions>? botStateOptions = null)
     {
-        _configuredReferenceLinks = rebuildImpactOptions?.Value.VerificationGuideLinks;
+        _generalDocumentationLinks = botStateOptions?.Value.GeneralDocumentationLinks;
     }
 
     public string PreferredLocale { get; set; } = "en";
@@ -49,19 +60,81 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
             sb.Append(CultureInfo.InvariantCulture, $"## {displayName} Review Notes");
         }
 
-        var resolvedLinks = ResolveReferenceLinks(_configuredReferenceLinks, isZh);
-        if (resolvedLinks.Count > 0)
+        return sb.ToString().TrimEnd();
+    }
+
+    public string FormatConsolidatedFooter(
+        string? locale = null,
+        IReadOnlyList<DocumentationLink>? moduleDocumentationLinks = null,
+        bool includeGeneralDocs = true,
+        IReadOnlySet<string>? excludedUrls = null)
+    {
+        var isZh = IsChinese(locale);
+        var combinedLinks = new List<DocumentationLink?>();
+        if (moduleDocumentationLinks != null && moduleDocumentationLinks.Count > 0)
         {
-            sb.AppendLine();
-            sb.AppendLine();
-            sb.AppendLine(isZh ? "更多参考文档：" : "For more details, see:");
-            foreach (var (title, url) in resolvedLinks)
+            combinedLinks.AddRange(moduleDocumentationLinks);
+        }
+
+        if (includeGeneralDocs && _generalDocumentationLinks != null && _generalDocumentationLinks.Count > 0)
+        {
+            combinedLinks.AddRange(_generalDocumentationLinks);
+        }
+
+        return DocumentationLinkFormatter.FormatSeeAlsoFooter(combinedLinks, isZh, excludedUrls);
+    }
+
+    public string FormatWipTip(
+        WipTipKind kind,
+        string prUrl,
+        string? locale = null,
+        IReadOnlyList<DocumentationLink>? documentationLinks = null)
+    {
+        var isZh = IsChinese(locale);
+        var sb = new StringBuilder();
+        var marker = kind == WipTipKind.Draft ? WipDraftTipMarker : WipReadyTipMarker;
+
+        sb.AppendLine("> [!TIP]");
+        if (kind == WipTipKind.Draft)
+        {
+            if (isZh)
             {
-                sb.AppendLine(CultureInfo.InvariantCulture, $"- [{title}]({url})");
+                sb.AppendLine(WipDraftTipLeadZh);
+                sb.AppendLine(">");
+                sb.AppendLine(CultureInfo.InvariantCulture, $"> [打开拉取请求]({prUrl})");
+            }
+            else
+            {
+                sb.AppendLine(WipDraftTipLeadEn);
+                sb.AppendLine(">");
+                sb.AppendLine(CultureInfo.InvariantCulture, $"> [Open the pull request]({prUrl})");
+            }
+        }
+        else
+        {
+            if (isZh)
+            {
+                sb.AppendLine(WipReadyTipLeadZh);
+                sb.AppendLine(">");
+                sb.AppendLine(CultureInfo.InvariantCulture, $"> [打开拉取请求]({prUrl})");
+            }
+            else
+            {
+                sb.AppendLine(WipReadyTipLeadEn);
+                sb.AppendLine(">");
+                sb.AppendLine(CultureInfo.InvariantCulture, $"> [Open the pull request]({prUrl})");
             }
         }
 
-        return sb.ToString().TrimEnd();
+        var seeAlsoBlockquote = DocumentationLinkFormatter.FormatSeeAlsoBlockquoteFooter(documentationLinks, isZh);
+        if (!string.IsNullOrEmpty(seeAlsoBlockquote))
+        {
+            sb.AppendLine(">");
+            sb.AppendLine(seeAlsoBlockquote);
+        }
+
+        sb.Append(marker);
+        return sb.ToString();
     }
 
     private static string NormalizeBotDisplayName(string? botDisplayName)
@@ -177,14 +250,14 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
         int threshold,
         string targetBranch,
         string? locale = null,
-        IReadOnlyList<VerificationReferenceLink>? referenceLinks = null)
+        IReadOnlyList<DocumentationLink>? referenceLinks = null)
     {
         var isZh = IsChinese(locale);
         var pkgList = string.Join("`, `", packages);
-        var headerUrls = ResolveReferenceLinks(_configuredReferenceLinks, isZh)
+        var headerUrls = DocumentationLinkFormatter.ResolveLinks(_generalDocumentationLinks, isZh)
             .Select(l => l.Url)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var resolvedLinks = ResolveReferenceLinks(referenceLinks, isZh)
+            .ToHashSet(StringComparer.Ordinal);
+        var resolvedLinks = DocumentationLinkFormatter.ResolveLinks(referenceLinks, isZh)
             .Where(l => !headerUrls.Contains(l.Url))
             .ToList();
         var sb = new StringBuilder();
@@ -219,52 +292,6 @@ public class GovernanceCommentFormatter : IGovernanceCommentFormatter
 
         sb.AppendLine(RebuildGateCommentMarker);
         return sb.ToString().TrimEnd();
-    }
-
-    private static List<(string Title, string Url)> ResolveReferenceLinks(
-        IReadOnlyList<VerificationReferenceLink>? referenceLinks,
-        bool isZh)
-    {
-        var result = new List<(string Title, string Url)>();
-        if (referenceLinks == null || referenceLinks.Count == 0)
-        {
-            return result;
-        }
-
-        var seenUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var link in referenceLinks)
-        {
-            if (link == null || !VerificationReferenceLink.TryNormalizeHttpUrl(link.Url, out var uri))
-            {
-                continue;
-            }
-
-            var rawTitle = isZh && !string.IsNullOrWhiteSpace(link.TitleZh) ? link.TitleZh : link.Title;
-            if (string.IsNullOrWhiteSpace(rawTitle))
-            {
-                continue;
-            }
-
-            if (!seenUrls.Add(uri.AbsoluteUri))
-            {
-                continue;
-            }
-
-            result.Add((EscapeMarkdownLinkTitle(rawTitle), uri.AbsoluteUri));
-        }
-
-        return result;
-    }
-
-    private static string EscapeMarkdownLinkTitle(string rawTitle)
-    {
-        return rawTitle
-            .Replace("\r", " ", StringComparison.Ordinal)
-            .Replace("\n", " ", StringComparison.Ordinal)
-            .Trim()
-            .Replace("\\", "\\\\", StringComparison.Ordinal)
-            .Replace("[", "\\[", StringComparison.Ordinal)
-            .Replace("]", "\\]", StringComparison.Ordinal);
     }
 
     public string FormatAbiBreakingChange(string diffSnippet, string? locale = null)

@@ -284,7 +284,17 @@
     // Range: >= 0.
     // Empty/0/null: 0 disables the quota gate so sweeps start regardless of remaining quota.
     // Default: 100
-    "MinRateLimitRemaining": 100
+    "MinRateLimitRemaining": 100,
+
+    // Module-specific documentation links appended to stale warning and auto-close comments.
+    // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
+    // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
+    // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
+    // Item field Url: Destination URL passed through verbatim into rendered markdown links; format: non-empty URL string; required; example: "https://openruyi.org/docs/contributing".
+    // Empty/0/null: no documentation links are appended to stale lifecycle comments.
+    // Example: [{ "Title": "Stale Policy", "TitleZh": "过期清理规则", "Url": "https://openruyi.org/docs/stale" }]
+    // Default: []
+    "DocumentationLinks": []
   },
 
   // =========================================================================
@@ -310,6 +320,7 @@
   // =========================================================================
   // SpdxCompliance -- SPDX license compliance
   // Defaults source: Options/SpdxComplianceOptions.cs
+  // Bounds checked by: Options/DocumentationLink.cs
   // =========================================================================
   "SpdxCompliance": {
     // Enables or disables the SPDX license compliance scanning module.
@@ -348,12 +359,23 @@
     // Range: >= 1.
     // Empty/0/null: higher values use more CPU; values < 1 restrict parallelism to 1.
     // Default: 8
-    "MaxDegreeOfParallelism": 8
+    "MaxDegreeOfParallelism": 8,
+
+    // Module-specific documentation links appended to the consolidated PR review footer when SpdxCompliance triggers a license compliance notice.
+    // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
+    // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
+    // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
+    // Item field Url: Destination URL passed through verbatim into rendered markdown links; format: non-empty URL string; required; example: "https://openruyi.org/docs/contributing".
+    // Empty/0/null: no SPDX-specific documentation links are appended.
+    // Example: [{ "Title": "SPDX License Policy", "TitleZh": "SPDX 许可证规范", "Url": "https://openruyi.org/docs/spdx" }]
+    // Default: []
+    "DocumentationLinks": []
   },
 
   // =========================================================================
   // CveSecurity -- CVE detection and lifecycle
   // Defaults source: Options/CveSecurityOptions.cs
+  // Bounds checked by: Options/DocumentationLink.cs
   // =========================================================================
   "CveSecurity": {
     // Enables or disables the CVE security vulnerability tracking module.
@@ -399,7 +421,17 @@
     // Unit: seconds.
     // Range: > 0.
     // Default: 15
-    "RequestTimeoutSeconds": 15
+    "RequestTimeoutSeconds": 15,
+
+    // Module-specific documentation links appended to the consolidated PR review footer when VulnerabilityModule posts a CVE security breakdown notice.
+    // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
+    // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
+    // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
+    // Item field Url: Destination URL passed through verbatim into rendered markdown links; format: non-empty URL string; required; example: "https://openruyi.org/docs/contributing".
+    // Empty/0/null: no CVE-specific documentation links are appended.
+    // Example: [{ "Title": "CVE Advisory Process", "TitleZh": "CVE 漏洞处理流程", "Url": "https://openruyi.org/docs/cve" }]
+    // Default: []
+    "DocumentationLinks": []
   },
 
   // =========================================================================
@@ -456,20 +488,21 @@
     // Default: "Rolling"
     "TargetBranchToBlock": "Rolling",
 
-    // Configured governance reference links rendered once in the consolidated PR review comment header (and deduplicated against rebuild-gate guidance).
+    // Module-specific documentation links appended dynamically to the consolidated PR review footer when RebuildImpact triggers a blocked rebuild gate (deduplicated against inline body URLs and BotState:GeneralDocumentationLinks).
     // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
     // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
     // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
-    // Item field Url: Absolute HTTP or HTTPS destination URL; format: absolute http/https URI without whitespace or control characters; required; example: "https://openruyi.org/docs/contributing".
-    // Empty/0/null: no external reference links are rendered in consolidated review comments.
-    // Example: [{ "Title": "Contribution Guide", "TitleZh": "贡献指南", "Url": "https://openruyi.org/docs/contributing" }]
+    // Item field Url: Destination URL passed through verbatim into rendered markdown links; format: non-empty URL string; required; example: "https://openruyi.org/docs/contributing".
+    // Empty/0/null: no rebuild-specific documentation links are appended.
+    // Example: [{ "Title": "Rebuild Verification Guide", "TitleZh": "重构验证指南", "Url": "https://openruyi.org/docs/rebuild" }]
     // Default: []
-    "VerificationGuideLinks": []
+    "DocumentationLinks": []
   },
 
   // =========================================================================
   // AbiCompliance -- Binary ABI compliance
   // Defaults source: Options/AbiComplianceOptions.cs
+  // Bounds checked by: Options/DocumentationLink.cs
   // =========================================================================
   "AbiCompliance": {
     // Enables or disables binary ABI compliance checking.
@@ -535,7 +568,17 @@
     // Unit: bytes.
     // Range: > 0.
     // Default: 1073741824
-    "MaxTotalPayloadBytes": 1073741824
+    "MaxTotalPayloadBytes": 1073741824,
+
+    // Module-specific documentation links appended to the consolidated PR review footer when AbiCompliance posts an ABI breaking-change or unverified notice.
+    // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
+    // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
+    // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
+    // Item field Url: Destination URL passed through verbatim into rendered markdown links; format: non-empty URL string; required; example: "https://openruyi.org/docs/contributing".
+    // Empty/0/null: no ABI-specific documentation links are appended.
+    // Example: [{ "Title": "ABI Compatibility Guide", "TitleZh": "ABI 兼容性指南", "Url": "https://openruyi.org/docs/abi" }]
+    // Default: []
+    "DocumentationLinks": []
   },
 
   // =========================================================================
@@ -769,7 +812,17 @@
     // Range: >= 0.
     // Empty/0/null: 0 disables the compressed archive cap and streams any compressed archive size.
     // Default: 104857600
-    "MaxArchiveBytes": 104857600
+    "MaxArchiveBytes": 104857600,
+
+    // Module-specific documentation links appended to automated package update PR comments (stepped-aside notices and failed-PR TTL closures).
+    // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
+    // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
+    // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
+    // Item field Url: Destination URL passed through verbatim into rendered markdown links; format: non-empty URL string; required; example: "https://openruyi.org/docs/contributing".
+    // Empty/0/null: no documentation links are appended to package update PR comments.
+    // Example: [{ "Title": "Auto-Update Guide", "TitleZh": "自动更新指南", "Url": "https://openruyi.org/docs/autoupdate" }]
+    // Default: []
+    "DocumentationLinks": []
   },
 
   // =========================================================================
@@ -851,7 +904,17 @@
     // Unit: hours.
     // Range: >= 1.
     // Default: 168
-    "CacheExpirationHours": 168
+    "CacheExpirationHours": 168,
+
+    // Module-specific documentation links appended to proactive CVE notice and auto-resolution comments.
+    // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
+    // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
+    // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
+    // Item field Url: Destination URL passed through verbatim into rendered markdown links; format: non-empty URL string; required; example: "https://openruyi.org/docs/contributing".
+    // Empty/0/null: no documentation links are appended to proactive CVE comments.
+    // Example: [{ "Title": "Security Policy", "TitleZh": "安全策略", "Url": "https://openruyi.org/docs/security" }]
+    // Default: []
+    "DocumentationLinks": []
   },
 
   // =========================================================================
@@ -963,7 +1026,17 @@
     // Unit: pull requests per repository per sweep.
     // Range: 1..500.
     // Default: 50
-    "MaxLocksPerSweep": 50
+    "MaxLocksPerSweep": 50,
+
+    // Module-specific documentation links appended to persistent ConversationGuard announcements and replies (omitted on ephemeral replies and dry-run logs).
+    // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
+    // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
+    // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
+    // Item field Url: Destination URL passed through verbatim into rendered markdown links; format: non-empty URL string; required; example: "https://openruyi.org/docs/contributing".
+    // Empty/0/null: no documentation links are appended to ConversationGuard comments.
+    // Example: [{ "Title": "Moderation Policy", "TitleZh": "协作管理规范", "Url": "https://openruyi.org/docs/moderation" }]
+    // Default: []
+    "DocumentationLinks": []
   },
 
   // =========================================================================
@@ -1016,6 +1089,45 @@
     // Cleanup action executed when an ephemeral bot reply exceeds EphemeralReplyDeleteMinutes.
     // Allowed values: "Delete" (deletes via REST API) or "Minimize" (folds as OUTDATED via GraphQL API).
     // Default: "Delete"
-    "EphemeralReplyAction": "Delete"
+    "EphemeralReplyAction": "Delete",
+
+    // General documentation links rendered once in consolidated PR governance review comment footers when at least one triggered review finding requests general contribution guidance.
+    // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
+    // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
+    // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
+    // Item field Url: Destination URL passed through verbatim into rendered markdown links; format: non-empty URL string; required; example: "https://openruyi.org/docs/contributing".
+    // Empty/0/null: no general contribution links are appended to consolidated review comment footers.
+    // Example: [{ "Title": "Contribution Guide", "TitleZh": "贡献指南", "Url": "https://openruyi.org/docs/contributing" }]
+    // Default: []
+    "GeneralDocumentationLinks": []
+  },
+
+  // =========================================================================
+  // WipDraft -- WIP title to draft reminder guidance
+  // Defaults source: Options/WipDraftOptions.cs
+  // Bounds checked by: Options/DocumentationLink.cs
+  // =========================================================================
+  "WipDraft": {
+    // Enables or disables WIP-to-Draft TIP reminder comment reconciliation on pull requests.
+    // true: WipDraftModule reconciles a single bot-owned TIP comment against PR title WIP tokens, draft state, and terminal state.
+    // false: WipDraftModule is skipped cleanly with no TIP comments created, updated, or deleted.
+    // Default: true
+    "Enabled": true,
+
+    // Dry-run mode that logs intended TIP comment actions without mutating GitHub comments.
+    // true: logs intended TIP create/update/delete actions without calling GitHub comment mutation APIs.
+    // false: executes live TIP comment create, update, and delete operations via the pipeline.
+    // Default: false
+    "DryRun": false,
+
+    // Module-specific documentation links rendered inside WIP/Ready TIP reminder comments.
+    // Format: JSON array of up to 5 objects { "Title": "...", "TitleZh": "..." (optional), "Url": "https://..." }.
+    // Item field Title: Display title used for English and default locales (single line); format: 1..120 character single-line title; required; example: "Contribution Guide".
+    // Item field TitleZh: Optional Chinese display title used in Chinese locales; format: optional 1..120 character single-line title; empty/0/null: falls back to Title when null or blank; example: "贡献指南".
+    // Item field Url: Destination URL passed through verbatim into rendered markdown links; format: non-empty URL string; required; example: "https://openruyi.org/docs/contributing".
+    // Empty/0/null: no external documentation links are appended to TIP comments.
+    // Example: [{ "Title": "Pull Request Workflow", "TitleZh": "PR 工作流指南", "Url": "https://openruyi.org/docs/pr-workflow" }]
+    // Default: []
+    "DocumentationLinks": []
   }
 }

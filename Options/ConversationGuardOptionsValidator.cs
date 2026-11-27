@@ -56,6 +56,8 @@ public class ConversationGuardOptionsValidator : IValidateOptions<ConversationGu
             failures.Add($"{nameof(options.RepositoryAllowList)} entry '{invalid}' must be formatted as 'owner/repo'.");
         }
 
+        DocumentationLinkValidator.Validate(options.DocumentationLinks, nameof(options.DocumentationLinks), failures);
+
         return failures.Count > 0
             ? ValidateOptionsResult.Fail(failures)
             : ValidateOptionsResult.Success;

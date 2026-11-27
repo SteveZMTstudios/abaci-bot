@@ -211,13 +211,14 @@ public class RebuildImpactModuleTests
         Assert.Contains(GitHubLabels.Rebuild1001To2500, context.LabelsToAdd);
         Assert.Contains(GitHubLabels.WorkflowBlocked, context.LabelsToAdd);
         Assert.NotEmpty(context.PendingComments);
-        Assert.Contains("Rebuild Impact Hold", context.PendingComments[0]);
-        Assert.Contains("1200", context.PendingComments[0]);
-        Assert.Contains("we place merges to `Rolling` on hold", context.PendingComments[0]);
-        Assert.Contains("Maintainers will coordinate isolated downstream rebuild verification", context.PendingComments[0]);
-        Assert.DoesNotContain("OBS", context.PendingComments[0], StringComparison.OrdinalIgnoreCase);
-        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0]);
-        Assert.DoesNotContain("Staging", context.PendingComments[0]);
+        Assert.True(context.PendingComments[0].IncludeGeneralDocs);
+        Assert.Contains("Rebuild Impact Hold", context.PendingComments[0].Body);
+        Assert.Contains("1200", context.PendingComments[0].Body);
+        Assert.Contains("we place merges to `Rolling` on hold", context.PendingComments[0].Body);
+        Assert.Contains("Maintainers will coordinate isolated downstream rebuild verification", context.PendingComments[0].Body);
+        Assert.DoesNotContain("OBS", context.PendingComments[0].Body, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0].Body);
+        Assert.DoesNotContain("Staging", context.PendingComments[0].Body);
     }
 
     [Fact]
@@ -284,7 +285,7 @@ public class RebuildImpactModuleTests
 
         Assert.Contains(GitHubLabels.WorkflowBlocked, context.LabelsToAdd);
         Assert.Single(context.PendingComments);
-        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0]);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0].Body);
     }
 
     [Fact]
@@ -323,7 +324,7 @@ public class RebuildImpactModuleTests
 
         // Human comment quoting legacy text must NOT suppress the bot's explanatory gate comment
         Assert.Single(context.PendingComments);
-        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0]);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0].Body);
 
         // Legacy text authored by our own bot account DOES suppress duplicate posting when identity is known
         var ownBotIdentity = Substitute.For<IBotIdentityProvider>();
@@ -388,7 +389,7 @@ public class RebuildImpactModuleTests
 
         // Plain-text legacy heading without hidden marker must NOT suppress when own identity cannot be resolved.
         Assert.Single(contextLegacy.PendingComments);
-        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, contextLegacy.PendingComments[0]);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, contextLegacy.PendingComments[0].Body);
 
         var markerComment = (IssueComment)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(IssueComment));
         typeof(IssueComment).GetProperty(nameof(IssueComment.User))?.SetValue(markerComment, unverifiedBotUser);
@@ -445,7 +446,7 @@ public class RebuildImpactModuleTests
         await module.ProcessAsync(context, CancellationToken.None);
 
         Assert.Single(context.PendingComments);
-        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0]);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0].Body);
     }
 
     [Fact]
@@ -527,7 +528,7 @@ public class RebuildImpactModuleTests
         await module.ProcessAsync(context, CancellationToken.None);
 
         Assert.Single(context.PendingComments);
-        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0]);
+        Assert.Contains(GovernanceCommentFormatter.RebuildGateCommentMarker, context.PendingComments[0].Body);
     }
 
     [Fact]
@@ -1231,7 +1232,7 @@ public class RebuildImpactModuleTests
         var options = Microsoft.Extensions.Options.Options.Create(new RebuildImpactOptions
         {
             BlockThreshold = 1001,
-            VerificationGuideLinks = new List<VerificationReferenceLink>
+            DocumentationLinks = new List<DocumentationLink>
             {
                 new() { Title = "OBS Reverse-Dependency Guide", Url = guideUrl1 },
                 new() { Title = "openRuyi OBS Portal", Url = guideUrl2 }
@@ -1246,9 +1247,9 @@ public class RebuildImpactModuleTests
 
         Assert.Contains(GitHubLabels.WorkflowBlocked, context.LabelsToAdd);
         Assert.Single(context.PendingComments);
-        Assert.Contains("**See also**:", context.PendingComments[0]);
-        Assert.Contains($"[OBS Reverse-Dependency Guide]({guideUrl1})", context.PendingComments[0]);
-        Assert.Contains($"[openRuyi OBS Portal]({guideUrl2})", context.PendingComments[0]);
+        Assert.True(context.PendingComments[0].IncludeGeneralDocs);
+        Assert.Equal(options.Value.DocumentationLinks, context.PendingComments[0].DocumentationLinks);
+        Assert.DoesNotContain("**See also**:", context.PendingComments[0].Body);
     }
 
     [Theory]
@@ -1280,7 +1281,7 @@ public class RebuildImpactModuleTests
 
         Assert.Contains(GitHubLabels.WorkflowBlocked, context.LabelsToAdd);
         Assert.DoesNotContain(GitHubLabels.WorkflowBlocked, context.LabelsToRemove);
-        Assert.Contains($"Status: {state}", context.PendingComments);
+        Assert.Contains(context.PendingComments, c => c.Body == $"Status: {state}");
     }
 
     [Fact]
@@ -1312,7 +1313,7 @@ public class RebuildImpactModuleTests
 
         Assert.DoesNotContain(GitHubLabels.WorkflowBlocked, context.LabelsToAdd);
         Assert.Contains(GitHubLabels.WorkflowBlocked, context.LabelsToRemove);
-        Assert.Contains("OBS automated verification passed.", context.PendingComments);
+        Assert.Contains(context.PendingComments, c => c.Body == "OBS automated verification passed." && !c.IncludeGeneralDocs);
     }
 
     [Fact]
@@ -1381,7 +1382,7 @@ public class RebuildImpactModuleTests
 
         Assert.Contains(GitHubLabels.WorkflowBlocked, blockedContext.LabelsToAdd);
         Assert.Single(blockedContext.PendingComments);
-        Assert.Contains("Automated OBS verification failed", blockedContext.PendingComments[0]);
+        Assert.Contains("Automated OBS verification failed", blockedContext.PendingComments[0].Body);
 
         // 2. Subsequent Pending/Failed poll with unchanged state returns null AdvisoryComment and posts nothing
         orchestrator.RequestVerificationAsync(Arg.Any<RebuildVerificationRequest>(), Arg.Any<CancellationToken>())
@@ -1419,7 +1420,7 @@ public class RebuildImpactModuleTests
 
         Assert.Contains(GitHubLabels.WorkflowBlocked, context.LabelsToAdd);
         Assert.Single(context.PendingComments);
-        Assert.Contains("Rebuild 影响范围暂缓合并", context.PendingComments[0], StringComparison.Ordinal);
+        Assert.Contains("Rebuild 影响范围暂缓合并", context.PendingComments[0].Body, StringComparison.Ordinal);
     }
 
     private sealed class HttpHandlerStub : HttpMessageHandler

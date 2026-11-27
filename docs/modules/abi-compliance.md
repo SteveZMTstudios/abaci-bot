@@ -79,6 +79,7 @@ Configured under the `AbiCompliance` JSON section:
 | `TempExtractionDirectory` | `string?` | `null` | Path for temporary extraction buffers (null uses system temporary path). |
 | `TimeoutSeconds` | `int` | `300` | Process execution timeout in seconds. |
 | `MaxTotalPayloadBytes` | `long` | `1073741824` | Maximum uncompressed total payload bytes processed by managed ELF/RPM engine (1 GB). |
+| `DocumentationLinks` | `DocumentationLink[]` | `[]` | Max 5 unique `http`/`https` links (`Title`, optional `TitleZh`, `Url`) appended to the consolidated PR review footer when `AbiCompliance` posts a breaking-change or unverified notice. |
 
 ---
 

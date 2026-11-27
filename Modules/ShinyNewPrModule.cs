@@ -41,7 +41,7 @@ public class ShinyNewPrModule : IPullRequestModule
         return context.EventType switch
         {
             PullRequestEventType.PullRequest =>
-                context.PullRequestAction == PullRequestAction.Opened,
+                !context.IsTerminal && context.PullRequestAction == PullRequestAction.Opened,
 
             PullRequestEventType.Review =>
                 context.PullRequestReviewAction == PullRequestReviewAction.Submitted,
@@ -58,11 +58,14 @@ public class ShinyNewPrModule : IPullRequestModule
 
     public async Task ProcessAsync(PullRequestContext context, CancellationToken cancellationToken)
     {
-        // 1. Tag newly opened PRs with the "Status: New" indicator
-        if (context.EventType == PullRequestEventType.PullRequest &&
-            context.PullRequestAction == PullRequestAction.Opened)
+        // 1. Tag newly opened non-terminal PRs with the "Status: New" indicator
+        if (context.EventType == PullRequestEventType.PullRequest)
         {
-            context.LabelsToAdd.Add(GitHubLabels.StatusNew);
+            if (!context.IsTerminal && context.PullRequestAction == PullRequestAction.Opened)
+            {
+                context.LabelsToAdd.Add(GitHubLabels.StatusNew);
+            }
+
             return;
         }
 
